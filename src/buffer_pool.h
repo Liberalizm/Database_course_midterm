@@ -82,6 +82,11 @@ public:
     bool UnpinPage(page_id_t pid, bool is_dirty);
     void FlushPage(page_id_t pid);
     void FlushAll();
+    bool HasDirtyPages() const;
+    // Empties the pool without writing anything back. Used when a statement is
+    // rolled back: any cached page, dirty or not, may hold its changes. No page
+    // may be pinned. The catalog restores the free-page list when it reloads.
+    void DiscardAll();
 
     // Gives a page back for reuse (e.g. the pages of a dropped table). The page
     // must not be pinned; its cached contents are discarded without write-back.

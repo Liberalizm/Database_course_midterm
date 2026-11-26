@@ -36,7 +36,7 @@ Meta commands:
   .tables               list tables          .schema <table>    show columns and indexes
   .indexes              list indexes         .stats             buffer pool / disk statistics
   .populate <t> <n>     insert n random rows .read <file>       run a script (SQL + meta commands)
-  .timer on|off         show query time      .checkpoint        flush everything to disk
+  .timer on|off         show query time      .checkpoint        write the log into the db
   .help                 this text            .exit / .quit      leave
 )";
 
@@ -201,6 +201,9 @@ bool Shell::RunMeta(const std::string& line) {
             out_ << buf;
             out_ << "  disk: file=" << d.Path() << " pages=" << d.NumPages() << " reads=" << d.Reads()
                  << " writes=" << d.Writes() << " free pages=" << b.FreePages().size() << "\n";
+            out_ << "  wal: file=" << d.Log().Path() << " size=" << d.Log().SizeBytes() / 1024
+                 << " KB pages=" << d.Log().PageRecords() << " commits=" << d.Commits()
+                 << " checkpoints=" << d.Checkpoints() << "\n";
         } else if (cmd == ".populate") {
             std::string name;
             int64_t n = 0;

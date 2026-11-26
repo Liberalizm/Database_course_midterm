@@ -69,12 +69,172 @@ TEST(DiskManager, InvalidPageIdsThrow) {
 TEST(DiskManager, CountsIo) {
     TempFile f;
     DiskManager disk(f.path());
-    disk.AllocatePage();  // allocation writes a zero page
+    disk.AllocatePage();  // allocation writes nothing: the page is zeros until written
+    EXPECT_EQ(disk.Writes(), 0u);
+    char buf[PAGE_SIZE] = {};
+    disk.WritePage(0, buf);
     EXPECT_EQ(disk.Writes(), 1u);
-    char buf[PAGE_SIZE];
     disk.ReadPage(0, buf);
     disk.ReadPage(0, buf);
     EXPECT_EQ(disk.Reads(), 2u);
+}
+
+// ---- write-ahead log -------------------------------------------------------
+
+void Fill(char* buf, char c) { std::memset(buf, c, PAGE_SIZE); }
+
+char FirstByte(DiskManager& disk, page_id_t pid) {
+    char buf[PAGE_SIZE];
+    disk.ReadPage(pid, buf);
+    return buf[0];
+}
+
+TEST(DiskManager, WritesGoToTheLogNotTheDatabaseFile) {
+    TempFile f;
+    DiskManager disk(f.path());
+    char buf[PAGE_SIZE];
+    Fill(buf, 'a');
+    disk.AllocatePage();
+    disk.WritePage(0, buf);
+    disk.Commit();
+    EXPECT_EQ(std::filesystem::file_size(f.path()), 0u) << "the database file changes only at a checkpoint";
+    EXPECT_EQ(disk.Log().PageRecords(), 1u);
+    EXPECT_EQ(FirstByte(disk, 0), 'a') << "reads see the logged version";
+    disk.Checkpoint();
+    EXPECT_EQ(std::filesystem::file_size(f.path()), PAGE_SIZE);
+    EXPECT_EQ(disk.Log().PageRecords(), 0u);
+    EXPECT_EQ(disk.Log().SizeBytes(), WriteAheadLog::kHeaderSize);
+    EXPECT_EQ(FirstByte(disk, 0), 'a');
+}
+
+TEST(DiskManager, RollbackRestoresCommittedPagesAndSize) {
+    TempFile f;
+    DiskManager disk(f.path());
+    char buf[PAGE_SIZE];
+    disk.AllocatePage();
+    Fill(buf, 'a');
+    disk.WritePage(0, buf);
+    disk.Commit();
+
+    Fill(buf, 'b');
+    disk.WritePage(0, buf);
+    disk.AllocatePage();
+    disk.WritePage(1, buf);
+    EXPECT_TRUE(disk.HasUncommittedChanges());
+    disk.Rollback();
+    EXPECT_FALSE(disk.HasUncommittedChanges());
+    EXPECT_EQ(disk.NumPages(), 1);
+    EXPECT_EQ(FirstByte(disk, 0), 'a');
+    EXPECT_EQ(disk.AllocatePage(), 1) << "the rolled-back allocation is handed out again";
+}
+
+TEST(DiskManager, CommittedWritesSurviveACrash) {
+    TempFile f;
+    std::string copy = f.path() + ".crash";
+    {
+        DiskManager disk(f.path());
+        char buf[PAGE_SIZE];
+        for (int i = 0; i < 3; ++i) disk.AllocatePage();
+        Fill(buf, 'x');
+        disk.WritePage(2, buf);
+        disk.Commit();
+        Fill(buf, 'y');  // not committed when the "crash" happens
+        disk.WritePage(1, buf);
+        disk.AllocatePage();
+        testing::CopyCrashImage(f.path(), copy);
+    }
+    {
+        DiskManager disk(copy);
+        EXPECT_EQ(disk.RecoveredCommits(), 1u);
+        EXPECT_EQ(disk.NumPages(), 3) << "the uncommitted allocation is gone";
+        EXPECT_EQ(FirstByte(disk, 2), 'x');
+        EXPECT_EQ(FirstByte(disk, 1), 0) << "the uncommitted write is gone";
+        EXPECT_EQ(disk.Log().PageRecords(), 0u) << "recovery checkpoints right away";
+    }
+    std::remove(copy.c_str());
+    std::remove((copy + ".wal").c_str());
+}
+
+// A crash in the middle of a checkpoint can leave a torn page in the database
+// file. The log still holds the full image, and recovery writes it again.
+TEST(DiskManager, RecoveryRepairsPagesTornDuringACheckpoint) {
+    TempFile f;
+    std::string copy = f.path() + ".crash";
+    {
+        DiskManager disk(f.path());
+        char buf[PAGE_SIZE];
+        disk.AllocatePage();
+        disk.AllocatePage();
+        Fill(buf, 'g');
+        disk.WritePage(1, buf);
+        disk.Commit();
+        testing::CopyCrashImage(f.path(), copy);
+    }
+    std::vector<char> torn(2 * PAGE_SIZE, 0);
+    std::memset(torn.data() + PAGE_SIZE, 'g', 100);  // only the start of page 1 made it
+    testing::WriteFileBytes(copy, torn);
+    {
+        DiskManager disk(copy);
+        char buf[PAGE_SIZE];
+        disk.ReadPage(1, buf);
+        for (size_t i = 0; i < PAGE_SIZE; ++i) ASSERT_EQ(buf[i], 'g') << "byte " << i;
+    }
+    std::remove(copy.c_str());
+    std::remove((copy + ".wal").c_str());
+}
+
+TEST(DiskManager, CleanShutdownCheckpointsAndRemovesTheLog) {
+    TempFile f;
+    {
+        DiskManager disk(f.path());
+        EXPECT_TRUE(std::filesystem::exists(f.wal_path()));
+        disk.AllocatePage();
+        char buf[PAGE_SIZE];
+        Fill(buf, 'q');
+        disk.WritePage(0, buf);  // not even committed: a clean shutdown commits it
+    }
+    EXPECT_FALSE(std::filesystem::exists(f.wal_path()));
+    EXPECT_EQ(std::filesystem::file_size(f.path()), PAGE_SIZE);
+    DiskManager disk(f.path());
+    EXPECT_EQ(FirstByte(disk, 0), 'q');
+    EXPECT_EQ(disk.RecoveredCommits(), 0u);
+}
+
+TEST(DiskManager, CheckpointsAutomaticallyWhenTheLogGrows) {
+    TempFile f;
+    DiskManager disk(f.path(), DiskOptions{true, 10});
+    char buf[PAGE_SIZE];
+    for (int i = 0; i < 30; ++i) {
+        page_id_t pid = disk.AllocatePage();
+        Fill(buf, static_cast<char>('A' + i));
+        disk.WritePage(pid, buf);
+        disk.Commit();
+        EXPECT_LT(disk.Log().PageRecords(), 10u);
+    }
+    EXPECT_EQ(disk.Checkpoints(), 3u);
+    for (page_id_t pid = 0; pid < 30; ++pid) EXPECT_EQ(FirstByte(disk, pid), static_cast<char>('A' + pid));
+}
+
+TEST(DiskManager, CheckpointRefusesUncommittedChanges) {
+    TempFile f;
+    DiskManager disk(f.path());
+    disk.AllocatePage();
+    EXPECT_THROW(disk.Checkpoint(), DbError);
+    disk.Commit();
+    EXPECT_NO_THROW(disk.Checkpoint());
+}
+
+TEST(DiskManager, InjectedWriteFailure) {
+    TempFile f;
+    DiskManager disk(f.path());
+    char buf[PAGE_SIZE] = {};
+    disk.AllocatePage();
+    disk.FailWritesAfter(1);
+    EXPECT_NO_THROW(disk.WritePage(0, buf));
+    EXPECT_THROW(disk.WritePage(0, buf), DbError);
+    EXPECT_THROW(disk.WritePage(0, buf), DbError) << "the disk stays broken";
+    disk.FailWritesAfter(-1);
+    EXPECT_NO_THROW(disk.WritePage(0, buf));
 }
 
 }  // namespace

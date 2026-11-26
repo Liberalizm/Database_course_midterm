@@ -114,6 +114,23 @@ void BufferPoolManager::FlushAll() {
     }
 }
 
+bool BufferPoolManager::HasDirtyPages() const {
+    for (const auto& [pid, f] : page_table_)
+        if (frames_[f].dirty_) return true;
+    return false;
+}
+
+void BufferPoolManager::DiscardAll() {
+    if (PinnedFrames() > 0) throw DbError("internal: cannot discard the buffer pool while pages are pinned");
+    page_table_.clear();
+    replacer_ = LRUReplacer();
+    free_list_.clear();
+    for (size_t i = 0; i < frames_.size(); ++i) {
+        frames_[i].Reset();
+        free_list_.push_back(static_cast<frame_id_t>(i));
+    }
+}
+
 size_t BufferPoolManager::PinnedFrames() const {
     size_t n = 0;
     for (const auto& p : frames_)

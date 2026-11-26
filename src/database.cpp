@@ -8,11 +8,12 @@
 
 namespace minidb {
 
-Database::Database(const std::string& path, size_t pool_frames) {
-    disk_ = std::make_unique<DiskManager>(path);
+Database::Database(const std::string& path, size_t pool_frames, DiskOptions disk_options) {
+    disk_ = std::make_unique<DiskManager>(path, disk_options);  // recovers the write-ahead log
     bpm_ = std::make_unique<BufferPoolManager>(pool_frames, disk_.get());
     catalog_ = std::make_unique<Catalog>(bpm_.get());
     planner_ = std::make_unique<Planner>(catalog_.get());
+    Commit();  // a newly created database is durable before its first statement
 }
 
 Database::~Database() {
@@ -22,9 +23,26 @@ Database::~Database() {
     }
 }
 
-void Database::Checkpoint() {
+void Database::Commit() {
     catalog_->Save();
-    bpm_->FlushAll();
+    bpm_->FlushAll();  // into the log, not the database file
+    disk_->Commit();   // COMMIT record + fsync: from here on the statement survives a crash
+}
+
+void Database::Rollback() {
+    // Checks run before writes, so most failing statements wrote nothing: then
+    // there is nothing to undo (and the catalog objects stay valid).
+    if (!bpm_->HasDirtyPages() && !disk_->HasUncommittedChanges()) return;
+    // Otherwise forget every change since the last commit, in memory and in the
+    // log, and rebuild the catalog from its committed pages.
+    bpm_->DiscardAll();
+    disk_->Rollback();
+    catalog_->Reload();
+}
+
+void Database::Checkpoint() {
+    Commit();
+    disk_->Checkpoint();
 }
 
 std::vector<QueryResult> Database::Execute(const std::string& sql) {
@@ -40,6 +58,8 @@ QueryResult Database::Run(const Statement& stmt) {
     if (auto* s = std::get_if<SelectStmt>(&stmt)) return RunSelect(*s);
     if (auto* s = std::get_if<ExplainStmt>(&stmt)) return RunExplain(*s);
 
+    // Every modifying statement is one transaction: it ends with a commit, or,
+    // if anything fails (including the commit itself), with a rollback.
     QueryResult r;
     try {
         if (auto* s = std::get_if<CreateTableStmt>(&stmt))
@@ -56,12 +76,11 @@ QueryResult Database::Run(const Statement& stmt) {
             r = RunUpdate(*s6);
         else if (auto* s7 = std::get_if<AlterTableStmt>(&stmt))
             r = RunAlterTable(*s7);
+        Commit();
     } catch (...) {
-        Checkpoint();  // keep catalog statistics consistent with whatever was written
+        Rollback();
         throw;
     }
-    // No WAL: we simply force everything to disk at the end of each modifying statement.
-    Checkpoint();
     return r;
 }
 
@@ -217,8 +236,9 @@ Row Database::PrepareRow(const TableInfo* t, Row row) const {
     return row;
 }
 
-// Statement atomicity without a log: every check that can fail runs before the
-// first byte is written, so a failing statement leaves the table untouched.
+// Every check that can fail runs before the first byte is written, so a failing
+// statement normally leaves the table untouched without needing a rollback (the
+// rollback in Run covers what checks cannot foresee, such as I/O errors).
 void Database::InsertRows(TableInfo* t, const std::vector<Row>& input) {
     const Schema& schema = t->schema;
     std::vector<Row> rows;
@@ -431,6 +451,17 @@ QueryResult Database::RunUpdate(const UpdateStmt& s) {
 }
 
 QueryResult Database::Populate(const std::string& table, int64_t n, uint32_t seed) {
+    try {
+        PopulateRows(table, n, seed);
+        Commit();
+    } catch (...) {
+        Rollback();
+        throw;
+    }
+    return {{}, {}, "INSERT " + std::to_string(n)};
+}
+
+void Database::PopulateRows(const std::string& table, int64_t n, uint32_t seed) {
     TableInfo* t = catalog_->RequireTable(table);
     const Schema& schema = t->schema;
     std::mt19937 rng(seed + static_cast<uint32_t>(t->row_count));
@@ -492,8 +523,6 @@ QueryResult Database::Populate(const std::string& table, int64_t n, uint32_t see
             batch.clear();
         }
     }
-    Checkpoint();
-    return {{}, {}, "INSERT " + std::to_string(n)};
 }
 
 }  // namespace minidb

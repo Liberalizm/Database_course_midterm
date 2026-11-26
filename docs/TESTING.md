@@ -7,7 +7,8 @@ the part that broke.
 ```
 tests/
 ├── unit/                    one executable per component, tested in isolation
-│   ├── test_disk_manager    storage: raw page I/O
+│   ├── test_wal             storage: log format, commit groups, recovery from torn/stale/damaged logs
+│   ├── test_disk_manager    storage: page I/O through the log, commit/rollback/checkpoint, crashes
 │   ├── test_lru_replacer    storage: eviction policy
 │   ├── test_buffer_pool     storage: caching, pinning, write-back, PageGuard
 │   ├── test_value           storage: values, schemas, tuple serialization
@@ -23,7 +24,7 @@ tests/
 │   └── test_shell           query:   statement splitting, scripts, meta commands, .read
 ├── integration/             whole engine via the Database API (SQL in, rows out)
 │   ├── test_sql.cpp         DDL/DML, constraints, index consistency, index-vs-scan
-│   └── test_persistence.cpp data survives restarts and simulated crashes
+│   └── test_persistence.cpp data survives restarts; crash at every point of the log; rollback on I/O errors
 └── e2e/                     the real shell binary, compared to golden output
     ├── run_case.cmake       runner: N.sql -> compare with N.expected
     ├── basic/               queries, joins, aggregates, EXPLAIN
@@ -43,13 +44,21 @@ Isolation techniques:
   all the time.
 * **Cross-checks**: index scan vs. sequential scan and hash join vs. nested loop
   must return the same results on random data.
+* **Crashes** are simulated without killing anything: a crash leaves behind
+  exactly what is in the files at that moment, so the tests copy the database
+  file and its log while the database is still open (`CopyCrashImage`), or cut
+  the log at every record boundary (and many points in between) and check that
+  recovery yields exactly the state after the last complete commit. Torn,
+  damaged and stale log records are built by editing the log's bytes.
+* **I/O errors** come from `DiskManager::FailWritesAfter(n)`, which makes page
+  writes fail from the n-th one on, in the middle of a statement or its commit.
 
 ## Running tests locally
 
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build --parallel
-ctest --test-dir build -j 8 --output-on-failure    # everything (335 tests)
+ctest --test-dir build -j 8 --output-on-failure    # everything (361 tests)
 
 ctest --test-dir build -L storage                  # one layer
 ctest --test-dir build -L query

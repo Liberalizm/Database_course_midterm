@@ -81,7 +81,9 @@ ALTER TABLE emp RENAME COLUMN salary TO pay;
  table_heap.cpp   table = linked list of slotted pages
  table_page.cpp   slotted page with variable-length tuples
  buffer_pool.cpp  page cache: pinning, LRU replacement, write-back
- disk_manager.cpp the database file as an array of 4 KB pages
+ disk_manager.cpp the database file as an array of 4 KB pages, written via the log
+ wal.cpp          write-ahead log: page images, commits, recovery, checkpoints
+ file_io.cpp      positioned file I/O with fsync (Win32 / POSIX)
 ```
 
 **Storage.** Every page is 4 KB. Tables are heap files of slotted pages; a
@@ -111,24 +113,50 @@ every outer row, with the outer values passed in as parameters.
 so rows stream through the plan. `EXPLAIN ANALYZE` shows estimated vs.
 actual row counts per operator.
 
-**Writes and durability.** Every modifying statement first computes and
-checks all affected rows (types, `NOT NULL`, row size, uniqueness against
-the end-of-statement state) and only then writes, so a failing statement
-changes nothing. After each modifying statement the catalog and all dirty
-pages are flushed to the file. There is no write-ahead log, so a crash in
-the middle of a statement can leave it partially written.
+**Writes.** Every modifying statement first computes and checks all
+affected rows (types, `NOT NULL`, row size, uniqueness against the
+end-of-statement state) and only then writes, so a failing statement
+normally changes nothing.
+
+**Write-ahead log and crash recovery.** Each modifying statement is a
+transaction. Pages are never written into the database file directly:
+every page write (including pages the buffer pool evicts in the middle of a
+statement) is appended as a full page image to the log `<file>.wal`. At the
+end of the statement the catalog and all dirty pages go to the log, followed
+by a `COMMIT` record, and the log is fsynced. From that moment the statement
+survives a crash or power failure. If anything fails before that (an I/O
+error, say), the statement is rolled back: its log records are cut off, the
+buffer pool is discarded and the catalog is reloaded.
+
+A *checkpoint* copies the newest committed image of every logged page into
+the database file, fsyncs it and empties the log. It runs when the log
+reaches 1024 pages (4 MB), on `.checkpoint`, and on a clean exit (which also
+deletes the log). On open, recovery replays every complete commit group and
+drops whatever follows the last `COMMIT` record: an unfinished statement, or a
+record torn by the crash. Records carry a checksum, the log's salt (which
+changes whenever the log is emptied), and a transaction number; the `COMMIT`
+record also carries a digest of its group. So stale or torn records are
+never applied. Because records are whole pages, replay is idempotent and
+also repairs pages torn in the middle of a checkpoint. `.stats` shows the
+log's size, commits and checkpoints.
+
+```
+ buffer pool ──page images──▶ <file>.wal ──checkpoint──▶ <file>
+                              [P][P][COMMIT][P][P][P][COMMIT][P][P]
+                              └──────── recovered ─────────┘ └ dropped after a crash
+```
 
 ## Limitations
 
-- No transactions or concurrency: one connection, autocommit only.
-- No write-ahead log (see above) and no page checksums.
+- No multi-statement transactions or concurrency: one connection, autocommit only.
+- No page checksums in the database file (the log has its own).
 - No `RIGHT` / `FULL` joins, foreign keys or views; `DEFAULT` must be a constant.
 - Indexes on `INT` and `TEXT` columns only; one column per index.
 - B+ tree nodes are not merged after deletes.
 
 ## Tests
 
-About 330 tests in three layers — unit tests per component, integration
+About 360 tests in three layers — unit tests per component, integration
 tests through the `Database` API, and end-to-end tests that run the shell
 binary against golden output — plus randomized differential and
 file-corruption tests. See [docs/TESTING.md](docs/TESTING.md).

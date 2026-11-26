@@ -19,6 +19,7 @@ out/
 *.so
 *.dll
 *.db
+*.db.wal
 
 # Local build directories
 build-*/
