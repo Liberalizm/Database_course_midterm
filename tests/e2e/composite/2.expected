@@ -1,0 +1,12 @@
+ERROR: duplicate key value violates unique constraint "enrollment_pkey": (student, course)=(2, ml)
+INSERT 1
+ student | course | term
+---------+--------+------
+ 2       | db     | 2024
+ 2       | ml     | 2025
+ 2       | os     | 2026
+(3 rows)
+ QUERY PLAN
+---------------------------------------------------------------------------------------------------------------
+ Projection: enrollment.term  (cost=4.02 rows=1)
+     -> Index Scan using enrollment_pkey on enrollment  Index Cond: enrollment.student = 2  (cost=4.02 rows=1)

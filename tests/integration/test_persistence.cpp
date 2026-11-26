@@ -149,6 +149,27 @@ TEST(Persistence, CorruptedFileNeverCrashesOrHangs) {
     EXPECT_GT(errors, 0) << "the damage should have been noticed at least sometimes";
 }
 
+TEST(Persistence, CompositeKeysSurviveRestart) {
+    TempFile f;
+    {
+        Database db(f.path(), 32);
+        db.Execute("CREATE TABLE ol (o INT, l INT, item TEXT, PRIMARY KEY (o, l), UNIQUE (item, o))");
+        db.Execute("CREATE INDEX ol_three ON ol (l, item, o)");
+        db.Populate("ol", 2000);
+        db.Execute("INSERT INTO ol VALUES (-1, 1, 'fixed'), (-1, 2, 'other')");
+    }
+    Database db(f.path(), 32);
+    ASSERT_EQ(db.GetCatalog().IndexesOf("ol").size(), 3u);
+    for (IndexInfo* idx : db.GetCatalog().IndexesOf("ol")) {
+        EXPECT_TRUE(idx->Composite()) << idx->name;
+        EXPECT_EQ(idx->tree->CheckAndCount(), 2002u) << idx->name;
+    }
+    EXPECT_THROW(db.Execute("INSERT INTO ol VALUES (-1, 1, 'new')"), DbError) << "primary key still enforced";
+    EXPECT_THROW(db.Execute("INSERT INTO ol VALUES (-1, 3, 'fixed')"), DbError) << "UNIQUE (item, o) too";
+    EXPECT_EQ(db.Execute("SELECT item FROM ol WHERE o = -1 AND l = 2").back().rows.at(0).at(0).AsText(), "other");
+    EXPECT_EQ(Scalar(db, "SELECT COUNT(*) FROM ol WHERE l = 1 AND item = 'fixed' AND o = -1"), 1);
+}
+
 TEST(Persistence, TextKeysSurviveRestart) {
     TempFile f;
     {

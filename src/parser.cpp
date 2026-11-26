@@ -310,45 +310,68 @@ AlterTableStmt Parser::ParseAlterTable() {
     return a;
 }
 
+// "(a, b, ...)": the column list of an index or a table constraint. `what`
+// names it in the error for a column listed twice.
+std::vector<std::string> Parser::ParseKeyColumns(const std::string& what) {
+    std::vector<std::string> cols;
+    ExpectSym("(");
+    do {
+        std::string c = ExpectIdent();
+        if (std::find(cols.begin(), cols.end(), c) != cols.end())
+            throw DbError("column \"" + c + "\" appears twice in " + what);
+        cols.push_back(std::move(c));
+    } while (AcceptSym(","));
+    ExpectSym(")");
+    return cols;
+}
+
+// CREATE TABLE name (column definitions and table constraints, in any order):
+//   PRIMARY KEY (a [, b ...])   UNIQUE (a [, b ...])
 CreateTableStmt Parser::ParseCreateTable() {
     CreateTableStmt c;
     c.name = ExpectIdent();
     ExpectSym("(");
-    std::string table_pk;
+    bool table_pk = false;
     do {
         if (AcceptKw("primary")) {
             ExpectKw("key");
-            ExpectSym("(");
-            table_pk = ExpectIdent();
-            ExpectSym(")");
+            if (table_pk) throw DbError("multiple primary keys for table \"" + c.name + "\" are not allowed");
+            c.primary_key = ParseKeyColumns("primary key constraint");
+            table_pk = true;
+            continue;
+        }
+        if (AcceptKw("unique")) {
+            c.unique_keys.push_back(ParseKeyColumns("unique constraint"));
             continue;
         }
         c.cols.push_back(ParseColumnDef());
     } while (AcceptSym(","));
     ExpectSym(")");
-    if (!table_pk.empty()) {
-        bool found = false;
-        for (auto& d : c.cols) {
-            if (d.name == table_pk) {
-                d.primary_key = true;
-                d.not_null = true;
-                found = true;
-            }
-        }
-        if (!found) throw DbError("primary key column \"" + table_pk + "\" does not exist");
+
+    auto find = [&](const std::string& name) -> ColumnDef* {
+        for (auto& d : c.cols)
+            if (d.name == name) return &d;
+        return nullptr;
+    };
+    for (const auto& name : c.primary_key) {
+        ColumnDef* d = find(name);
+        if (!d) throw DbError("primary key column \"" + name + "\" does not exist");
+        d->not_null = true;  // implied by PRIMARY KEY
     }
+    for (const auto& key : c.unique_keys)
+        for (const auto& name : key)
+            if (!find(name)) throw DbError("unique constraint column \"" + name + "\" does not exist");
     return c;
 }
 
+// CREATE [UNIQUE] INDEX name ON table (a [, b ...])
 CreateIndexStmt Parser::ParseCreateIndex(bool unique) {
     CreateIndexStmt c;
     c.unique = unique;
     c.name = ExpectIdent();
     ExpectKw("on");
     c.table = ExpectIdent();
-    ExpectSym("(");
-    c.column = ExpectIdent();
-    ExpectSym(")");
+    c.columns = ParseKeyColumns("index \"" + c.name + "\"");
     return c;
 }
 

@@ -57,10 +57,12 @@ BinOp Flip(BinOp op) {
     }
 }
 
-// Does `e` have the shape  alias.col <op> <constant>  (either order) usable by `idx`?
-// INT index: any comparison with an INT constant. Hashed TEXT index: only
-// equality with a TEXT constant, and `v` is the hash of that constant.
-bool MatchIndexPredicate(const Expr& e, const std::string& alias, const IndexInfo& idx, BinOp* op, int64_t* v) {
+// Does `e` have the shape  alias.column <op> <constant>  (either order), with a
+// constant an index on a column of type `type` can look up? INT column: any
+// comparison with an INT constant. TEXT column (indexed by hash): only equality
+// with a TEXT constant. Returns the operator (column on the left) and the constant.
+bool MatchKeyPredicate(const Expr& e, const std::string& alias, const std::string& column, TypeId type, BinOp* op,
+                       const Value** constant) {
     if (e.kind != ExprKind::BINARY) return false;
     BinOp o = e.op;
     if (o != BinOp::EQ && o != BinOp::LT && o != BinOp::LE && o != BinOp::GT && o != BinOp::GE) return false;
@@ -71,24 +73,54 @@ bool MatchIndexPredicate(const Expr& e, const std::string& alias, const IndexInf
         o = Flip(o);
     }
     if (c->kind != ExprKind::COLUMN || k->kind != ExprKind::CONST) return false;
-    if (c->table != alias || c->column != idx.column) return false;
-    if (idx.hashed) {
-        if (o != BinOp::EQ || k->value.Type() != TypeId::TEXT) return false;
-        *op = o;
-        *v = HashTextKey(k->value.AsText());
-        return true;
-    }
-    if (k->value.Type() != TypeId::INT) return false;
+    if (c->table != alias || c->column != column) return false;
+    if (k->value.Type() != type) return false;
+    if (type == TypeId::TEXT && o != BinOp::EQ) return false;
+    if (type != TypeId::TEXT && type != TypeId::INT) return false;
     *op = o;
-    *v = k->value.AsInt();
+    *constant = &k->value;
     return true;
 }
+
+// What the conditions on one key column allow: an equality (its constant) or
+// a range on the column's tree key, and which conjuncts these came from.
+struct KeyColumnConds {
+    std::optional<size_t> eq_conj;
+    const Value* eq_value = nullptr;
+    std::optional<IndexBound> lo, hi;
+    std::vector<size_t> range_used;
+};
 
 void TightenLo(std::optional<IndexBound>& lo, int64_t v, bool incl) {
     if (!lo || v > lo->value || (v == lo->value && !incl)) lo = IndexBound{v, incl};
 }
 void TightenHi(std::optional<IndexBound>& hi, int64_t v, bool incl) {
     if (!hi || v < hi->value || (v == hi->value && !incl)) hi = IndexBound{v, incl};
+}
+
+KeyColumnConds CollectKeyConds(const std::vector<ExprPtr>& conjuncts, const std::string& alias,
+                               const std::string& column, TypeId type) {
+    KeyColumnConds k;
+    for (size_t i = 0; i < conjuncts.size(); ++i) {
+        BinOp op;
+        const Value* c;
+        if (!MatchKeyPredicate(*conjuncts[i], alias, column, type, &op, &c)) continue;
+        int64_t v = IndexKeyPart(*c);
+        switch (op) {
+            case BinOp::EQ:
+                if (!k.eq_conj) {
+                    k.eq_conj = i;
+                    k.eq_value = c;
+                }
+                break;
+            case BinOp::GT: TightenLo(k.lo, v, false); k.range_used.push_back(i); break;
+            case BinOp::GE: TightenLo(k.lo, v, true); k.range_used.push_back(i); break;
+            case BinOp::LT: TightenHi(k.hi, v, false); k.range_used.push_back(i); break;
+            case BinOp::LE: TightenHi(k.hi, v, true); k.range_used.push_back(i); break;
+            default: break;
+        }
+    }
+    return k;
 }
 
 bool IsSubset(const std::set<int>& a, const std::set<int>& b) {
@@ -266,32 +298,16 @@ std::unique_ptr<ScanExecutor> Planner::BuildAccessPath(const Source& src, const 
     double best_rows = rows * SelectivityOf(conjuncts);
     IndexInfo* best_idx = nullptr;
     std::optional<IndexBound> best_lo, best_hi;
-    std::vector<size_t> best_used;
+    std::vector<size_t> best_answered;
 
-    // Option 2..n: an index scan for every usable index.
+    // Option 2..n: an index scan for every usable index. A multi-column index is
+    // searched on its leading column, and once that is fixed by an equality, also
+    // on the next: a range (or equality) on an INT second column of a two-column
+    // index, or equality on all the other columns (whose hash is key2).
     for (IndexInfo* idx : catalog_->IndexesOf(t->name)) {
-        std::optional<IndexBound> lo, hi;
-        std::optional<size_t> eq_conj;
-        int64_t eq_val = 0;
-        std::vector<size_t> range_used;
-        for (size_t i = 0; i < conjuncts.size(); ++i) {
-            BinOp op;
-            int64_t v;
-            if (!MatchIndexPredicate(*conjuncts[i], src.alias, *idx, &op, &v)) continue;
-            switch (op) {
-                case BinOp::EQ:
-                    if (!eq_conj) {
-                        eq_conj = i;
-                        eq_val = v;
-                    }
-                    break;
-                case BinOp::GT: TightenLo(lo, v, false); range_used.push_back(i); break;
-                case BinOp::GE: TightenLo(lo, v, true); range_used.push_back(i); break;
-                case BinOp::LT: TightenHi(hi, v, false); range_used.push_back(i); break;
-                case BinOp::LE: TightenHi(hi, v, true); range_used.push_back(i); break;
-                default: break;
-            }
-        }
+        auto type_of = [&](size_t i) { return t->schema.At(static_cast<size_t>(idx->col_idxs[i])).type; };
+        const KeyColumnConds k0 = CollectKeyConds(conjuncts, src.alias, idx->columns[0], type_of(0));
+        std::optional<IndexBound> lo = k0.lo, hi = k0.hi;
         // Statistics: min/max of the column straight from the B+ tree. Assume
         // values are uniformly distributed in [min, max].
         int64_t kmin = 0, kmax = 0;
@@ -300,18 +316,53 @@ std::unique_ptr<ScanExecutor> Planner::BuildAccessPath(const Source& src, const 
         double domain = have_stats ? static_cast<double>(kmax) - static_cast<double>(kmin) + 1.0 : 0.0;
 
         double matched;
-        std::vector<size_t> used;
-        if (eq_conj) {
+        std::vector<size_t> used;      // conjuncts the scan bounds come from (for estimates)
+        std::vector<size_t> answered;  // ... of which the scan alone guarantees (no re-check)
+        if (k0.eq_conj) {
+            const int64_t eq_val = IndexKeyPart(*k0.eq_value);
             lo = hi = IndexBound{eq_val, true};
-            used = {*eq_conj};
-            if (idx->unique)
+            used = {*k0.eq_conj};
+            bool full_key = !idx->Composite();  // every key column fixed by an equality
+            double narrow = 1.0;                 // selectivity of the conditions on the other columns
+            if (idx->OrderedKey2()) {
+                KeyColumnConds k1 = CollectKeyConds(conjuncts, src.alias, idx->columns[1], TypeId::INT);
+                if (k1.eq_conj) {
+                    lo = hi = IndexBound{eq_val, true, true, k1.eq_value->AsInt()};
+                    used.push_back(*k1.eq_conj);
+                    full_key = true;
+                    narrow = 0.05;
+                } else if (k1.lo || k1.hi) {
+                    if (k1.lo) lo = IndexBound{eq_val, k1.lo->inclusive, true, k1.lo->value};
+                    if (k1.hi) hi = IndexBound{eq_val, k1.hi->inclusive, true, k1.hi->value};
+                    used.insert(used.end(), k1.range_used.begin(), k1.range_used.end());
+                    narrow = (k1.lo && k1.hi) ? 0.1 : 0.3;
+                }
+            } else if (idx->Key2Hashed()) {
+                Row rest;
+                std::vector<size_t> rest_used;
+                for (size_t i = 1; i < idx->columns.size(); ++i) {
+                    KeyColumnConds ki = CollectKeyConds(conjuncts, src.alias, idx->columns[i], type_of(i));
+                    if (!ki.eq_conj) break;
+                    rest.push_back(*ki.eq_value);
+                    rest_used.push_back(*ki.eq_conj);
+                }
+                if (rest.size() == idx->columns.size() - 1) {
+                    lo = hi = IndexBound{eq_val, true, true, IndexKey2(rest.data(), rest.size())};
+                    used.insert(used.end(), rest_used.begin(), rest_used.end());
+                    full_key = true;
+                    narrow = std::pow(0.05, static_cast<double>(rest.size()));
+                }
+            }
+            if (idx->unique && full_key)
                 matched = 1.0;
             else if (have_stats)
-                matched = (eq_val < kmin || eq_val > kmax) ? 1.0 : std::max(1.0, rows / domain);
+                matched = (eq_val < kmin || eq_val > kmax) ? 1.0 : std::max(1.0, rows / domain * narrow);
             else
-                matched = std::max(1.0, rows * 0.05);
+                matched = std::max(1.0, rows * 0.05 * narrow);
+            answered.push_back(*k0.eq_conj);
         } else if (lo || hi) {
-            used = range_used;
+            used = k0.range_used;
+            answered = k0.range_used;
             if (have_stats) {
                 double a = lo ? static_cast<double>(lo->value) + (lo->inclusive ? 0 : 1) : static_cast<double>(kmin);
                 double b = hi ? static_cast<double>(hi->value) - (hi->inclusive ? 0 : 1) : static_cast<double>(kmax);
@@ -325,6 +376,10 @@ std::unique_ptr<ScanExecutor> Planner::BuildAccessPath(const Source& src, const 
         } else {
             continue;
         }
+        // Only conditions on an INT leading column are answered exactly. A TEXT one
+        // is looked up by hash, and key2 can be a hash or stand for a NULL, so
+        // those conditions stay in the filter as a re-check.
+        if (idx->hashed) answered.clear();
         std::vector<ExprPtr> rest;
         for (size_t i = 0; i < conjuncts.size(); ++i)
             if (std::find(used.begin(), used.end(), i) == used.end()) rest.push_back(conjuncts[i]);
@@ -333,24 +388,22 @@ std::unique_ptr<ScanExecutor> Planner::BuildAccessPath(const Source& src, const 
         // fetching `matched` random rows out of `pages` pages.
         double pages_fetched = pages * (1.0 - std::pow(1.0 - 1.0 / pages, matched));
         if (pages <= 1.0) pages_fetched = 1.0;
-        double cost = idx->tree->Height() + matched / BPlusTree::LEAF_CAPACITY + pages_fetched * RANDOM_PAGE_COST +
+        double cost = idx->tree->Height() + matched / idx->tree->LeafCapacity() + pages_fetched * RANDOM_PAGE_COST +
                       matched * CPU_TUPLE_COST;
         if (cost < best_cost) {
             best_cost = cost;
             best_idx = idx;
             best_lo = lo;
             best_hi = hi;
-            best_used = used;
+            best_answered = answered;
             best_rows = matched * SelectivityOf(rest);
         }
     }
 
-    // Conditions answered by the index are dropped from the filter, except for a
-    // hashed (TEXT) index: two texts can share a hash, so `col = 'x'` is re-checked.
-    const bool recheck = best_idx && best_idx->hashed;
+    // Conditions the index answers exactly are dropped from the filter.
     std::vector<ExprPtr> residual;
     for (size_t i = 0; i < conjuncts.size(); ++i)
-        if (recheck || std::find(best_used.begin(), best_used.end(), i) == best_used.end())
+        if (std::find(best_answered.begin(), best_answered.end(), i) == best_answered.end())
             residual.push_back(conjuncts[i]);
     ExprPtr pred = MakeConjunction(residual);
     ExprPtr bound = pred ? BindExpr(pred, src.schema) : nullptr;

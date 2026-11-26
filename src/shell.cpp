@@ -16,7 +16,8 @@ const char* kHelp = R"(MiniDB - a relational database written from scratch.
 
 SQL (end every statement with ';'):
   CREATE TABLE t (id INT PRIMARY KEY, name TEXT NOT NULL DEFAULT '?', score DOUBLE, ok BOOL);
-  CREATE [UNIQUE] INDEX idx ON t (col);        DROP TABLE t;  DROP INDEX idx;
+  CREATE TABLE u (a INT, b TEXT, n INT, PRIMARY KEY (a, b), UNIQUE (b, n));
+  CREATE [UNIQUE] INDEX idx ON t (col [, col2 ...]);  DROP TABLE t;  DROP INDEX idx;
   ALTER TABLE t ADD [COLUMN] c TYPE [UNIQUE] | DROP [COLUMN] c | RENAME [COLUMN] a TO b | RENAME TO u;
   INSERT INTO t VALUES (1, 'a', 2.5, true), (2, 'b', NULL, false);
   INSERT INTO t (id, name) SELECT ...;
@@ -39,6 +40,12 @@ Meta commands:
   .timer on|off         show query time      .checkpoint        flush everything to disk
   .help                 this text            .exit / .quit      leave
 )";
+
+std::string ColumnList(const IndexInfo& idx) {
+    std::string out;
+    for (size_t i = 0; i < idx.columns.size(); ++i) out += (i ? ", " : "") + idx.columns[i];
+    return out;
+}
 
 std::string Trim(const std::string& s) {
     size_t a = s.find_first_not_of(" \t\r\n");
@@ -169,8 +176,8 @@ bool Shell::RunMeta(const std::string& line) {
                 out_ << "  " << t->name << "  (" << t->row_count << " rows, " << t->heap->PageCount() << " pages)\n";
         } else if (cmd == ".indexes") {
             for (IndexInfo* i : db_.GetCatalog().Indexes())
-                out_ << "  " << i->name << " ON " << i->table << "(" << i->column << ")" << (i->unique ? " UNIQUE" : "")
-                     << "  height=" << i->tree->Height() << "\n";
+                out_ << "  " << i->name << " ON " << i->table << "(" << ColumnList(*i) << ")"
+                     << (i->unique ? " UNIQUE" : "") << "  height=" << i->tree->Height() << "\n";
         } else if (cmd == ".schema") {
             std::string name;
             in >> name;
@@ -185,7 +192,8 @@ bool Shell::RunMeta(const std::string& line) {
                 out_ << "\n";
             }
             for (IndexInfo* i : db_.GetCatalog().IndexesOf(name))
-                out_ << "  index " << i->name << " (" << i->column << ")" << (i->unique ? " UNIQUE" : "") << " btree\n";
+                out_ << "  index " << i->name << " (" << ColumnList(*i) << ")" << (i->unique ? " UNIQUE" : "")
+                     << " btree\n";
         } else if (cmd == ".stats") {
             auto& b = db_.Bpm();
             auto& d = db_.Disk();
