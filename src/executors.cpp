@@ -96,6 +96,7 @@ std::string IndexScanExecutor::Describe() const {
     std::string s = "Index Scan using " + index_->name + " on " + TableLabel(table_, alias_);
     std::vector<std::string> conds;
     std::string col = alias_ + "." + index_->column;
+    if (index_->hashed) col = "hash(" + col + ")";  // the bounds are hash values
     if (lo_ && hi_ && lo_->inclusive && hi_->inclusive && lo_->value == hi_->value) {
         conds.push_back(col + " = " + std::to_string(lo_->value));
     } else {

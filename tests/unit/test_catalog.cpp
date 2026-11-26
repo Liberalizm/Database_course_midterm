@@ -62,12 +62,12 @@ TEST_F(CatalogTest, IndexIsBuiltFromExistingRows) {
 }
 
 TEST_F(CatalogTest, IndexValidation) {
-    TableInfo* t = cat->CreateTable("t", {Col("k", TypeId::INT), Col("s", TypeId::TEXT)});
-    EXPECT_THROW(cat->CreateIndex("i1", "t", "s", false), DbError) << "TEXT not indexable";
+    TableInfo* t = cat->CreateTable("t", {Col("k", TypeId::INT), Col("s", TypeId::TEXT), Col("d", TypeId::DOUBLE)});
+    EXPECT_THROW(cat->CreateIndex("i1", "t", "d", false), DbError) << "DOUBLE not indexable";
     EXPECT_THROW(cat->CreateIndex("i2", "t", "zzz", false), DbError);
     EXPECT_THROW(cat->CreateIndex("i3", "missing", "k", false), DbError);
-    AddRow(t, {I(1), T("a")});
-    AddRow(t, {I(1), T("b")});
+    AddRow(t, {I(1), T("a"), D(1.0)});
+    AddRow(t, {I(1), T("b"), D(2.0)});
     EXPECT_THROW(cat->CreateIndex("uniq", "t", "k", true), DbError) << "duplicates violate UNIQUE";
     EXPECT_NO_THROW(cat->CreateIndex("i4", "t", "k", false));
     EXPECT_THROW(cat->CreateIndex("i4", "t", "k", false), DbError) << "duplicate index name";
@@ -280,6 +280,61 @@ TEST_F(CatalogTest, ZeroedCatalogWithOtherPagesIsStillCorrupt) {
     disk = std::make_unique<DiskManager>(file.path());
     bpm = std::make_unique<BufferPoolManager>(32, disk.get());
     EXPECT_THROW(Catalog c(bpm.get()), DbError) << "data exists: never silently reset it";
+}
+
+// ---- TEXT (hashed) indexes ----
+
+TEST_F(CatalogTest, TextIndexIsHashedAndExact) {
+    EXPECT_EQ(HashTextKey("abc"), HashTextKey("abc"));
+    EXPECT_NE(HashTextKey("abc"), HashTextKey("abd"));
+    EXPECT_NE(HashTextKey(""), HashTextKey(std::string(1, '\0')));
+
+    TableInfo* t = cat->CreateTable("u", {Col("id", TypeId::INT), Col("email", TypeId::TEXT)});
+    AddRow(t, {I(1), T("a@x")});
+    AddRow(t, {I(2), T("b@x")});
+    AddRow(t, {I(3), N()});
+    IndexInfo* idx = cat->CreateIndex("u_email", "u", "email", true);
+    EXPECT_TRUE(idx->hashed);
+    EXPECT_EQ(idx->tree->CheckAndCount(), 2u) << "NULLs are not indexed";
+    EXPECT_TRUE(cat->KeyTaken(idx, T("a@x")));
+    EXPECT_FALSE(cat->KeyTaken(idx, T("c@x")));
+    EXPECT_FALSE(cat->KeyTaken(idx, T("a@x"), [](RID) { return true; })) << "ignored rows do not count";
+}
+
+TEST_F(CatalogTest, TextIndexSurvivesHashCollisions) {
+    TableInfo* t = cat->CreateTable("u", {Col("id", TypeId::INT), Col("name", TypeId::TEXT)});
+    AddRow(t, {I(1), T("y")});
+    IndexInfo* idx = cat->CreateIndex("u_name", "u", "name", true);
+    // Fake a collision: an entry with the hash of "x" that points at the row holding "y".
+    RID y_rid;
+    {
+        auto it = t->heap->Begin();
+        std::string buf;
+        ASSERT_TRUE(it.Next(&y_rid, &buf));
+    }
+    idx->tree->Insert(HashTextKey("x"), y_rid);
+    EXPECT_FALSE(cat->KeyTaken(idx, T("x"))) << "same hash, different text: not a duplicate";
+    EXPECT_TRUE(cat->KeyTaken(idx, T("y")));
+}
+
+TEST_F(CatalogTest, TextIndexKindIsRestoredAfterRestart) {
+    TableInfo* t = cat->CreateTable("u", {Col("id", TypeId::INT), Col("name", TypeId::TEXT)});
+    AddRow(t, {I(1), T("ann")});
+    cat->CreateIndex("u_name", "u", "name", true);
+    cat->CreateIndex("u_id", "u", "id", false);
+    Reopen();
+    for (IndexInfo* idx : cat->IndexesOf("u")) EXPECT_EQ(idx->hashed, idx->column == "name") << idx->name;
+    IndexInfo* by_name = cat->IndexesOf("u")[0]->column == "name" ? cat->IndexesOf("u")[0] : cat->IndexesOf("u")[1];
+    EXPECT_TRUE(cat->KeyTaken(by_name, T("ann")));
+}
+
+TEST_F(CatalogTest, UniqueTextIndexOnDuplicatesFails) {
+    TableInfo* t = cat->CreateTable("u", {Col("name", TypeId::TEXT)});
+    AddRow(t, {T("a")});
+    AddRow(t, {T("b")});
+    AddRow(t, {T("a")});
+    EXPECT_THROW(cat->CreateIndex("u_name", "u", "name", true), DbError);
+    EXPECT_NO_THROW(cat->CreateIndex("u_name", "u", "name", false));
 }
 
 }  // namespace

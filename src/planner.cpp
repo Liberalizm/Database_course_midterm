@@ -57,8 +57,10 @@ BinOp Flip(BinOp op) {
     }
 }
 
-// Does `e` have the shape  alias.col <op> <INT constant>  (either order)?
-bool MatchIndexPredicate(const Expr& e, const std::string& alias, const std::string& col, BinOp* op, int64_t* v) {
+// Does `e` have the shape  alias.col <op> <constant>  (either order) usable by `idx`?
+// INT index: any comparison with an INT constant. Hashed TEXT index: only
+// equality with a TEXT constant, and `v` is the hash of that constant.
+bool MatchIndexPredicate(const Expr& e, const std::string& alias, const IndexInfo& idx, BinOp* op, int64_t* v) {
     if (e.kind != ExprKind::BINARY) return false;
     BinOp o = e.op;
     if (o != BinOp::EQ && o != BinOp::LT && o != BinOp::LE && o != BinOp::GT && o != BinOp::GE) return false;
@@ -69,7 +71,13 @@ bool MatchIndexPredicate(const Expr& e, const std::string& alias, const std::str
         o = Flip(o);
     }
     if (c->kind != ExprKind::COLUMN || k->kind != ExprKind::CONST) return false;
-    if (c->table != alias || c->column != col) return false;
+    if (c->table != alias || c->column != idx.column) return false;
+    if (idx.hashed) {
+        if (o != BinOp::EQ || k->value.Type() != TypeId::TEXT) return false;
+        *op = o;
+        *v = HashTextKey(k->value.AsText());
+        return true;
+    }
     if (k->value.Type() != TypeId::INT) return false;
     *op = o;
     *v = k->value.AsInt();
@@ -157,7 +165,7 @@ std::unique_ptr<ScanExecutor> Planner::BuildAccessPath(const Source& src, const 
         for (size_t i = 0; i < conjuncts.size(); ++i) {
             BinOp op;
             int64_t v;
-            if (!MatchIndexPredicate(*conjuncts[i], src.alias, idx->column, &op, &v)) continue;
+            if (!MatchIndexPredicate(*conjuncts[i], src.alias, *idx, &op, &v)) continue;
             switch (op) {
                 case BinOp::EQ:
                     if (!eq_conj) {
@@ -175,7 +183,8 @@ std::unique_ptr<ScanExecutor> Planner::BuildAccessPath(const Source& src, const 
         // Statistics: min/max of the column straight from the B+ tree. Assume
         // values are uniformly distributed in [min, max].
         int64_t kmin = 0, kmax = 0;
-        bool have_stats = idx->tree->MinKey(&kmin) && idx->tree->MaxKey(&kmax) && kmax >= kmin;
+        // (Not for a hashed index: the min/max of hash values says nothing.)
+        bool have_stats = !idx->hashed && idx->tree->MinKey(&kmin) && idx->tree->MaxKey(&kmax) && kmax >= kmin;
         double domain = have_stats ? static_cast<double>(kmax) - static_cast<double>(kmin) + 1.0 : 0.0;
 
         double matched;
@@ -224,9 +233,13 @@ std::unique_ptr<ScanExecutor> Planner::BuildAccessPath(const Source& src, const 
         }
     }
 
+    // Conditions answered by the index are dropped from the filter, except for a
+    // hashed (TEXT) index: two texts can share a hash, so `col = 'x'` is re-checked.
+    const bool recheck = best_idx && best_idx->hashed;
     std::vector<ExprPtr> residual;
     for (size_t i = 0; i < conjuncts.size(); ++i)
-        if (std::find(best_used.begin(), best_used.end(), i) == best_used.end()) residual.push_back(conjuncts[i]);
+        if (recheck || std::find(best_used.begin(), best_used.end(), i) == best_used.end())
+            residual.push_back(conjuncts[i]);
     ExprPtr pred = MakeConjunction(residual);
     ExprPtr bound = pred ? BindExpr(pred, src.schema) : nullptr;
 

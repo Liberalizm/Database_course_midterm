@@ -149,5 +149,17 @@ TEST(Persistence, CorruptedFileNeverCrashesOrHangs) {
     EXPECT_GT(errors, 0) << "the damage should have been noticed at least sometimes";
 }
 
+TEST(Persistence, TextKeysSurviveRestart) {
+    TempFile f;
+    {
+        Database db(f.path(), 32);
+        db.Execute("CREATE TABLE u (name TEXT PRIMARY KEY, n INT)");
+        db.Execute("INSERT INTO u VALUES ('alice', 1), ('bob', 2)");
+    }
+    Database db(f.path(), 32);
+    EXPECT_THROW(db.Execute("INSERT INTO u VALUES ('alice', 3)"), DbError) << "unique TEXT key still enforced";
+    EXPECT_EQ(Scalar(db, "SELECT n FROM u WHERE name = 'bob'"), 2);
+}
+
 }  // namespace
 }  // namespace minidb

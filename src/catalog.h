@@ -1,6 +1,7 @@
 // catalog.h - system catalog: which tables and indexes exist, and where they live.
 #pragma once
 
+#include <functional>
 #include <map>
 #include <memory>
 #include <string>
@@ -20,13 +21,23 @@ struct TableInfo {
     std::unique_ptr<TableHeap> heap;
 };
 
+// 64-bit FNV-1a hash of a TEXT value: the B+ tree key of a TEXT index.
+int64_t HashTextKey(const std::string& s);
+
 struct IndexInfo {
     std::string name;
     std::string table;
     std::string column;
     int col_idx = -1;
     bool unique = false;
+    // INT column: the B+ tree key is the value itself (supports ranges).
+    // TEXT column: the key is HashTextKey(value), so the index answers only
+    // equality lookups, and since hashes can collide every hit is re-checked
+    // against the real value (see Catalog::KeyTaken and the planner).
+    bool hashed = false;
     std::unique_ptr<BPlusTree> tree;
+
+    int64_t KeyOf(const Value& v) const { return hashed ? HashTextKey(v.AsText()) : v.AsInt(); }
 };
 
 // The catalog itself is persisted in a chain of pages starting at page 0.
@@ -42,6 +53,11 @@ public:
     IndexInfo* CreateIndex(const std::string& name, const std::string& table, const std::string& column, bool unique);
     void DropIndex(const std::string& name);
     std::vector<IndexInfo*> IndexesOf(const std::string& table);
+
+    // True if some row (other than those `ignore` returns true for) has the
+    // non-NULL value `v` in the index's column. Used for UNIQUE checks; exact
+    // even for hashed TEXT indexes, whose candidate rows are compared by value.
+    bool KeyTaken(IndexInfo* idx, const Value& v, const std::function<bool(RID)>& ignore = nullptr);
 
     std::vector<TableInfo*> Tables();
     std::vector<IndexInfo*> Indexes();

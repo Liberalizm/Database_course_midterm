@@ -215,6 +215,8 @@ void Catalog::Load() {
         page_id_t root = r.I32();
         TableInfo* t = RequireTable(idx->table);
         idx->col_idx = t->schema.Find("", idx->column);
+        if (idx->col_idx < 0) throw DbError("catalog is corrupt (index on unknown column)");
+        idx->hashed = t->schema.At(static_cast<size_t>(idx->col_idx)).type == TypeId::TEXT;
         idx->tree = std::make_unique<BPlusTree>(bpm_, root);
         indexes_[idx->name] = std::move(idx);
     }
@@ -285,9 +287,10 @@ IndexInfo* Catalog::CreateIndex(const std::string& name, const std::string& tabl
     TableInfo* t = RequireTable(table);
     int col = t->schema.Find("", column);
     if (col < 0) throw DbError("column \"" + column + "\" does not exist in table \"" + table + "\"");
-    if (t->schema.At(col).type != TypeId::INT)
-        throw DbError("indexes are only supported on INT columns (\"" + column + "\" is " +
-                      TypeName(t->schema.At(col).type) + ")");
+    TypeId type = t->schema.At(col).type;
+    if (type != TypeId::INT && type != TypeId::TEXT)
+        throw DbError("indexes are only supported on INT and TEXT columns (\"" + column + "\" is " +
+                      TypeName(type) + ")");
 
     auto idx = std::make_unique<IndexInfo>();
     idx->name = name;
@@ -295,6 +298,7 @@ IndexInfo* Catalog::CreateIndex(const std::string& name, const std::string& tabl
     idx->column = column;
     idx->col_idx = col;
     idx->unique = unique;
+    idx->hashed = type == TypeId::TEXT;
     idx->tree = std::make_unique<BPlusTree>(bpm_, INVALID_PAGE_ID);
 
     // Bulk-build from the existing rows.
@@ -303,13 +307,13 @@ IndexInfo* Catalog::CreateIndex(const std::string& name, const std::string& tabl
     std::string buf;
     while (it.Next(&rid, &buf)) {
         Row row = DeserializeTuple(t->schema, buf.data(), buf.size());
-        if (row[col].IsNull()) continue;
-        int64_t key = row[col].AsInt();
-        if (unique && idx->tree->ContainsKey(key)) {
+        const Value& v = row[col];
+        if (v.IsNull()) continue;
+        if (unique && KeyTaken(idx.get(), v)) {
             FreePages(idx->tree->Pages());  // don't leak the partially built tree
-            throw DbError("could not create unique index \"" + name + "\": duplicate key " + std::to_string(key));
+            throw DbError("could not create unique index \"" + name + "\": duplicate key " + v.ToString());
         }
-        idx->tree->Insert(key, rid);
+        idx->tree->Insert(idx->KeyOf(v), rid);
     }
     IndexInfo* raw = idx.get();
     indexes_[name] = std::move(idx);
@@ -322,6 +326,32 @@ void Catalog::DropIndex(const std::string& name) {
     std::vector<page_id_t> pages = it->second->tree->Pages();
     indexes_.erase(it);
     FreePages(pages);
+}
+
+int64_t HashTextKey(const std::string& s) {
+    uint64_t h = 14695981039346656037ull;  // FNV-1a, 64 bit
+    for (unsigned char c : s) {
+        h ^= c;
+        h *= 1099511628211ull;
+    }
+    return static_cast<int64_t>(h);
+}
+
+bool Catalog::KeyTaken(IndexInfo* idx, const Value& v, const std::function<bool(RID)>& ignore) {
+    TableInfo* t = idx->hashed ? RequireTable(idx->table) : nullptr;
+    const int64_t key = idx->KeyOf(v);
+    std::string buf;
+    for (auto it = idx->tree->LowerBound(key); it.Valid() && it.Entry().key == key; it.Next()) {
+        RID rid = it.Entry().rid;
+        if (ignore && ignore(rid)) continue;
+        if (!idx->hashed) return true;
+        // Same hash: only a conflict if the actual text is equal too.
+        if (!t->heap->Get(rid, &buf)) continue;
+        Row row = DeserializeTuple(t->schema, buf.data(), buf.size());
+        const Value& other = row[static_cast<size_t>(idx->col_idx)];
+        if (!other.IsNull() && other.Compare(v) == 0) return true;
+    }
+    return false;
 }
 
 std::vector<IndexInfo*> Catalog::IndexesOf(const std::string& table) {

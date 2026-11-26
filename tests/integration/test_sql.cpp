@@ -125,7 +125,7 @@ TEST_F(SqlTest, Constraints) {
     EXPECT_THROW(db->Execute("UPDATE emp SET id = NULL WHERE id = 1"), DbError);
     EXPECT_NO_THROW(db->Execute("UPDATE emp SET id = 1 WHERE id = 1")) << "same value is not a conflict";
     EXPECT_THROW(db->Execute("CREATE TABLE bad (a INT PRIMARY KEY, b INT PRIMARY KEY)"), DbError);
-    EXPECT_THROW(db->Execute("CREATE TABLE bad (a TEXT PRIMARY KEY)"), DbError);
+    EXPECT_THROW(db->Execute("CREATE TABLE bad (a DOUBLE PRIMARY KEY)"), DbError);
     EXPECT_EQ(Scalar("SELECT COUNT(*) FROM emp"), 5) << "failed statements must not change data";
     ExpectIndexesConsistent("emp");
 }
@@ -310,6 +310,59 @@ TEST_F(SqlTest, FunctionsCaseConcatAndDistinctAggregates) {
     EXPECT_THROW(db->Execute("SELECT NOSUCHFN(id) FROM emp"), DbError);
     EXPECT_THROW(db->Execute("SELECT name FROM emp GROUP BY UPPER(name)"), DbError)
         << "name itself is not grouped, only UPPER(name)";
+}
+
+TEST_F(SqlTest, TextPrimaryKeyAndUniqueColumns) {
+    db->Execute("CREATE TABLE users (name TEXT PRIMARY KEY, email TEXT UNIQUE, age INT)");
+    db->Execute("INSERT INTO users VALUES ('ann', 'ann@x', 30), ('bob', NULL, 25), ('cid', NULL, 41)");
+    EXPECT_THROW(db->Execute("INSERT INTO users VALUES ('ann', 'other@x', 1)"), DbError);
+    EXPECT_THROW(db->Execute("INSERT INTO users VALUES ('dan', 'ann@x', 1)"), DbError);
+    EXPECT_THROW(db->Execute("INSERT INTO users VALUES ('eve', 'e@x', 1), ('eve', 'f@x', 2)"), DbError)
+        << "duplicates inside one statement";
+    EXPECT_THROW(db->Execute("INSERT INTO users VALUES (NULL, 'n@x', 1)"), DbError) << "PRIMARY KEY is NOT NULL";
+    EXPECT_NO_THROW(db->Execute("INSERT INTO users VALUES ('Ann', 'ANN@x', 1)")) << "case-sensitive like PostgreSQL";
+    EXPECT_THROW(db->Execute("UPDATE users SET email = 'ann@x' WHERE name = 'bob'"), DbError);
+    // Swapping two keys in one statement is fine: uniqueness holds at the end.
+    EXPECT_EQ(Msg("UPDATE users SET name = CASE name WHEN 'bob' THEN 'cid' ELSE 'bob' END "
+                  "WHERE name = 'bob' OR name = 'cid'"),
+              "UPDATE 2");
+    EXPECT_EQ(Scalar("SELECT age FROM users WHERE name = 'cid'"), 25);
+    EXPECT_EQ(Msg("DELETE FROM users WHERE name = 'Ann'"), "DELETE 1");
+    EXPECT_NO_THROW(db->Execute("INSERT INTO users VALUES ('Ann', 'ANN@x', 1)")) << "the deleted key is free again";
+    ExpectIndexesConsistent("users");
+}
+
+TEST_F(SqlTest, TextIndexIsUsedForEqualityOnly) {
+    db->Execute("CREATE TABLE t (id INT PRIMARY KEY, code TEXT)");
+    db->Populate("t", 3000);
+    db->Execute("CREATE INDEX t_code ON t (code)");
+    std::string code = Q("SELECT code FROM t WHERE id = 1234")[0][0].AsText();
+    auto plan = Q("EXPLAIN SELECT id FROM t WHERE code = '" + code + "'");
+    std::string text;
+    for (auto& r : plan) text += r[0].AsText() + "\n";
+    EXPECT_NE(text.find("Index Scan using t_code"), std::string::npos) << text;
+    EXPECT_NE(text.find("hash(t.code)"), std::string::npos) << text;
+    EXPECT_NE(text.find("Filter: t.code = '" + code + "'"), std::string::npos) << "re-checked because of collisions\n"
+                                                                             << text;
+    auto range = Q("EXPLAIN SELECT id FROM t WHERE code > 'm'");
+    EXPECT_EQ(range[1][0].AsText().find("Index Scan"), std::string::npos) << "hashes cannot answer ranges";
+    // Same answers with and without the index.
+    for (const char* c : {"alpha_1", "kilo_500", "nope", "papa_999"}) {
+        std::string q = std::string("SELECT COUNT(*) FROM t WHERE code = '") + c + "'";
+        int64_t with_index = Scalar(q);
+        int64_t by_scan = Scalar(std::string("SELECT COUNT(*) FROM t WHERE code || '' = '") + c + "'");
+        EXPECT_EQ(with_index, by_scan) << c;
+    }
+    ExpectIndexesConsistent("t");
+}
+
+TEST_F(SqlTest, PopulateFillsUniqueTextColumns) {
+    db->Execute("CREATE TABLE u (id INT PRIMARY KEY, login TEXT UNIQUE)");
+    db->Execute("INSERT INTO u VALUES (1, 'login_3')");  // a value Populate would also produce
+    db->Populate("u", 500);
+    EXPECT_EQ(Scalar("SELECT COUNT(*) FROM u"), 501);
+    EXPECT_EQ(Scalar("SELECT COUNT(DISTINCT login) FROM u"), 501);
+    ExpectIndexesConsistent("u");
 }
 
 TEST_F(SqlTest, QuotedIdentifiersAreNeverKeywords) {
