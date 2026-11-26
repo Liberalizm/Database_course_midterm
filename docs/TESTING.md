@@ -29,6 +29,7 @@ tests/
     ├── run_case.cmake       runner: N.sql -> compare with N.expected
     ├── basic/               queries, joins, aggregates, EXPLAIN
     ├── advanced/            LEFT JOIN, functions, subqueries, set ops, TEXT keys, ALTER TABLE
+    ├── composite/           composite PRIMARY KEY / UNIQUE, multi-column indexes (2 steps: restart)
     ├── errors/              error messages; the shell keeps going after errors
     ├── persistence/         3 separate shell processes on the same file
     └── views/               CREATE / DROP VIEW, views over views, kept across a restart
@@ -51,7 +52,7 @@ Isolation techniques:
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build --parallel
-ctest --test-dir build -j 8 --output-on-failure    # everything (335 tests)
+ctest --test-dir build -j 8 --output-on-failure    # everything (362 tests)
 
 ctest --test-dir build -L storage                  # one layer
 ctest --test-dir build -L query

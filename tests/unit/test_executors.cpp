@@ -561,6 +561,82 @@ TEST_F(ScanTest, IndexScanResidualPredicate) {
     EXPECT_EQ(Keys(*IScan(IndexBound{1, true}, IndexBound{10, true}, pred)), (std::vector<int64_t>{2, 4, 6, 8, 10}));
 }
 
+// Scans of a two-column index on (a INT, b INT): bounds on (key, key2) pairs.
+class CompositeScanTest : public ::testing::Test {
+protected:
+    void SetUp() override {
+        table = catalog.CreateTable("t", {Col("a", TypeId::INT), Col("b", TypeId::INT)});
+        std::vector<Row> rows;
+        for (int a = 0; a < 10; ++a)
+            for (int b = 9; b >= 0; --b) rows.push_back({I(a), I(b)});
+        rows.push_back({I(5), N()});
+        rows.push_back({I(5), I(INT64_MAX)});
+        rows.push_back({I(6), I(INT64_MIN)});
+        rows.push_back({N(), I(5)});  // not indexed (NULL leading column)
+        for (const Row& r : rows) {
+            table->heap->Insert(SerializeTuple(table->schema, r));
+            ++table->row_count;
+        }
+        index = catalog.CreateIndex("t_ab", "t", std::vector<std::string>{"a", "b"}, false);
+    }
+    // Rows as "a:b" strings, in scan order.
+    std::vector<std::string> Scan(std::optional<IndexBound> lo, std::optional<IndexBound> hi) {
+        IndexScanExecutor s(table, index, "t", table->schema, lo, hi, nullptr);
+        std::vector<std::string> out;
+        for (auto& r : Drain(s)) out.push_back(r[0].ToString() + ":" + r[1].ToString());
+        return out;
+    }
+    using V = std::vector<std::string>;
+
+    TempFile file;
+    DiskManager disk{file.path()};
+    BufferPoolManager bpm{32, &disk};
+    Catalog catalog{&bpm};
+    TableInfo* table = nullptr;
+    IndexInfo* index = nullptr;
+};
+
+TEST_F(CompositeScanTest, PointLookupOnBothColumns) {
+    EXPECT_EQ(Scan(IndexBound{5, true, true, 3}, IndexBound{5, true, true, 3}), V{"5:3"});
+    EXPECT_TRUE(Scan(IndexBound{5, true, true, 10}, IndexBound{5, true, true, 10}).empty());
+}
+
+TEST_F(CompositeScanTest, LeadingColumnPrefixIsOrderedBySecond) {
+    // NULL b is stored as key2 = INT64_MIN, so it sorts first (the planner re-checks
+    // conditions on b, so it is never returned for one).
+    EXPECT_EQ(Scan(IndexBound{5, true}, IndexBound{5, true}),
+              (V{"5:NULL", "5:0", "5:1", "5:2", "5:3", "5:4", "5:5", "5:6", "5:7", "5:8", "5:9",
+                 "5:9223372036854775807"}));
+    EXPECT_EQ(Scan(IndexBound{8, false}, std::nullopt).size(), 10u) << "a > 8";
+}
+
+TEST_F(CompositeScanTest, RangeOnSecondColumnWithinOneLeadingValue) {
+    EXPECT_EQ(Scan(IndexBound{5, true, true, 2}, IndexBound{5, true, true, 4}), (V{"5:2", "5:3", "5:4"}));
+    EXPECT_EQ(Scan(IndexBound{5, false, true, 2}, IndexBound{5, false, true, 4}), V{"5:3"});
+    EXPECT_EQ(Scan(IndexBound{5, false, true, 8}, IndexBound{5, true}), (V{"5:9", "5:9223372036854775807"}))
+        << "b > 8: up to the end of a = 5";
+    EXPECT_EQ(Scan(IndexBound{4, true}, IndexBound{4, false, true, 2}), (V{"4:0", "4:1"})) << "b < 2";
+}
+
+TEST_F(CompositeScanTest, ExclusiveBoundAtTheEndOfKey2MovesToTheNextKey) {
+    // (5, INT64_MAX) exclusive: nothing more with a = 5, continue at a = 6.
+    auto rows = Scan(IndexBound{5, false, true, INT64_MAX}, IndexBound{6, true});
+    ASSERT_EQ(rows.size(), 11u);
+    EXPECT_EQ(rows.front(), "6:-9223372036854775808");
+    EXPECT_TRUE(Scan(IndexBound{INT64_MAX, false, true, INT64_MAX}, std::nullopt).empty());
+}
+
+TEST_F(CompositeScanTest, DescribeShowsBothKeyParts) {
+    IndexScanExecutor s(table, index, "t", table->schema, IndexBound{5, true, true, 2}, IndexBound{5, false, true, 4},
+                        nullptr);
+    EXPECT_EQ(s.Describe(), "Index Scan using t_ab on t  Index Cond: (t.a, t.b) >= (5, 2) AND (t.a, t.b) < (5, 4)");
+    IndexScanExecutor p(table, index, "t", table->schema, IndexBound{5, true, true, 2}, IndexBound{5, true, true, 2},
+                        nullptr);
+    EXPECT_EQ(p.Describe(), "Index Scan using t_ab on t  Index Cond: (t.a, t.b) = (5, 2)");
+    IndexScanExecutor q(table, index, "t", table->schema, IndexBound{5, true}, IndexBound{5, true}, nullptr);
+    EXPECT_EQ(q.Describe(), "Index Scan using t_ab on t  Index Cond: t.a = 5");
+}
+
 TEST_F(ScanTest, ScansLeaveNoPinnedPages) {
     auto s = IScan(IndexBound{100, true}, IndexBound{900, true});
     Drain(*s);

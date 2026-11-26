@@ -38,9 +38,17 @@ public:
     // Access path for single-table DML (DELETE / UPDATE ... WHERE ...).
     std::unique_ptr<ScanExecutor> PlanTableScan(TableInfo* table, const ExprPtr& where);
 
-    // Replaces every subquery in an expression that is evaluated outside of a
-    // SELECT (INSERT ... VALUES, UPDATE ... SET) by its result.
-    ExprPtr ResolveSubqueries(const ExprPtr& e);
+    // Binds an expression evaluated once per row of `table` (UPDATE ... SET) to
+    // the table's schema. Columns may be qualified with the table name, and a
+    // subquery may refer to the row being updated: it is then correlated and
+    // re-run per row. Uncorrelated subqueries run once, now.
+    ExprPtr PlanRowExpr(TableInfo* table, const ExprPtr& e);
+
+    // Replaces every subquery in an expression that has no current row (INSERT
+    // ... VALUES, DEFAULT) by its result; a subquery may still be correlated
+    // within itself. `insert_target` is the table being inserted into, which
+    // VALUES cannot refer to: naming it gets an error that says so.
+    ExprPtr ResolveSubqueries(const ExprPtr& e, const TableInfo* insert_target = nullptr);
 
     // Renders a plan tree (EXPLAIN). `analyze` adds actual row counts.
     static std::vector<std::string> Explain(const Executor& root, bool analyze);
@@ -63,6 +71,8 @@ private:
         std::map<std::string, int> slot_of;  // "table.column" as written -> slot
     };
     std::vector<Scope*> scopes_;
+    const TableInfo* insert_target_ = nullptr;  // see ResolveSubqueries
+    ExprPtr ResolveSubqueriesRec(const ExprPtr& e);
     bool ResolvesInEnclosingQuery(const Expr& col) const;
 
     // The views being expanded right now (outermost first), to detect a view

@@ -36,7 +36,7 @@ protected:
     void ExpectIndexesConsistent(const std::string& table) {
         TableInfo* t = db->GetCatalog().RequireTable(table);
         for (IndexInfo* idx : db->GetCatalog().IndexesOf(table)) {
-            int64_t non_null = Scalar("SELECT COUNT(" + idx->column + ") FROM " + table);
+            int64_t non_null = Scalar("SELECT COUNT(" + idx->columns[0] + ") FROM " + table);
             EXPECT_EQ(static_cast<int64_t>(idx->tree->CheckAndCount()), non_null) << idx->name;
         }
         EXPECT_EQ(t->row_count, Scalar("SELECT COUNT(*) FROM " + table)) << "row_count statistic drifted";
@@ -536,6 +536,97 @@ TEST_F(SqlTest, SubqueriesInDml) {
     ExpectIndexesConsistent("dept");
 }
 
+TEST_F(SqlTest, CorrelatedSubqueriesInUpdateSetAndInsertValues) {
+    SeedCompany();  // eng: ann 100, bob 80 | sales: cid 50, dan 70 | eve: no dept, 60 | dept 3 "empty"
+    db->Execute("ALTER TABLE dept ADD COLUMN headcount INT");
+    db->Execute("CREATE INDEX dept_headcount ON dept (headcount)");  // must follow the correlated updates
+    auto col = [&](const std::string& sql) {
+        std::vector<Value> out;
+        for (auto& r : Q(sql)) out.push_back(r[0]);
+        return out;
+    };
+
+    // UPDATE ... SET: the subquery refers to the row being updated, qualified or not.
+    EXPECT_EQ(Msg("UPDATE dept SET headcount = (SELECT COUNT(*) FROM emp e WHERE e.dept_id = dept.id)"), "UPDATE 3");
+    auto hc = col("SELECT headcount FROM dept ORDER BY id");
+    EXPECT_EQ(hc[0].AsInt(), 2);
+    EXPECT_EQ(hc[1].AsInt(), 2);
+    EXPECT_EQ(hc[2].AsInt(), 0);
+    EXPECT_EQ(Msg("UPDATE dept SET headcount = (SELECT COUNT(*) FROM emp WHERE dept_id = dept.id AND salary > 75) "
+                  "+ dept.headcount * 10"),
+              "UPDATE 3");
+    hc = col("SELECT headcount FROM dept ORDER BY id");
+    EXPECT_EQ(hc[0].AsInt(), 22);
+    EXPECT_EQ(hc[1].AsInt(), 20);
+    EXPECT_EQ(hc[2].AsInt(), 0);
+
+    // Every row sees the table as it was before the statement: raise everyone to
+    // their department's maximum (eve has no department: the subquery gives NULL).
+    EXPECT_EQ(Msg("UPDATE emp SET salary = (SELECT MAX(x.salary) FROM emp x WHERE x.dept_id = emp.dept_id)"),
+              "UPDATE 5");
+    auto sal = col("SELECT salary FROM emp ORDER BY id");
+    EXPECT_EQ(sal[0].AsDouble(), 100);
+    EXPECT_EQ(sal[1].AsDouble(), 100);
+    EXPECT_EQ(sal[2].AsDouble(), 70);
+    EXPECT_EQ(sal[3].AsDouble(), 70);
+    EXPECT_TRUE(sal[4].IsNull());
+    ExpectIndexesConsistent("emp");
+
+    // EXISTS / IN, a reference two levels up, and correlation in SET and WHERE together.
+    db->Execute("UPDATE emp SET salary = id * 10");
+    EXPECT_EQ(Msg("UPDATE dept SET name = name || '*' WHERE EXISTS (SELECT 1 FROM emp WHERE dept_id = dept.id)"),
+              "UPDATE 2");
+    EXPECT_EQ(Msg("UPDATE dept SET headcount = CASE WHEN dept.id IN (SELECT dept_id FROM emp e WHERE "
+                  "EXISTS (SELECT 1 FROM emp f WHERE f.dept_id = dept.id AND f.salary > e.salary)) "
+                  "THEN 1 ELSE 0 END"),
+              "UPDATE 3");
+    hc = col("SELECT headcount FROM dept ORDER BY id");
+    EXPECT_EQ(hc[0].AsInt(), 1);
+    EXPECT_EQ(hc[2].AsInt(), 0);
+    EXPECT_EQ(Msg("UPDATE emp SET salary = (SELECT COUNT(*) FROM emp x WHERE x.dept_id = emp.dept_id) "
+                  "WHERE EXISTS (SELECT 1 FROM dept d WHERE d.id = emp.dept_id AND d.name = 'sales*')"),
+              "UPDATE 2");
+    EXPECT_EQ(Scalar("SELECT COUNT(*) FROM emp WHERE dept_id = 2 AND salary = 2"), 2);
+    EXPECT_EQ(Scalar("SELECT COUNT(*) FROM emp WHERE dept_id = 1 AND salary IN (10, 20)"), 2) << "untouched";
+    ExpectIndexesConsistent("emp");
+
+    // Errors: the whole statement is rejected and nothing changes.
+    EXPECT_THROW(db->Execute("UPDATE dept SET headcount = (SELECT id FROM emp WHERE emp.dept_id = dept.id)"), DbError)
+        << "more than one row for eng";
+    EXPECT_EQ(Scalar("SELECT headcount FROM dept WHERE id = 1"), 1);
+    EXPECT_THROW(db->Execute("UPDATE dept SET headcount = (SELECT COUNT(*) FROM emp WHERE emp.dept_id = dept.nope)"),
+                 DbError);
+    EXPECT_THROW(db->Execute("UPDATE dept SET headcount = (SELECT COUNT(*) FROM emp WHERE emp.dept_id = d.id)"),
+                 DbError);
+
+    // INSERT ... VALUES: a subquery may be correlated within itself...
+    EXPECT_EQ(Msg("INSERT INTO dept VALUES (10, 'x', (SELECT COUNT(*) FROM dept d WHERE EXISTS "
+                  "(SELECT 1 FROM emp e WHERE e.dept_id = d.id))), "
+                  "(11, 'y', (SELECT MAX((SELECT COUNT(*) FROM emp e WHERE e.dept_id = d.id)) FROM dept d))"),
+              "INSERT 2");
+    hc = col("SELECT headcount FROM dept WHERE id >= 10 ORDER BY id");
+    EXPECT_EQ(hc[0].AsInt(), 2);
+    EXPECT_EQ(hc[1].AsInt(), 2);
+    // ...but there is no current row in VALUES, so the target table cannot be referred to.
+    try {
+        db->Execute("INSERT INTO dept VALUES (12, 'z', (SELECT COUNT(*) FROM emp WHERE emp.dept_id = dept.id))");
+        ADD_FAILURE() << "expected an error";
+    } catch (const DbError& e) {
+        EXPECT_NE(std::string(e.what()).find("INSERT ... VALUES has no current row"), std::string::npos) << e.what();
+    }
+    try {
+        db->Execute("INSERT INTO dept VALUES (12, 'z', (SELECT COUNT(*) FROM emp e WHERE e.dept_id = headcount))");
+        ADD_FAILURE() << "expected an error";
+    } catch (const DbError& e) {
+        EXPECT_NE(std::string(e.what()).find("INSERT ... VALUES cannot refer to it"), std::string::npos) << e.what();
+    }
+    EXPECT_EQ(Scalar("SELECT COUNT(*) FROM dept WHERE id = 12"), 0);
+    // A name the subquery's own FROM provides still wins over the target table.
+    EXPECT_EQ(Msg("INSERT INTO dept VALUES (12, 'z', (SELECT COUNT(*) FROM dept WHERE dept.id < 10))"), "INSERT 1");
+    EXPECT_EQ(Scalar("SELECT headcount FROM dept WHERE id = 12"), 3);
+    ExpectIndexesConsistent("dept");
+}
+
 TEST_F(SqlTest, UnionIntersectExcept) {
     SeedCompany();
     // Departments that have employees, and those that don't.
@@ -608,7 +699,7 @@ TEST_F(SqlTest, AlterTable) {
     // DROP COLUMN removes the data and the indexes on it; other indexes keep working.
     EXPECT_EQ(Msg("ALTER TABLE emp DROP COLUMN dept_id"), "ALTER TABLE");
     EXPECT_THROW(db->Execute("SELECT dept_id FROM emp"), DbError);
-    for (IndexInfo* idx : db->GetCatalog().IndexesOf("emp")) EXPECT_NE(idx->column, "dept_id");
+    for (IndexInfo* idx : db->GetCatalog().IndexesOf("emp")) EXPECT_EQ(std::count(idx->columns.begin(), idx->columns.end(), "dept_id"), 0);
     EXPECT_EQ(Q("SELECT name FROM emp WHERE id = 4")[0][0].AsText(), "dan");
     EXPECT_THROW(db->Execute("INSERT INTO emp (id, name) VALUES (1, 'dup')"), DbError) << "primary key still enforced";
     // RENAME COLUMN / TABLE.
@@ -908,6 +999,192 @@ TEST_F(SqlTest, ErrorsDoNotBreakTheSession) {
     EXPECT_THROW(db->Execute("SELECT nope FROM emp"), DbError);
     EXPECT_THROW(db->Execute("SELECT 1 / 0"), DbError);
     EXPECT_EQ(Scalar("SELECT COUNT(*) FROM emp"), 5);
+}
+
+// ---- multi-column indexes, composite PRIMARY KEY / UNIQUE ----
+
+TEST_F(SqlTest, CompositePrimaryKeyIsEnforced) {
+    db->Execute("CREATE TABLE ol (order_id INT, line INT, item TEXT, PRIMARY KEY (order_id, line))");
+    db->Execute("INSERT INTO ol VALUES (1, 1, 'a'), (1, 2, 'b'), (2, 1, 'c')");
+    ASSERT_EQ(db->GetCatalog().IndexesOf("ol").size(), 1u);
+    EXPECT_EQ(db->GetCatalog().IndexesOf("ol")[0]->name, "ol_pkey");
+
+    EXPECT_EQ(ErrorOf(*db, "INSERT INTO ol VALUES (1, 1, 'dup')"),
+              "duplicate key value violates unique constraint \"ol_pkey\": (order_id, line)=(1, 1)");
+    EXPECT_EQ(Msg("INSERT INTO ol VALUES (2, 2, 'same order, new line'), (3, 1, 'new order')"), "INSERT 2");
+    EXPECT_THROW(db->Execute("INSERT INTO ol VALUES (1, NULL, 'x')"), DbError) << "key columns are NOT NULL";
+    EXPECT_THROW(db->Execute("INSERT INTO ol (line, item) VALUES (9, 'x')"), DbError);
+    EXPECT_THROW(db->Execute("INSERT INTO ol VALUES (4, 1, 'x'), (4, 1, 'y')"), DbError) << "within one statement";
+    EXPECT_EQ(Scalar("SELECT COUNT(*) FROM ol"), 5) << "failed statements change nothing";
+
+    // Uniqueness holds for the end state of an UPDATE: swapping two keys is fine...
+    EXPECT_EQ(Msg("UPDATE ol SET line = 3 - line WHERE order_id = 1"), "UPDATE 2");
+    EXPECT_EQ(Q("SELECT item FROM ol WHERE order_id = 1 AND line = 1")[0][0].AsText(), "b");
+    // ...colliding with a row that is not updated is not.
+    EXPECT_EQ(ErrorOf(*db, "UPDATE ol SET order_id = 1 WHERE order_id = 2 AND line = 1"),
+              "duplicate key value violates unique constraint \"ol_pkey\": (order_id, line)=(1, 1)");
+    EXPECT_THROW(db->Execute("UPDATE ol SET line = 1 WHERE order_id = 2"), DbError) << "two targets collide";
+    EXPECT_EQ(Scalar("SELECT COUNT(*) FROM ol WHERE order_id = 2"), 2);
+    EXPECT_EQ(Msg("UPDATE ol SET item = 'changed' WHERE order_id = 2"), "UPDATE 2") << "keys unchanged: fine";
+    EXPECT_EQ(Msg("DELETE FROM ol WHERE order_id = 1 AND line = 1"), "DELETE 1");
+    EXPECT_EQ(Msg("INSERT INTO ol VALUES (1, 1, 'again')"), "INSERT 1") << "a deleted key is free again";
+    ExpectIndexesConsistent("ol");
+}
+
+TEST_F(SqlTest, InvalidCompositeKeysCreateNothing) {
+    EXPECT_EQ(ErrorOf(*db, "CREATE TABLE x (a INT PRIMARY KEY, b INT, PRIMARY KEY (a, b))"),
+              "multiple primary keys for table \"x\" are not allowed");
+    EXPECT_THROW(db->Execute("CREATE TABLE x (a INT, d DOUBLE, PRIMARY KEY (a, d))"), DbError) << "DOUBLE key";
+    EXPECT_THROW(db->Execute("CREATE TABLE x (a INT, b INT, UNIQUE (b, a, b))"), DbError);
+    EXPECT_EQ(db->GetCatalog().GetTable("x"), nullptr);
+    // A constraint whose index cannot be created (the name is taken) leaves no table behind.
+    db->Execute("CREATE TABLE other (v INT); CREATE INDEX y_pkey ON other (v)");
+    EXPECT_THROW(db->Execute("CREATE TABLE y (a INT, b INT, PRIMARY KEY (a, b))"), DbError);
+    EXPECT_EQ(db->GetCatalog().GetTable("y"), nullptr);
+    EXPECT_EQ(Msg("CREATE TABLE y (a INT, b INT)"), "CREATE TABLE");
+}
+
+TEST_F(SqlTest, CompositeUniqueConstraintTreatsNullsAsDistinct) {
+    db->Execute("CREATE TABLE u (a INT, b TEXT, c INT UNIQUE, UNIQUE (a, b), UNIQUE (c))");
+    std::vector<std::string> names;
+    for (IndexInfo* i : db->GetCatalog().IndexesOf("u")) names.push_back(i->name);
+    std::sort(names.begin(), names.end());
+    EXPECT_EQ(names, (std::vector<std::string>{"u_a_b_key", "u_c_key"})) << "the repeated UNIQUE (c) adds nothing";
+
+    db->Execute("INSERT INTO u VALUES (1, NULL, 1), (1, NULL, 2), (NULL, 'x', 3), (NULL, 'x', 4)");
+    db->Execute("INSERT INTO u VALUES (1, 'x', 5), (2, 'x', 6), (1, 'y', 7)");
+    EXPECT_EQ(ErrorOf(*db, "INSERT INTO u VALUES (1, 'x', 8)"),
+              "duplicate key value violates unique constraint \"u_a_b_key\": (a, b)=(1, x)");
+    EXPECT_THROW(db->Execute("UPDATE u SET b = 'x' WHERE c = 7"), DbError);
+    EXPECT_EQ(Msg("UPDATE u SET b = NULL WHERE c IN (5, 7)"), "UPDATE 2") << "(1, NULL) twice is allowed";
+    EXPECT_EQ(Scalar("SELECT COUNT(*) FROM u WHERE a = 1 AND b IS NULL"), 4);
+    ExpectIndexesConsistent("u");
+}
+
+TEST_F(SqlTest, CreateMultiColumnIndexOnExistingRows) {
+    db->Execute("CREATE TABLE t (a INT, b TEXT, c INT)");
+    db->Execute("INSERT INTO t VALUES (1, 'x', 1), (1, 'y', 2), (2, 'x', 3), (1, 'x', 4)");
+    EXPECT_EQ(ErrorOf(*db, "CREATE UNIQUE INDEX t_ab ON t (a, b)"),
+              "could not create unique index \"t_ab\": duplicate key (a, b)=(1, x)");
+    EXPECT_EQ(Msg("CREATE UNIQUE INDEX t_abc ON t (a, b, c)"), "CREATE INDEX");
+    EXPECT_EQ(Msg("CREATE INDEX t_ba ON t (b, a)"), "CREATE INDEX");
+    EXPECT_THROW(db->Execute("INSERT INTO t VALUES (1, 'x', 4)"), DbError);
+    EXPECT_EQ(Msg("INSERT INTO t VALUES (1, 'x', 5)"), "INSERT 1");
+    ExpectIndexesConsistent("t");
+    // ALTER TABLE: renaming a key column keeps the index; dropping one drops it.
+    db->Execute("ALTER TABLE t RENAME COLUMN b TO bb");
+    EXPECT_THROW(db->Execute("INSERT INTO t VALUES (1, 'x', 4)"), DbError) << "still enforced after the rename";
+    db->Execute("ALTER TABLE t DROP COLUMN c");
+    ASSERT_EQ(db->GetCatalog().IndexesOf("t").size(), 1u);
+    EXPECT_EQ(db->GetCatalog().IndexesOf("t")[0]->name, "t_ba");
+    EXPECT_EQ(db->GetCatalog().IndexesOf("t")[0]->columns, (std::vector<std::string>{"bb", "a"}));
+    ExpectIndexesConsistent("t");
+}
+
+TEST_F(SqlTest, PlannerUsesMultiColumnIndexes) {
+    db->Execute("CREATE TABLE ol (order_id INT, line INT, item TEXT, qty INT, PRIMARY KEY (order_id, line))");
+    std::string sql = "INSERT INTO ol VALUES ";
+    for (int o = 1; o <= 200; ++o)
+        for (int l = 1; l <= 10; ++l)
+            sql += (o + l > 2 ? ", (" : "(") + std::to_string(o) + ", " + std::to_string(l) + ", 'item" +
+                   std::to_string(o % 50) + "', " + std::to_string(l * o % 7) + ")";
+    db->Execute(sql);
+    db->Execute("CREATE INDEX ol_item_qty ON ol (item, qty)");
+    auto plan = [&](const std::string& where) {
+        std::string out;
+        for (auto& r : Q("EXPLAIN SELECT * FROM ol WHERE " + where)) out += r[0].AsText() + "\n";
+        return out;
+    };
+    auto has = [](const std::string& text, const std::string& part) {
+        return text.find(part) != std::string::npos;
+    };
+
+    std::string p = plan("order_id = 7 AND line = 3");
+    EXPECT_TRUE(has(p, "Index Scan using ol_pkey on ol  Index Cond: (ol.order_id, ol.line) = (7, 3)")) << p;
+    EXPECT_EQ(Q("SELECT order_id, line FROM ol WHERE order_id = 7 AND line = 3").size(), 1u);
+
+    p = plan("order_id = 7");
+    EXPECT_TRUE(has(p, "Index Cond: ol.order_id = 7")) << p;
+    EXPECT_EQ(Q("SELECT * FROM ol WHERE order_id = 7").size(), 10u);
+
+    p = plan("order_id = 7 AND line >= 3 AND line < 6");
+    EXPECT_TRUE(has(p, "Index Cond: (ol.order_id, ol.line) >= (7, 3) AND (ol.order_id, ol.line) < (7, 6)")) << p;
+    auto lines = Q("SELECT line FROM ol WHERE order_id = 7 AND line >= 3 AND line < 6");
+    ASSERT_EQ(lines.size(), 3u);
+    EXPECT_EQ(lines[0][0].AsInt(), 3) << "index order";
+
+    p = plan("order_id BETWEEN 5 AND 6");
+    EXPECT_TRUE(has(p, "Index Scan using ol_pkey")) << p;
+    EXPECT_EQ(Q("SELECT * FROM ol WHERE order_id BETWEEN 5 AND 6").size(), 20u);
+
+    p = plan("line = 3");
+    EXPECT_TRUE(has(p, "Seq Scan on ol")) << "no condition on the leading column: " << p;
+
+    // (TEXT, INT): the leading column is hashed, so its condition stays as a re-check.
+    p = plan("item = 'item7' AND qty = 2");
+    EXPECT_TRUE(has(p, "Index Scan using ol_item_qty")) << p;
+    EXPECT_TRUE(has(p, "(hash(ol.item), ol.qty) = (")) << p;
+    EXPECT_TRUE(has(p, "Filter: ")) << p;
+    EXPECT_EQ(Scalar("SELECT COUNT(*) FROM ol WHERE item = 'item7' AND qty = 2"),
+              Scalar("SELECT COUNT(*) FROM ol WHERE item || '' = 'item7' AND qty + 0 = 2"));
+}
+
+// Differential test: random data, random modifications and random queries over a
+// table with multi-column indexes must give the same results as over a copy
+// without any index (always a sequential scan).
+TEST_F(SqlTest, MultiColumnIndexesMatchSequentialScans) {
+    db->Execute("CREATE TABLE r (id INT PRIMARY KEY, a INT, b INT, c TEXT, d INT)");
+    db->Execute("CREATE TABLE plain (id INT, a INT, b INT, c TEXT, d INT)");
+    db->Execute("CREATE INDEX r_ab ON r (a, b); CREATE INDEX r_ca ON r (c, a); CREATE INDEX r_acd ON r (a, c, d)");
+    db->Execute("CREATE UNIQUE INDEX r_db ON r (d, b, id)");
+    std::mt19937 rng(2024);
+    auto small = [&](int n) { return rng() % 9 == 0 ? std::string("NULL") : std::to_string(static_cast<int>(rng() % n) - 2); };
+    auto text = [&] { return rng() % 9 == 0 ? std::string("NULL") : "'s" + std::to_string(rng() % 4) + "'"; };
+    std::string values;
+    for (int id = 1; id <= 1500; ++id)
+        values += (id > 1 ? ", (" : "(") + std::to_string(id) + ", " + small(60) + ", " + small(12) + ", " + text() +
+                  ", " + small(5) + ")";
+    db->Execute("INSERT INTO r VALUES " + values + "; INSERT INTO plain SELECT * FROM r");
+
+    auto cond = [&] {
+        static const char* ops[] = {"=", "=", "<", "<=", ">", ">="};
+        switch (rng() % 4) {
+            case 0: return "a " + std::string(ops[rng() % 6]) + " " + std::to_string(static_cast<int>(rng() % 62) - 3);
+            case 1: return "b " + std::string(ops[rng() % 6]) + " " + std::to_string(static_cast<int>(rng() % 14) - 3);
+            case 2: return "c = 's" + std::to_string(rng() % 5) + "'";
+            default: return "d = " + std::to_string(static_cast<int>(rng() % 6) - 2);
+        }
+    };
+    auto sorted = [&](const std::string& sql) {
+        std::vector<std::string> out;
+        for (auto& row : Q(sql)) {
+            std::string s;
+            for (auto& v : row) s += v.ToString() + "|";
+            out.push_back(s);
+        }
+        std::sort(out.begin(), out.end());
+        return out;
+    };
+    int index_scans = 0;
+    for (int round = 0; round < 6; ++round) {
+        for (int q = 0; q < 60; ++q) {
+            std::string where = cond();
+            for (int k = rng() % 3; k > 0; --k) where += " AND " + cond();
+            std::string sel = "SELECT id, a, b, c, d FROM ";
+            ASSERT_EQ(sorted(sel + "r WHERE " + where), sorted(sel + "plain WHERE " + where)) << where;
+            for (auto& line : Q("EXPLAIN " + sel + "r WHERE " + where))
+                index_scans += line[0].AsText().find("Index Scan") != std::string::npos;
+        }
+        // Change both tables the same way, then check again.
+        std::string where = cond();
+        std::string set = "a = " + small(60) + ", b = b + 1, c = " + text();
+        db->Execute("UPDATE r SET " + set + " WHERE " + where + "; UPDATE plain SET " + set + " WHERE " + where);
+        where = cond() + " AND " + cond();
+        db->Execute("DELETE FROM r WHERE " + where + "; DELETE FROM plain WHERE " + where);
+        ExpectIndexesConsistent("r");
+    }
+    EXPECT_GT(index_scans, 50) << "the multi-column indexes were actually used";
+    EXPECT_EQ(Scalar("SELECT COUNT(*) FROM r"), Scalar("SELECT COUNT(*) FROM plain"));
 }
 
 }  // namespace

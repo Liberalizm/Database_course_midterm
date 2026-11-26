@@ -59,15 +59,27 @@ IndexScanExecutor::IndexScanExecutor(TableInfo* table, IndexInfo* index, std::st
 
 void IndexScanExecutor::InitImpl() {
     done_ = false;
-    if (lo_) {
-        if (!lo_->inclusive && lo_->value == INT64_MAX) {
+    if (!lo_) {
+        it_.emplace(index_->tree->Begin());
+        return;
+    }
+    // The first (key, key2) at or above the bound. An exclusive bound starts right
+    // after it: at key2 + 1, or (bound on key alone, or key2 at its maximum) at the
+    // next key. Past INT64_MAX there is nothing.
+    int64_t k = lo_->value;
+    int64_t k2 = lo_->has2 ? lo_->value2 : INT64_MIN;
+    if (!lo_->inclusive) {
+        if (lo_->has2 && k2 != INT64_MAX) {
+            ++k2;
+        } else if (k == INT64_MAX) {
             done_ = true;
             return;
+        } else {
+            ++k;
+            k2 = INT64_MIN;
         }
-        it_.emplace(index_->tree->LowerBound(lo_->inclusive ? lo_->value : lo_->value + 1));
-    } else {
-        it_.emplace(index_->tree->Begin());
     }
+    it_.emplace(index_->tree->LowerBound(k, k2));
 }
 
 bool IndexScanExecutor::NextImpl(Row* out) {
@@ -75,9 +87,13 @@ bool IndexScanExecutor::NextImpl(Row* out) {
     std::string buf;
     while (it_->Valid()) {
         IndexKey e = it_->Entry();
-        if (hi_ && (e.key > hi_->value || (!hi_->inclusive && e.key == hi_->value))) {
-            done_ = true;
-            return false;
+        if (hi_) {
+            int c = e.key < hi_->value ? -1 : e.key > hi_->value ? 1 : 0;
+            if (c == 0 && hi_->has2) c = e.key2 < hi_->value2 ? -1 : e.key2 > hi_->value2 ? 1 : 0;
+            if (c > 0 || (c == 0 && !hi_->inclusive)) {
+                done_ = true;
+                return false;
+            }
         }
         it_->Next();
         if (!table_->heap->Get(e.rid, &buf)) continue;  // stale entry (should not happen)
@@ -95,13 +111,30 @@ bool IndexScanExecutor::NextImpl(Row* out) {
 std::string IndexScanExecutor::Describe() const {
     std::string s = "Index Scan using " + index_->name + " on " + TableLabel(table_, alias_);
     std::vector<std::string> conds;
-    std::string col = alias_ + "." + index_->column;
+    // What the bounds are compared with: the leading column (or its hash), and for
+    // a bound on (key, key2) also the second column or the hash of the others.
+    const auto& cols = index_->columns;
+    std::string col = alias_ + "." + cols[0];
     if (index_->hashed) col = "hash(" + col + ")";  // the bounds are hash values
-    if (lo_ && hi_ && lo_->inclusive && hi_->inclusive && lo_->value == hi_->value) {
-        conds.push_back(col + " = " + std::to_string(lo_->value));
+    std::string col2;
+    if (index_->Composite()) {
+        std::vector<std::string> rest;
+        for (size_t i = 1; i < cols.size(); ++i) rest.push_back(alias_ + "." + cols[i]);
+        col2 = index_->Key2Hashed() ? "hash(" + Join(rest, ", ") + ")" : rest[0];
+    }
+    auto side = [&](const IndexBound& b) {
+        return b.has2 ? "(" + col + ", " + col2 + ")" : col;
+    };
+    auto value = [](const IndexBound& b) {
+        return b.has2 ? "(" + std::to_string(b.value) + ", " + std::to_string(b.value2) + ")"
+                      : std::to_string(b.value);
+    };
+    if (lo_ && hi_ && lo_->inclusive && hi_->inclusive && lo_->value == hi_->value && lo_->has2 == hi_->has2 &&
+        (!lo_->has2 || lo_->value2 == hi_->value2)) {
+        conds.push_back(side(*lo_) + " = " + value(*lo_));
     } else {
-        if (lo_) conds.push_back(col + (lo_->inclusive ? " >= " : " > ") + std::to_string(lo_->value));
-        if (hi_) conds.push_back(col + (hi_->inclusive ? " <= " : " < ") + std::to_string(hi_->value));
+        if (lo_) conds.push_back(side(*lo_) + (lo_->inclusive ? " >= " : " > ") + value(*lo_));
+        if (hi_) conds.push_back(side(*hi_) + (hi_->inclusive ? " <= " : " < ") + value(*hi_));
     }
     if (!conds.empty()) s += "  Index Cond: " + Join(conds, " AND ");
     if (pred_) s += "  Filter: " + pred_->ToString();

@@ -35,11 +35,11 @@ SQL summary and the meta commands (`.tables`, `.schema t`, `.indexes`,
 | Area | Supported |
 |---|---|
 | Types | `INT` (64-bit), `DOUBLE`, `TEXT`, `BOOL`, `NULL` |
-| DDL | `CREATE TABLE` with `PRIMARY KEY`, `UNIQUE`, `NOT NULL`, `DEFAULT`; `CREATE [UNIQUE] INDEX`; `CREATE [OR REPLACE] VIEW v [(cols)] AS SELECT ...`; `DROP TABLE / INDEX / VIEW`; `ALTER TABLE ADD / DROP / RENAME [COLUMN]`, `RENAME TO` |
+| DDL | `CREATE TABLE` with `PRIMARY KEY`, `UNIQUE`, `NOT NULL`, `DEFAULT`, and composite `PRIMARY KEY (a, b)` / `UNIQUE (a, b)` table constraints; `CREATE [UNIQUE] INDEX` on one or more columns; `CREATE [OR REPLACE] VIEW v [(cols)] AS SELECT ...`; `DROP TABLE / INDEX / VIEW`; `ALTER TABLE ADD / DROP / RENAME [COLUMN]`, `RENAME TO` |
 | DML | `INSERT ... VALUES / SELECT`, `UPDATE`, `DELETE` — each statement is atomic |
 | Queries | `SELECT [DISTINCT]`, `WHERE`, `[INNER] JOIN`, `LEFT / RIGHT / FULL [OUTER] JOIN`, `CROSS JOIN` / comma joins, `GROUP BY`, `HAVING`, `ORDER BY` (names, aliases, positions), `LIMIT` / `OFFSET` |
 | Set operations | `UNION`, `INTERSECT`, `EXCEPT`, each with or without `ALL` |
-| Subqueries | scalar `(SELECT ...)`, `x [NOT] IN (SELECT ...)`, `[NOT] EXISTS (...)`, derived tables `FROM (SELECT ...) alias`; correlated subqueries (referring to the outer row) in `WHERE` (also of `UPDATE` / `DELETE`), `HAVING` and the select list |
+| Subqueries | scalar `(SELECT ...)`, `x [NOT] IN (SELECT ...)`, `[NOT] EXISTS (...)`, derived tables `FROM (SELECT ...) alias`; correlated subqueries (referring to the outer row) in `WHERE` (also of `UPDATE` / `DELETE`), `HAVING`, the select list and `UPDATE ... SET` (the row being updated); subqueries in `INSERT ... VALUES` may be correlated within themselves |
 | Expressions | arithmetic (overflow-checked), comparisons, `AND / OR / NOT` with three-valued logic, `LIKE`, `BETWEEN`, `IN (list)`, `IS [NOT] NULL`, `||`, `CASE` |
 | Functions | `ABS`, `ROUND`, `LENGTH`, `UPPER`, `LOWER`, `SUBSTR`, `COALESCE`, `NULLIF` |
 | Aggregates | `COUNT(*)`, `COUNT / SUM / AVG / MIN / MAX`, each also with `DISTINCT` |
@@ -112,6 +112,18 @@ range scans); `TEXT` columns by a 64-bit FNV-1a hash (equality only). Hashes
 can collide, so uniqueness checks compare the real values and index scans
 re-check the condition. Deletes are lazy (nodes are never merged).
 
+A multi-column index — also behind `PRIMARY KEY (a, b)` and `UNIQUE (a, b)` —
+uses a "wide" tree with a second 64-bit key part: entries are
+(key(a), key2, RID), where key2 is the second column's key for a two-column
+index (so an `INT` second column stays ordered) and a hash of the remaining
+columns otherwise. The planner uses it for conditions on the leading column
+alone (`a = 1`, `a < 5`), for `a = 1 AND b BETWEEN 3 AND 7` when `b` is the
+`INT` second column, and for equality on every column. Conditions on the later
+columns are always re-checked (key2 may be a hash, or stand for a `NULL`).
+Rows whose leading column is `NULL` are not indexed, and a key containing a
+`NULL` never violates uniqueness (as in PostgreSQL). Single-column trees keep
+the original node format, so existing database files open unchanged.
+
 **Planning.** For every table the planner compares a sequential scan with
 each usable index (min/max statistics from the B+ tree, Cardenas' formula
 for heap pages touched), pushes single-table conditions below joins,
@@ -157,12 +169,13 @@ the middle of a statement can leave it partially written.
   columns are applied after the view's rows are produced.
 - Joins are left-deep: no parenthesized joins, and a `RIGHT` / `FULL JOIN`
   cannot follow a comma-separated `FROM` list (write `CROSS JOIN` instead).
-- Indexes on `INT` and `TEXT` columns only; one column per index.
+- Indexes on `INT` and `TEXT` columns only. A multi-column index is not used
+  for a range on a column after the second, or on a `TEXT` column.
 - B+ tree nodes are not merged after deletes.
 
 ## Tests
 
-About 330 tests in three layers — unit tests per component, integration
+About 360 tests in three layers — unit tests per component, integration
 tests through the `Database` API, and end-to-end tests that run the shell
 binary against golden output — plus randomized differential and
 file-corruption tests. See [docs/TESTING.md](docs/TESTING.md).
