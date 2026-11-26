@@ -4,11 +4,32 @@ project(Database_course_midterm CXX)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-if (MSVC)
-    add_compile_options(/W4)
-else ()
-    add_compile_options(-Wall -Wextra)
+option(MINIDB_BUILD_TESTS "Build the MiniDB test suite" ON)
+option(MINIDB_WERROR "Treat compiler warnings in MiniDB code as errors" OFF)
+option(MINIDB_SANITIZE "Build everything with AddressSanitizer + UndefinedBehaviorSanitizer" OFF)
+
+if (MINIDB_SANITIZE)
+    if (MSVC)
+        message(FATAL_ERROR "MINIDB_SANITIZE is only supported with GCC/Clang")
+    endif ()
+    add_compile_options(-fsanitize=address,undefined -fno-omit-frame-pointer -fno-sanitize-recover=all)
+    add_link_options(-fsanitize=address,undefined)
 endif ()
+
+# Warning flags for our own targets only (not for third-party code such as GoogleTest).
+function(minidb_set_warnings target)
+    if (MSVC)
+        target_compile_options(${target} PRIVATE /W4)
+        if (MINIDB_WERROR)
+            target_compile_options(${target} PRIVATE /WX)
+        endif ()
+    else ()
+        target_compile_options(${target} PRIVATE -Wall -Wextra)
+        if (MINIDB_WERROR)
+            target_compile_options(${target} PRIVATE -Werror)
+        endif ()
+    endif ()
+endfunction()
 
 # The database engine as a library, shared by the shell and the tests.
 add_library(minidb_core STATIC
@@ -25,13 +46,14 @@ add_library(minidb_core STATIC
         src/planner.cpp
         src/database.cpp)
 target_include_directories(minidb_core PUBLIC src)
+minidb_set_warnings(minidb_core)
 
 # Interactive SQL shell.
 add_executable(Database_course_midterm src/main.cpp)
 target_link_libraries(Database_course_midterm PRIVATE minidb_core)
+minidb_set_warnings(Database_course_midterm)
 
-# Tests.
-enable_testing()
-add_executable(minidb_tests tests/test_main.cpp)
-target_link_libraries(minidb_tests PRIVATE minidb_core)
-add_test(NAME minidb_tests COMMAND minidb_tests)
+if (MINIDB_BUILD_TESTS)
+    enable_testing()
+    add_subdirectory(tests)
+endif ()
