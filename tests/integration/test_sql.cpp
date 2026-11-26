@@ -390,10 +390,68 @@ TEST_F(SqlTest, UncorrelatedSubqueries) {
     // Errors.
     EXPECT_THROW(db->Execute("SELECT (SELECT name FROM emp)"), DbError) << "more than one row";
     EXPECT_THROW(db->Execute("SELECT * FROM emp WHERE id IN (SELECT id, name FROM emp)"), DbError);
-    EXPECT_THROW(db->Execute("SELECT name FROM emp e WHERE salary = (SELECT MAX(salary) FROM emp x "
+    EXPECT_EQ(Q("SELECT name FROM emp e WHERE salary = (SELECT MAX(salary) FROM emp x "
+                "WHERE x.dept_id = e.dept_id)").size(),
+              2u)
+        << "correlated subqueries work now (see CorrelatedSubqueries): ann and dan";
+}
+
+TEST_F(SqlTest, CorrelatedSubqueries) {
+    SeedCompany();  // eng: ann 100, bob 80 | sales: cid 50, dan 70 | eve: no dept, 60 | dept 3 "empty"
+    auto names = [&](const std::string& sql) {
+        std::vector<std::string> out;
+        for (auto& r : Q(sql)) out.push_back(r[0].AsText());
+        return out;
+    };
+    using V = std::vector<std::string>;
+    EXPECT_EQ(names("SELECT d.name FROM dept d WHERE EXISTS (SELECT 1 FROM emp e WHERE e.dept_id = d.id) "
+                    "ORDER BY d.name"),
+              (V{"eng", "sales"}));
+    EXPECT_EQ(names("SELECT d.name FROM dept d WHERE NOT EXISTS (SELECT 1 FROM emp e WHERE e.dept_id = d.id)"),
+              (V{"empty"}));
+    // Scalar: above their own department's average (eve's NULL department matches nothing).
+    EXPECT_EQ(names("SELECT e.name FROM emp e WHERE e.salary > "
+                    "(SELECT AVG(x.salary) FROM emp x WHERE x.dept_id = e.dept_id) ORDER BY e.name"),
+              (V{"ann", "dan"}));
+    // In the SELECT list, per row.
+    auto staff = Q("SELECT d.name, (SELECT COUNT(*) FROM emp e WHERE e.dept_id = d.id) FROM dept d ORDER BY d.id");
+    ASSERT_EQ(staff.size(), 3u);
+    EXPECT_EQ(staff[0][1].AsInt(), 2);
+    EXPECT_EQ(staff[2][1].AsInt(), 0);
+    // IN, unqualified outer reference, and two levels of nesting.
+    EXPECT_EQ(names("SELECT name FROM dept WHERE 'bob' IN (SELECT name FROM emp WHERE dept_id = dept.id)"),
+              (V{"eng"}));
+    EXPECT_EQ(names("SELECT d.name FROM dept d WHERE EXISTS (SELECT 1 FROM emp e WHERE e.dept_id = d.id AND "
+                    "EXISTS (SELECT 1 FROM emp f WHERE f.dept_id = d.id AND f.salary > e.salary)) ORDER BY 1"),
+              (V{"eng", "sales"}));
+    // With joins, GROUP BY and in DML.
+    EXPECT_EQ(Scalar("SELECT COUNT(*) FROM emp e JOIN dept d ON e.dept_id = d.id WHERE e.salary = "
+                     "(SELECT MIN(salary) FROM emp WHERE dept_id = d.id)"),
+              2);
+    EXPECT_EQ(Msg("DELETE FROM emp WHERE NOT EXISTS (SELECT 1 FROM dept d WHERE d.id = emp.dept_id)"), "DELETE 1");
+    EXPECT_EQ(Scalar("SELECT COUNT(*) FROM emp"), 4);
+    // Errors are still reported.
+    EXPECT_THROW(db->Execute("SELECT name FROM emp e WHERE salary = (SELECT x.salary FROM emp x "
                              "WHERE x.dept_id = e.dept_id)"),
                  DbError)
-        << "correlated subqueries are not supported";
+        << "more than one row for eng";
+    EXPECT_THROW(db->Execute("SELECT name FROM emp WHERE EXISTS (SELECT 1 FROM dept WHERE dept.id = emp.nope)"),
+                 DbError);
+}
+
+// Differential: correlated EXISTS / IN must agree with the equivalent joins.
+TEST_F(SqlTest, CorrelatedSubqueriesAgreeWithJoinsOnRandomData) {
+    db->Execute("CREATE TABLE a (id INT PRIMARY KEY, k INT); CREATE TABLE b (id INT PRIMARY KEY, k INT)");
+    db->Populate("a", 300);
+    db->Populate("b", 200);
+    db->Execute("UPDATE a SET k = NULL WHERE id % 13 = 0");
+    db->Execute("UPDATE b SET k = k + 500 WHERE id % 2 = 0");
+    int64_t with_partner = Scalar("SELECT COUNT(*) FROM (SELECT DISTINCT a.id FROM a JOIN b ON a.k = b.k) x");
+    EXPECT_EQ(Scalar("SELECT COUNT(*) FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.k = a.k)"), with_partner);
+    EXPECT_EQ(Scalar("SELECT COUNT(*) FROM a WHERE a.k IN (SELECT b.k FROM b WHERE b.k = a.k)"), with_partner);
+    EXPECT_EQ(Scalar("SELECT COUNT(*) FROM a WHERE NOT EXISTS (SELECT 1 FROM b WHERE b.k = a.k)"), 300 - with_partner);
+    EXPECT_EQ(Scalar("SELECT SUM((SELECT COUNT(*) FROM b WHERE b.k = a.k)) FROM a"),
+              Scalar("SELECT COUNT(*) FROM a JOIN b ON a.k = b.k"));
 }
 
 TEST_F(SqlTest, SubqueriesInDml) {

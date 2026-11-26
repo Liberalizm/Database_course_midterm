@@ -105,21 +105,49 @@ ExprPtr PreboundColumn(int idx, const std::string& name) {
 
 }  // namespace
 
-ExprPtr Planner::RunSubquery(const Expr& node, ExprPtr left) {
-    // Uncorrelated subqueries only: the subquery is planned on its own, so a
-    // reference to an outer column fails like any unknown column would.
-    ExecPtr plan;
-    try {
-        plan = PlanSelect(*node.subquery);
-    } catch (const DbError& err) {
-        std::string msg = err.what();
-        bool unresolved = msg.find("missing FROM-clause entry") != std::string::npos ||
-                          (msg.rfind("column \"", 0) == 0 && msg.find("does not exist") != std::string::npos);
-        if (!unresolved) throw;
-        throw DbError(msg + " (correlated subqueries, which refer to the outer query, are not supported)");
+bool Planner::ResolvesInEnclosingQuery(const Expr& col) const {
+    for (const Scope* s : scopes_) {
+        for (const auto& src : *s->srcs) {
+            if (!col.table.empty() && src.alias != col.table) continue;
+            if (src.schema.Find("", col.column) >= 0) return true;
+        }
     }
+    return false;
+}
+
+ExprPtr Planner::RunSubquery(const Expr& node, ExprPtr left, const std::vector<Source>* srcs) {
+    // Plan the subquery with the enclosing query's sources in scope (when there is
+    // one), so references to outer columns become PARAMs instead of errors.
+    Scope scope;
+    scope.srcs = srcs;
+    struct ScopeGuard {
+        std::vector<Scope*>* stack;
+        bool pushed;
+        ~ScopeGuard() {
+            if (pushed) stack->pop_back();
+        }
+    };
+    if (srcs) scopes_.push_back(&scope);
+    ScopeGuard guard{&scopes_, srcs != nullptr};
+    ExecPtr plan = PlanSelect(*node.subquery);
     if (node.sub_kind != SubqueryKind::EXISTS && plan->OutSchema().Size() != 1)
         throw DbError("subquery must return only one column");
+
+    if (!scope.refs.empty()) {
+        // Correlated: keep the plan and run it again for every outer row.
+        auto e = std::make_shared<Expr>();
+        e->kind = ExprKind::SUBPLAN;
+        e->sub_kind = node.sub_kind;
+        e->negated = node.negated;
+        e->left = std::move(left);
+        e->subplan = std::shared_ptr<Executor>(std::move(plan));
+        e->params = scope.params;
+        e->args = scope.refs;  // canonicalized by the caller, in the outer query's scope
+        e->FixHeight();
+        return e;
+    }
+
+    // Uncorrelated: run it once, now, and replace it by its result.
     plan->Init();
     Row r;
     switch (node.sub_kind) {
@@ -155,7 +183,7 @@ ExprPtr Planner::RunSubquery(const Expr& node, ExprPtr left) {
 
 ExprPtr Planner::ResolveSubqueries(const ExprPtr& e) {
     if (!e) return nullptr;
-    if (e->kind == ExprKind::SUBQUERY) return RunSubquery(*e, ResolveSubqueries(e->left));
+    if (e->kind == ExprKind::SUBQUERY) return RunSubquery(*e, ResolveSubqueries(e->left), nullptr);
     auto c = std::make_shared<Expr>(*e);
     c->left = ResolveSubqueries(e->left);
     c->right = ResolveSubqueries(e->right);
@@ -165,7 +193,14 @@ ExprPtr Planner::ResolveSubqueries(const ExprPtr& e) {
 
 ExprPtr Planner::Canonicalize(const ExprPtr& e, const std::vector<Source>& srcs) {
     if (!e) return nullptr;
-    if (e->kind == ExprKind::SUBQUERY) return RunSubquery(*e, Canonicalize(e->left, srcs));
+    if (e->kind == ExprKind::SUBQUERY) {
+        ExprPtr r = RunSubquery(*e, Canonicalize(e->left, srcs), &srcs);
+        // The outer columns a correlated subquery reads belong to this query (or,
+        // when nested deeper, to one around it: then they become params here too).
+        if (r->kind == ExprKind::SUBPLAN)
+            for (auto& a : r->args) a = Canonicalize(a, srcs);
+        return r;
+    }
     auto c = std::make_shared<Expr>(*e);
     if (e->kind == ExprKind::COLUMN) {
         if (e->prebound) return c;
@@ -179,7 +214,25 @@ ExprPtr Planner::Canonicalize(const ExprPtr& e, const std::vector<Source>& srcs)
                 found = static_cast<int>(i);
             }
         }
+        if (found < 0 && !scopes_.empty() && ResolvesInEnclosingQuery(*e)) {
+            // A column of an enclosing query: a parameter of the innermost scope.
+            Scope& s = *scopes_.back();
+            auto [it, inserted] = s.slot_of.emplace(e->table + "." + e->column, static_cast<int>(s.refs.size()));
+            if (inserted) {
+                s.refs.push_back(Expr::Col(e->table, e->column));
+                s.params->push_back(Value::Null());
+            }
+            auto p = std::make_shared<Expr>();
+            p->kind = ExprKind::PARAM;
+            p->params = s.params;
+            p->param_slot = it->second;
+            p->table = e->table;
+            p->column = e->column;
+            return p;
+        }
         if (found < 0) {
+            for (const Scope* s : scopes_)  // e.g. "emp.nope" where emp is an outer table
+                for (const auto& src : *s->srcs) alias_exists = alias_exists || src.alias == e->table;
             if (!e->table.empty() && !alias_exists)
                 throw DbError("missing FROM-clause entry for table \"" + e->table + "\"");
             throw DbError("column \"" + e->ToString() + "\" does not exist");

@@ -11,7 +11,7 @@
 
 namespace minidb {
 
-enum class ExprKind { CONST, COLUMN, BINARY, UNARY, IS_NULL, AGG, FUNC, SUBQUERY, IN_SET };
+enum class ExprKind { CONST, COLUMN, BINARY, UNARY, IS_NULL, AGG, FUNC, SUBQUERY, IN_SET, PARAM, SUBPLAN };
 enum class SubqueryKind { SCALAR, EXISTS, IN };
 enum class BinOp { EQ, NE, LT, LE, GT, GE, AND, OR, ADD, SUB, MUL, DIV, MOD, LIKE, CONCAT };
 enum class UnaryOp { NOT, NEG };
@@ -19,6 +19,7 @@ enum class AggFunc { COUNT, SUM, AVG, MIN, MAX };
 
 struct Expr;
 struct SelectStmt;
+class Executor;
 
 // Every pass over an expression (binding, evaluation, printing, even the
 // destructor) is recursive, so a tree that is too tall would overflow the
@@ -51,6 +52,14 @@ struct Expr {
     std::shared_ptr<const SelectStmt> subquery;
     std::shared_ptr<const std::unordered_set<std::string>> in_set;
     bool in_set_has_null = false;
+    // Correlated subqueries. PARAM: a column of an enclosing query, read from
+    // (*params)[param_slot] (`column` keeps the name for printing). SUBPLAN: a
+    // planned subquery (`subplan`, same kinds as SUBQUERY) that is re-run for every
+    // outer row after copying the values of `args` (outer column expressions, bound
+    // against the outer row) into the `params` its PARAM nodes read.
+    std::shared_ptr<std::vector<Value>> params;
+    int param_slot = -1;
+    std::shared_ptr<Executor> subplan;
     ExprPtr left, right;         // children (UNARY / IS_NULL / AGG use `left`)
     int height = 1;              // 1 for leaves, 1 + tallest child otherwise
 

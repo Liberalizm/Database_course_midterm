@@ -1,5 +1,7 @@
 #include "expression.h"
 
+#include "executors.h"
+
 #include <algorithm>
 #include <cctype>
 #include <cmath>
@@ -49,6 +51,12 @@ std::string Expr::ToString() const {
             std::string s = std::string(negated ? "NOT " : "") + kinds[static_cast<int>(sub_kind)] + "(SELECT ...)";
             if (sub_kind == SubqueryKind::IN) s = wrap(left) + (negated ? " NOT IN " : " IN ") + "(SELECT ...)";
             return s;
+        }
+        case ExprKind::PARAM: return table.empty() ? column : table + "." + column;
+        case ExprKind::SUBPLAN: {
+            static const char* kinds[] = {"", "EXISTS ", ""};
+            if (sub_kind == SubqueryKind::IN) return wrap(left) + (negated ? " NOT IN " : " IN ") + "(SELECT ...)";
+            return std::string(negated ? "NOT " : "") + kinds[static_cast<int>(sub_kind)] + "(SELECT ...)";
         }
         case ExprKind::IN_SET:
             return wrap(left) + (negated ? " NOT IN " : " IN ") + "(" + std::to_string(in_set->size() + (in_set_has_null ? 1 : 0)) + " values)";
@@ -270,6 +278,43 @@ Value EvaluateFunction(const Expr& e, const Row& row) {
     throw DbError("internal: unknown function " + fn);
 }
 
+// A correlated subquery, evaluated for one outer row: copy the outer values the
+// subquery refers to into its parameter slots, then run its plan again.
+Value EvaluateSubplan(const Expr& e, const Row& row) {
+    Value x;  // IN: the tested value, from the outer row
+    if (e.sub_kind == SubqueryKind::IN) x = Evaluate(*e.left, row);
+    for (size_t i = 0; i < e.args.size(); ++i) (*e.params)[i] = Evaluate(*e.args[i], row);
+    Executor& plan = *e.subplan;
+    plan.Init();
+    Row r;
+    switch (e.sub_kind) {
+        case SubqueryKind::EXISTS: return Value::Bool(plan.Next(&r) != e.negated);
+        case SubqueryKind::SCALAR: {
+            if (!plan.Next(&r)) return Value::Null();
+            Value v = r[0];
+            if (plan.Next(&r)) throw DbError("more than one row returned by a subquery used as an expression");
+            return v;
+        }
+        case SubqueryKind::IN: {
+            // Same three-valued logic as IN_SET: TRUE on a match; else NULL if x
+            // or any result is NULL; else FALSE (and the reverse for NOT IN).
+            bool any = false, saw_null = false;
+            while (plan.Next(&r)) {
+                any = true;
+                if (r[0].IsNull()) {
+                    saw_null = true;
+                } else if (!x.IsNull() && x.Compare(r[0]) == 0) {
+                    return Value::Bool(!e.negated);
+                }
+            }
+            if (!any) return Value::Bool(e.negated);
+            if (x.IsNull() || saw_null) return Value::Null();
+            return Value::Bool(e.negated);
+        }
+    }
+    throw DbError("internal: bad subquery kind");
+}
+
 }  // namespace
 
 Value Evaluate(const Expr& e, const Row& row) {
@@ -294,6 +339,8 @@ Value Evaluate(const Expr& e, const Row& row) {
         case ExprKind::AGG: throw DbError("internal: aggregate evaluated as scalar");
         case ExprKind::FUNC: return EvaluateFunction(e, row);
         case ExprKind::SUBQUERY: throw DbError("internal: subquery was not resolved by the planner");
+        case ExprKind::PARAM: return (*e.params)[static_cast<size_t>(e.param_slot)];
+        case ExprKind::SUBPLAN: return EvaluateSubplan(e, row);
         case ExprKind::IN_SET: {
             // x IN (subquery results), three-valued: TRUE on a match; otherwise NULL if x
             // or any result is NULL (the answer is unknown); otherwise FALSE.

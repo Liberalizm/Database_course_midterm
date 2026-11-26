@@ -39,7 +39,7 @@ SQL summary and the meta commands (`.tables`, `.schema t`, `.indexes`,
 | DML | `INSERT ... VALUES / SELECT`, `UPDATE`, `DELETE` — each statement is atomic |
 | Queries | `SELECT [DISTINCT]`, `WHERE`, `[INNER] JOIN`, `LEFT [OUTER] JOIN`, `CROSS JOIN` / comma joins, `GROUP BY`, `HAVING`, `ORDER BY` (names, aliases, positions), `LIMIT` / `OFFSET` |
 | Set operations | `UNION`, `INTERSECT`, `EXCEPT`, each with or without `ALL` |
-| Subqueries | scalar `(SELECT ...)`, `x [NOT] IN (SELECT ...)`, `[NOT] EXISTS (...)`, derived tables `FROM (SELECT ...) alias` — uncorrelated only |
+| Subqueries | scalar `(SELECT ...)`, `x [NOT] IN (SELECT ...)`, `[NOT] EXISTS (...)`, derived tables `FROM (SELECT ...) alias`; correlated subqueries (referring to the outer row) in `WHERE` (also of `UPDATE` / `DELETE`), `HAVING` and the select list |
 | Expressions | arithmetic (overflow-checked), comparisons, `AND / OR / NOT` with three-valued logic, `LIKE`, `BETWEEN`, `IN (list)`, `IS [NOT] NULL`, `||`, `CASE` |
 | Functions | `ABS`, `ROUND`, `LENGTH`, `UPPER`, `LOWER`, `SUBSTR`, `COALESCE`, `NULLIF` |
 | Aggregates | `COUNT(*)`, `COUNT / SUM / AVG / MIN / MAX`, each also with `DISTINCT` |
@@ -104,7 +104,8 @@ orders inner joins greedily (smallest input first, avoiding cross
 products) and chooses a hash join for equi-joins (smaller side hashed) or
 a nested loop otherwise. Queries with a `LEFT JOIN` are joined in the order
 written. Uncorrelated subqueries are executed once during planning and
-replaced by their result.
+replaced by their result; a correlated one keeps its plan and is re-run for
+every outer row, with the outer values passed in as parameters.
 
 **Execution.** Operators follow the Volcano model (`Init()` / `Next(row)`),
 so rows stream through the plan. `EXPLAIN ANALYZE` shows estimated vs.
@@ -121,7 +122,6 @@ the middle of a statement can leave it partially written.
 
 - No transactions or concurrency: one connection, autocommit only.
 - No write-ahead log (see above) and no page checksums.
-- Subqueries cannot refer to columns of the outer query (correlated).
 - No `RIGHT` / `FULL` joins, foreign keys or views; `DEFAULT` must be a constant.
 - Indexes on `INT` and `TEXT` columns only; one column per index.
 - B+ tree nodes are not merged after deletes.
