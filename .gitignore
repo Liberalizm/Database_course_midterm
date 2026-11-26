@@ -19,3 +19,9 @@ out/
 *.so
 *.dll
 *.db
+
+# Local build directories
+build-*/
+
+# Test artifacts
+Testing/

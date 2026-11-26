@@ -246,6 +246,29 @@ int BPlusTree::Height() const {
     }
 }
 
+bool BPlusTree::MinKey(int64_t* out) const {
+    Iterator it = Begin();
+    if (!it.Valid()) return false;
+    *out = it.Entry().key;
+    return true;
+}
+
+bool BPlusTree::MaxKey(int64_t* out) const {
+    if (root_ == INVALID_PAGE_ID) return false;
+    page_id_t pid = root_;
+    while (true) {
+        PageGuard g = PageGuard::Fetch(bpm_, pid);
+        const char* d = g.Data();
+        int n = Size(d);
+        if (IsLeaf(d)) {
+            if (n == 0) return false;  // rightmost leaf emptied by lazy deletes
+            *out = LeafKey(d, n - 1).key;
+            return true;
+        }
+        pid = Child(d, n - 1);
+    }
+}
+
 size_t BPlusTree::CheckAndCount() const {
     size_t n = 0;
     bool first = true;

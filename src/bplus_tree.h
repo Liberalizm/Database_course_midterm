@@ -63,6 +63,10 @@ public:
     Iterator LowerBound(int64_t key) const;  // first entry with entry.key >= key
     int Height() const;
 
+    // Smallest / largest key (statistics for the planner). False if unknown/empty.
+    bool MinKey(int64_t* out) const;
+    bool MaxKey(int64_t* out) const;
+
     // Debug: verify sortedness of the leaf chain and return number of entries.
     size_t CheckAndCount() const;
 
