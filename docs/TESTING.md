@@ -29,6 +29,7 @@ tests/
 │   ├── test_persistence.cpp data survives restarts; crash at every point of the log; rollback on I/O errors
 │   ├── test_temporal.cpp    DATE / TIMESTAMP: storage, comparison, arithmetic, indexes, reopen
 │   ├── test_planner_stats.cpp ANALYZE estimates, index scans in correlated subqueries (randomized)
+│   ├── test_concurrency.cpp file locking; Connections from several threads, busy timeout, stress
 │   ├── test_foreign_keys.cpp FOREIGN KEY checks, actions, DDL guards, randomized invariants
 │   └── test_transactions.cpp BEGIN/COMMIT/ROLLBACK, savepoints, crash at every write, model check
 └── e2e/                     the real shell binary, compared to golden output

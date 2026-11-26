@@ -17,6 +17,7 @@
 #include <cerrno>
 #include <cstring>
 #include <fcntl.h>
+#include <sys/file.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #endif
@@ -67,6 +68,15 @@ void File::Close() {
 }
 
 bool File::IsOpen() const { return handle_ != nullptr; }
+
+bool File::TryLockExclusive() {
+    // Windows locks are mandatory, so lock one byte far beyond any data: reads
+    // of the file through other handles (e.g. a backup copy) keep working.
+    OVERLAPPED ov{};
+    ov.OffsetHigh = 0x40000000;  // offset 2^62
+    return LockFileEx(static_cast<HANDLE>(handle_), LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY, 0, 1, 0,
+                      &ov) != 0;
+}
 
 size_t File::ReadAt(uint64_t offset, void* buf, size_t n) {
     size_t done = 0;
@@ -148,6 +158,8 @@ void File::Close() {
 }
 
 bool File::IsOpen() const { return fd_ >= 0; }
+
+bool File::TryLockExclusive() { return ::flock(fd_, LOCK_EX | LOCK_NB) == 0; }
 
 size_t File::ReadAt(uint64_t offset, void* buf, size_t n) {
     size_t done = 0;

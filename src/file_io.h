@@ -23,6 +23,9 @@ public:
     bool Open(const std::string& path);
     void Close();
     bool IsOpen() const;
+    // Takes an exclusive lock on the file that other processes (and other File
+    // objects) cannot take until this one is closed. False if it is held.
+    bool TryLockExclusive();
 
     // Reads up to `n` bytes at `offset`; returns fewer only at the end of the file.
     size_t ReadAt(uint64_t offset, void* buf, size_t n);

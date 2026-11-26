@@ -23,6 +23,10 @@ std::string Hex32(uint32_t v) {
 
 DiskManager::DiskManager(const std::string& path, DiskOptions options) : path_(path), options_(options) {
     if (file_.Open(path) && options_.sync) SyncParentDirectory(path);
+    // One DiskManager per database file: a second one (another process, or the
+    // same process opening the file twice) would corrupt it.
+    if (!file_.TryLockExclusive())
+        throw DbError("database \"" + path + "\" is locked: it is open in another process or connection");
     const uint64_t size = file_.Size();
     const bool whole_pages = size % DISK_PAGE_SIZE == 0;
     // Either the file is damaged (truncated, or something else entirely) or it

@@ -252,10 +252,31 @@ machine (Windows): 1000 single-row `INSERT`s take ~2 s as autocommit vs
 (or `DiskOptions{.sync = false}`) skips the fsyncs: commits stay atomic if the
 process crashes, but not if the machine loses power.
 
+**Concurrency.** While a database is open its file is locked (`LockFileEx` /
+`flock`), so a second process (or a second `Database` on the same file) is
+refused with "database ... is locked" instead of corrupting it. Inside one
+process, any number of `Connection`s can share a `Database` from different
+threads:
+
+```cpp
+Database db("shop.db");
+Connection a(&db), b(&db);           // e.g. one per thread
+a.Execute("BEGIN; UPDATE acct SET balance = balance - 5 WHERE id = 1");
+b.Execute("SELECT SUM(balance) FROM acct");  // waits until a commits
+```
+
+Statements run one at a time, and an open transaction holds the whole
+database until it commits or rolls back (like SQLite's rollback-journal mode):
+other connections wait, up to a busy timeout (`SetBusyTimeout`, default 5 s),
+then fail with "database is locked". Every schedule is therefore
+serializable and no connection ever sees uncommitted data. A connection that
+is closed with a transaction open rolls it back.
+
 ## Limitations
 
-- One connection at a time: no concurrency control, and no file locking to
-  stop two processes from opening the same database file.
+- Concurrency is coarse: one writer or reader at a time (a database-level
+  lock), so connections never run in parallel. Only one process can have a
+  database open.
 - A transaction's changes stay in the log until it commits, so a very large
   transaction makes the log (not the database file) large until the next
   checkpoint.
@@ -277,7 +298,7 @@ process crashes, but not if the machine loses power.
 
 ## Tests
 
-About 500 tests in three layers — unit tests per component, integration
+About 560 tests in three layers — unit tests per component, integration
 tests through the `Database` API, and end-to-end tests that run the shell
 binary against golden output — plus randomized differential and
 file-corruption tests. See [docs/TESTING.md](docs/TESTING.md).

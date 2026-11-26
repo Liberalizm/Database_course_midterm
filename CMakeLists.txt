@@ -51,6 +51,8 @@ add_library(minidb_core STATIC
         src/database.cpp
         src/shell.cpp)
 target_include_directories(minidb_core PUBLIC src)
+find_package(Threads REQUIRED)  # Connections may be used from several threads
+target_link_libraries(minidb_core PUBLIC Threads::Threads)
 minidb_set_warnings(minidb_core)
 
 # Interactive SQL shell.

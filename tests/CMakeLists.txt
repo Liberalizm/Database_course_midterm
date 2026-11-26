@@ -76,7 +76,7 @@ foreach (f IN LISTS MINIDB_UNIT_FILES)
 endforeach ()
 
 # ---- integration tests ----
-minidb_add_test(test_integration "integration" integration/test_sql.cpp integration/test_persistence.cpp integration/test_temporal.cpp integration/test_planner_stats.cpp
+minidb_add_test(test_integration "integration" integration/test_sql.cpp integration/test_persistence.cpp integration/test_temporal.cpp integration/test_planner_stats.cpp integration/test_concurrency.cpp
         integration/test_foreign_keys.cpp
         integration/test_transactions.cpp)
 
