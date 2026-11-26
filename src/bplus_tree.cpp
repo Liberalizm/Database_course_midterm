@@ -450,6 +450,8 @@ size_t BPlusTree::CheckAndCount() const {
 namespace {
 
 struct StructureCheck {
+    StructureCheck(BufferPoolManager* b, Layout l, int lmin, int imin)
+        : bpm(b), L(l), leaf_min(lmin), internal_min(imin) {}
     BufferPoolManager* bpm;
     Layout L;
     int leaf_min, internal_min;
@@ -497,7 +499,7 @@ struct StructureCheck {
 
 size_t BPlusTree::CheckStructure() const {
     if (root_ == INVALID_PAGE_ID) return 0;
-    StructureCheck c{bpm_, Layout{wide_}, LeafMin(), InternalMin()};
+    StructureCheck c(bpm_, Layout{wide_}, LeafMin(), InternalMin());
     c.Visit(root_, 0, true, nullptr, nullptr);
     // The leaf chain must link exactly the leaves, in key order.
     for (size_t i = 0; i < c.leaves.size(); ++i) {

@@ -378,7 +378,9 @@ TEST_F(BPlusTreeTest, DeletingEverythingShrinksTheTreeToOneLeaf) {
         EXPECT_GE(t.Height(), 4);
         for (int i = 0; i < 2000; ++i) {
             ASSERT_TRUE(t.Remove(i, RID{i, 0}));
-            if (i % 101 == 0) ASSERT_EQ(t.CheckStructure(), static_cast<size_t>(1999 - i)) << "after removing " << i;
+            if (i % 101 == 0) {
+                ASSERT_EQ(t.CheckStructure(), static_cast<size_t>(1999 - i)) << "after removing " << i;
+            }
         }
         EXPECT_EQ(t.Height(), 1) << "fanout " << fanout;
         EXPECT_EQ(t.Pages().size(), 1u);
@@ -440,8 +442,9 @@ TEST_F(BPlusTreeTest, RebalancedTreeSurvivesAReload) {
     {
         BPlusTree t(&bpm, INVALID_PAGE_ID, 6, 5);
         for (int i = 0; i < 3000; ++i) t.Insert(i * 7 % 3000, RID{i, 0});
-        for (int i = 0; i < 3000; ++i)
+        for (int i = 0; i < 3000; ++i) {
             if (i % 5 != 0) t.Remove(i * 7 % 3000, RID{i, 0});
+        }
         root = t.Root();
         bpm.FlushAll();
     }

@@ -225,7 +225,7 @@ TEST(Value, TemporalHashKeysMatchComparison) {
 }
 
 TEST(Value, TemporalTupleRoundTrip) {
-    Schema s({{"d", TypeId::DATE}, {"t", TypeId::TIMESTAMP}, {"n", TypeId::DATE}});
+    Schema s({Col("d", TypeId::DATE), Col("t", TypeId::TIMESTAMP), Col("n", TypeId::DATE)});
     Row r = {Value::Date(ParseDate("2024-02-29")), Value::Timestamp(ParseTimestamp("1950-06-01 10:20:30")), N()};
     std::string bytes = SerializeTuple(s, r);
     Row back = DeserializeTuple(s, bytes.data(), bytes.size());
