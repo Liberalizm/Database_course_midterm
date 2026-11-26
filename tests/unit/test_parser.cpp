@@ -43,6 +43,86 @@ TEST(Parser, TableLevelPrimaryKey) {
 
 TEST(Parser, UnknownTypeIsRejected) { EXPECT_THROW(Parser("CREATE TABLE t (a BLOB)").ParseAll(), DbError); }
 
+TEST(Parser, ColumnForeignKey) {
+    auto c = ParseOne<CreateTableStmt>(
+        "CREATE TABLE emp (id INT PRIMARY KEY, dept_id INT REFERENCES dept, "
+        "boss INT NOT NULL CONSTRAINT boss_fk REFERENCES emp (id) ON UPDATE CASCADE ON DELETE SET NULL)");
+    ASSERT_EQ(c.cols.size(), 3u);
+    EXPECT_FALSE(c.cols[0].references);
+    ASSERT_TRUE(c.cols[1].references);
+    EXPECT_EQ(c.cols[1].references->ref_table, "dept");
+    EXPECT_EQ(c.cols[1].references->ref_column, "");  // the primary key
+    EXPECT_EQ(c.cols[1].references->name, "");
+    EXPECT_EQ(c.cols[1].references->on_delete, FkAction::NO_ACTION);
+    ASSERT_TRUE(c.cols[2].references);
+    EXPECT_TRUE(c.cols[2].not_null);
+    EXPECT_EQ(c.cols[2].references->name, "boss_fk");
+    EXPECT_EQ(c.cols[2].references->ref_column, "id");
+    EXPECT_EQ(c.cols[2].references->on_delete, FkAction::SET_NULL);
+    EXPECT_EQ(c.cols[2].references->on_update, FkAction::CASCADE);
+}
+
+TEST(Parser, TableForeignKey) {
+    auto c = ParseOne<CreateTableStmt>(
+        "CREATE TABLE t (a INT, b TEXT, FOREIGN KEY (a) REFERENCES p (x) ON DELETE RESTRICT,"
+        " CONSTRAINT b_fk FOREIGN KEY (b) REFERENCES q ON DELETE NO ACTION ON UPDATE SET DEFAULT)");
+    ASSERT_EQ(c.cols.size(), 2u);
+    ASSERT_EQ(c.foreign_keys.size(), 2u);
+    EXPECT_EQ(c.foreign_keys[0].column, "a");
+    EXPECT_EQ(c.foreign_keys[0].ref_table, "p");
+    EXPECT_EQ(c.foreign_keys[0].ref_column, "x");
+    EXPECT_EQ(c.foreign_keys[0].on_delete, FkAction::RESTRICT);
+    EXPECT_EQ(c.foreign_keys[1].name, "b_fk");
+    EXPECT_EQ(c.foreign_keys[1].column, "b");
+    EXPECT_EQ(c.foreign_keys[1].on_delete, FkAction::NO_ACTION);
+    EXPECT_EQ(c.foreign_keys[1].on_update, FkAction::SET_DEFAULT);
+}
+
+TEST(Parser, ForeignKeyWordsAreNotReserved) {
+    auto c = ParseOne<CreateTableStmt>("CREATE TABLE t (foreign INT, references INT, cascade TEXT, constraint INT)");
+    ASSERT_EQ(c.cols.size(), 4u);
+    EXPECT_EQ(c.cols[0].name, "foreign");
+    EXPECT_EQ(c.cols[3].name, "constraint");
+    EXPECT_TRUE(c.foreign_keys.empty());
+    auto d = ParseOne<AlterTableStmt>("ALTER TABLE t DROP constraint");
+    EXPECT_EQ(d.action, AlterTableStmt::Action::DROP_COLUMN);
+    EXPECT_EQ(d.name, "constraint");
+}
+
+TEST(Parser, AlterTableForeignKeys) {
+    auto a = ParseOne<AlterTableStmt>("ALTER TABLE emp ADD CONSTRAINT fk FOREIGN KEY (dept_id) REFERENCES dept (id)");
+    EXPECT_EQ(a.action, AlterTableStmt::Action::ADD_FOREIGN_KEY);
+    EXPECT_EQ(a.foreign_key.name, "fk");
+    EXPECT_EQ(a.foreign_key.column, "dept_id");
+    EXPECT_EQ(a.foreign_key.ref_table, "dept");
+    auto b = ParseOne<AlterTableStmt>("ALTER TABLE emp ADD FOREIGN KEY (x) REFERENCES t ON DELETE CASCADE");
+    EXPECT_EQ(b.action, AlterTableStmt::Action::ADD_FOREIGN_KEY);
+    EXPECT_EQ(b.foreign_key.on_delete, FkAction::CASCADE);
+    auto c = ParseOne<AlterTableStmt>("ALTER TABLE emp ADD COLUMN boss INT REFERENCES emp");
+    EXPECT_EQ(c.action, AlterTableStmt::Action::ADD_COLUMN);
+    ASSERT_TRUE(c.column.references);
+    EXPECT_EQ(c.column.references->ref_table, "emp");
+    auto d = ParseOne<AlterTableStmt>("ALTER TABLE emp DROP CONSTRAINT fk");
+    EXPECT_EQ(d.action, AlterTableStmt::Action::DROP_CONSTRAINT);
+    EXPECT_EQ(d.name, "fk");
+}
+
+TEST(Parser, ForeignKeySyntaxErrors) {
+    for (const char* sql : {"CREATE TABLE t (a INT REFERENCES)",
+                            "CREATE TABLE t (a INT REFERENCES p (x, y))",
+                            "CREATE TABLE t (a INT, b INT, FOREIGN KEY (a, b) REFERENCES p)",
+                            "CREATE TABLE t (a INT REFERENCES p ON DELETE)",
+                            "CREATE TABLE t (a INT REFERENCES p ON DELETE CASCADE ON DELETE SET NULL)",
+                            "CREATE TABLE t (a INT REFERENCES p ON INSERT CASCADE)",
+                            "CREATE TABLE t (a INT REFERENCES p ON DELETE SET)",
+                            "CREATE TABLE t (a INT REFERENCES p ON DELETE NO)",
+                            "CREATE TABLE t (a INT REFERENCES p REFERENCES q)",
+                            "CREATE TABLE t (a INT CONSTRAINT c UNIQUE)",
+                            "CREATE TABLE t (a INT, CONSTRAINT c PRIMARY KEY (a))",
+                            "ALTER TABLE t ADD FOREIGN KEY a REFERENCES p"})
+        EXPECT_THROW(Parser(sql).ParseAll(), DbError) << sql;
+}
+
 TEST(Parser, CreateIndexAndDrop) {
     auto i = ParseOne<CreateIndexStmt>("CREATE UNIQUE INDEX idx ON t (col)");
     EXPECT_TRUE(i.unique);

@@ -135,8 +135,9 @@ Token Parser::Advance() {
     return t;
 }
 
-bool Parser::CheckKw(const char* kw) const {
-    return Peek().type == TokenType::IDENT && !Peek().quoted && Peek().text == kw;
+bool Parser::CheckKw(const char* kw) const { return CheckKwAt(0, kw); }
+bool Parser::CheckKwAt(size_t k, const char* kw) const {
+    return Peek(k).type == TokenType::IDENT && !Peek(k).quoted && Peek(k).text == kw;
 }
 bool Parser::AcceptKw(const char* kw) {
     if (!CheckKw(kw)) return false;
@@ -252,13 +253,26 @@ TypeId Parser::ParseType() {
     return type;
 }
 
-// name type [PRIMARY KEY | NOT NULL | NULL | UNIQUE]...
+// name type [PRIMARY KEY | NOT NULL | NULL | UNIQUE | DEFAULT e | [CONSTRAINT n] REFERENCES ...]...
+// CONSTRAINT, REFERENCES, FOREIGN, CASCADE, RESTRICT, ACTION and NO are matched
+// in context only (not reserved), so columns with those names keep working.
 ColumnDef Parser::ParseColumnDef() {
     ColumnDef d;
     d.name = ExpectIdent();
     d.type = ParseType();
     while (true) {
-        if (AcceptKw("primary")) {
+        if (CheckKw("constraint") || CheckKw("references")) {
+            std::string name;
+            if (AcceptKw("constraint")) {
+                name = ExpectIdent();
+                if (!CheckKw("references"))
+                    Error("expected REFERENCES (only foreign key constraints can be named)");
+            }
+            if (d.references) Error("more than one REFERENCES for column \"" + d.name + "\"");
+            Advance();  // REFERENCES
+            d.references = ParseReferences();
+            d.references->name = name;
+        } else if (AcceptKw("primary")) {
             ExpectKw("key");
             d.primary_key = true;
             d.not_null = true;
@@ -279,17 +293,99 @@ ColumnDef Parser::ParseColumnDef() {
     return d;
 }
 
+// After REFERENCES: table [(column)] [ON DELETE action] [ON UPDATE action], the
+// two ON clauses in either order. Without a column the primary key is meant.
+ForeignKey Parser::ParseReferences() {
+    ForeignKey fk;
+    fk.ref_table = ExpectIdent();
+    if (AcceptSym("(")) {
+        fk.ref_column = ExpectIdent();
+        if (CheckSym(",")) Error("foreign keys over several columns are not supported");
+        ExpectSym(")");
+    }
+    bool on_delete = false, on_update = false;
+    while (AcceptKw("on")) {
+        if (AcceptKw("delete")) {
+            if (on_delete) Error("ON DELETE specified more than once");
+            on_delete = true;
+            fk.on_delete = ParseFkAction();
+        } else if (AcceptKw("update")) {
+            if (on_update) Error("ON UPDATE specified more than once");
+            on_update = true;
+            fk.on_update = ParseFkAction();
+        } else {
+            Error("expected DELETE or UPDATE");
+        }
+    }
+    return fk;
+}
+
+// CASCADE | RESTRICT | NO ACTION | SET NULL | SET DEFAULT
+FkAction Parser::ParseFkAction() {
+    if (AcceptKw("cascade")) return FkAction::CASCADE;
+    if (AcceptKw("restrict")) return FkAction::RESTRICT;
+    if (AcceptKw("no")) {
+        ExpectKw("action");
+        return FkAction::NO_ACTION;
+    }
+    if (AcceptKw("set")) {
+        if (AcceptKw("null")) return FkAction::SET_NULL;
+        if (AcceptKw("default")) return FkAction::SET_DEFAULT;
+        Error("expected NULL or DEFAULT");
+    }
+    Error("expected CASCADE, RESTRICT, NO ACTION, SET NULL or SET DEFAULT");
+}
+
+// "FOREIGN KEY ..." or "CONSTRAINT name <constraint>", as opposed to a column
+// definition such as "foreign INT" (KEY is reserved, so it can't be a type name).
+bool Parser::AtTableConstraint() const {
+    if (CheckKw("foreign") && CheckKwAt(1, "key")) return true;
+    return CheckKw("constraint") && Peek(1).type == TokenType::IDENT && Peek(2).type == TokenType::IDENT &&
+           (CheckKwAt(2, "foreign") || CheckKwAt(2, "primary") || CheckKwAt(2, "unique") || CheckKwAt(2, "check"));
+}
+
+ForeignKey Parser::ParseTableConstraint() {
+    std::string name;
+    if (AcceptKw("constraint")) {
+        name = ExpectIdent();
+        if (!CheckKw("foreign")) Error("expected FOREIGN KEY (only foreign key constraints can be named)");
+    }
+    ExpectKw("foreign");
+    ExpectKw("key");
+    ExpectSym("(");
+    std::string column = ExpectIdent();
+    if (CheckSym(",")) Error("foreign keys over several columns are not supported");
+    ExpectSym(")");
+    ExpectKw("references");
+    ForeignKey fk = ParseReferences();
+    fk.name = name;
+    fk.column = column;
+    return fk;
+}
+
 // After ALTER TABLE. ADD / DROP / RENAME / COLUMN / TO are matched in context
 // only (not reserved), so existing columns with those names keep working.
 AlterTableStmt Parser::ParseAlterTable() {
     AlterTableStmt a;
     a.table = ExpectIdent();
     if (AcceptKw("add")) {
+        if (AtTableConstraint()) {
+            a.action = AlterTableStmt::Action::ADD_FOREIGN_KEY;
+            a.foreign_key = ParseTableConstraint();
+            return a;
+        }
         a.action = AlterTableStmt::Action::ADD_COLUMN;
         // "ADD COLUMN x INT" vs. a column that is itself named "column": "ADD column INT".
         if (CheckKw("column") && Peek(1).type == TokenType::IDENT && Peek(2).type == TokenType::IDENT) Advance();
         a.column = ParseColumnDef();
     } else if (AcceptKw("drop")) {
+        // "DROP CONSTRAINT name" vs. dropping a column named "constraint".
+        if (CheckKw("constraint") && Peek(1).type == TokenType::IDENT) {
+            Advance();
+            a.action = AlterTableStmt::Action::DROP_CONSTRAINT;
+            a.name = ExpectIdent();
+            return a;
+        }
         a.action = AlterTableStmt::Action::DROP_COLUMN;
         if (CheckKw("column") && Peek(1).type == TokenType::IDENT) Advance();
         a.name = ExpectIdent();
@@ -321,6 +417,10 @@ CreateTableStmt Parser::ParseCreateTable() {
             ExpectSym("(");
             table_pk = ExpectIdent();
             ExpectSym(")");
+            continue;
+        }
+        if (AtTableConstraint()) {
+            c.foreign_keys.push_back(ParseTableConstraint());
             continue;
         }
         c.cols.push_back(ParseColumnDef());

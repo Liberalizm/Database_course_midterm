@@ -7,6 +7,7 @@
 #include <variant>
 #include <vector>
 
+#include "foreign_key.h"
 #include "value.h"
 
 namespace minidb {
@@ -153,11 +154,15 @@ struct ColumnDef {
     bool not_null = false;
     bool unique = false;
     ExprPtr default_expr;  // DEFAULT <constant expression>
+    // [CONSTRAINT name] REFERENCES t [(c)] [ON DELETE ...] [ON UPDATE ...]
+    // (`table` and `column` are filled in when the constraint is created).
+    std::optional<ForeignKey> references;
 };
 
 struct CreateTableStmt {
     std::string name;
     std::vector<ColumnDef> cols;
+    std::vector<ForeignKey> foreign_keys;  // table constraints: [CONSTRAINT n] FOREIGN KEY (c) REFERENCES ...
 };
 
 struct CreateIndexStmt {
@@ -241,12 +246,14 @@ struct ExplainStmt {
 
 // ALTER TABLE table ADD [COLUMN] col | DROP [COLUMN] name | RENAME [COLUMN] name TO new_name
 //                  | RENAME TO new_name
+//                  | ADD [CONSTRAINT n] FOREIGN KEY (c) REFERENCES ... | DROP CONSTRAINT n
 struct AlterTableStmt {
-    enum class Action { ADD_COLUMN, DROP_COLUMN, RENAME_COLUMN, RENAME_TABLE };
+    enum class Action { ADD_COLUMN, DROP_COLUMN, RENAME_COLUMN, RENAME_TABLE, ADD_FOREIGN_KEY, DROP_CONSTRAINT };
     std::string table;
     Action action = Action::ADD_COLUMN;
-    ColumnDef column;      // ADD_COLUMN
-    std::string name;      // DROP_COLUMN, RENAME_COLUMN: the existing column
+    ColumnDef column;        // ADD_COLUMN
+    ForeignKey foreign_key;  // ADD_FOREIGN_KEY
+    std::string name;      // DROP_COLUMN, RENAME_COLUMN: the existing column; DROP_CONSTRAINT: the constraint
     std::string new_name;  // RENAME_COLUMN, RENAME_TABLE
 };
 

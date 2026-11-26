@@ -28,6 +28,10 @@ private:
     Statement ParseStatement();
     CreateTableStmt ParseCreateTable();
     ColumnDef ParseColumnDef();
+    ForeignKey ParseReferences();       // after REFERENCES: table [(column)] [ON DELETE a] [ON UPDATE a]
+    FkAction ParseFkAction();
+    bool AtTableConstraint() const;     // [CONSTRAINT name] FOREIGN KEY comes next
+    ForeignKey ParseTableConstraint();  // [CONSTRAINT name] FOREIGN KEY (column) REFERENCES ...
     AlterTableStmt ParseAlterTable();
     CreateIndexStmt ParseCreateIndex(bool unique);
     InsertStmt ParseInsert();
@@ -53,6 +57,7 @@ private:
     const Token& Peek(size_t k = 0) const;
     Token Advance();
     bool CheckKw(const char* kw) const;
+    bool CheckKwAt(size_t k, const char* kw) const;  // the k-th token ahead is this keyword
     bool AcceptKw(const char* kw);
     void ExpectKw(const char* kw);
     bool CheckSym(const char* s) const;

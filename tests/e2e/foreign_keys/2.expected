@@ -1,0 +1,22 @@
+Table "emp"
+  id  INT  NOT NULL
+  name  TEXT
+  dept_id  INT
+  boss  INT
+  index emp_pkey (id) UNIQUE btree
+  constraint emp_boss FOREIGN KEY (boss) REFERENCES emp(id) ON DELETE SET NULL
+  constraint emp_dept_id_fkey FOREIGN KEY (dept_id) REFERENCES dept(id) ON DELETE CASCADE ON UPDATE CASCADE
+  referenced by emp(boss) via emp_boss
+ERROR: insert or update on table "emp" violates foreign key constraint "emp_dept_id_fkey": key (dept_id)=(2) is not present in table "dept"
+INSERT 1
+ALTER TABLE
+INSERT 1
+ERROR: foreign key constraint "emp_dept" is violated by an existing row of table "emp": key (dept_id)=(99) is not present in table "dept"
+DELETE 1
+ALTER TABLE
+ERROR: update or delete on table "dept" violates foreign key constraint "emp_dept" on table "emp": key (id)=(3) is still referenced from table "emp"
+ name | name
+------+------
+ bob  | eng
+ fay  | hr
+(2 rows)

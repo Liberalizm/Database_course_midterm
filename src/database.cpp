@@ -3,8 +3,8 @@
 #include <algorithm>
 #include <chrono>
 #include <random>
-#include <set>
-#include <unordered_set>
+
+#include "write_set.h"
 
 namespace minidb {
 
@@ -100,13 +100,36 @@ QueryResult Database::RunCreateTable(const CreateTableStmt& s) {
             throw DbError("PRIMARY KEY / UNIQUE is only supported on INT and TEXT columns");
     }
     catalog_->CreateTable(s.name, cols);
-    for (const auto& d : s.cols) {
-        if (d.primary_key)
-            catalog_->CreateIndex(s.name + "_pkey", s.name, d.name, true);
-        else if (d.unique)
-            catalog_->CreateIndex(s.name + "_" + d.name + "_key", s.name, d.name, true);
+    // Indexes and foreign keys need the table to exist (a foreign key may refer
+    // to the table itself), so a failure here takes the new table back out.
+    try {
+        for (const auto& d : s.cols) {
+            if (d.primary_key)
+                catalog_->CreateIndex(s.name + "_pkey", s.name, d.name, true);
+            else if (d.unique)
+                catalog_->CreateIndex(s.name + "_" + d.name + "_key", s.name, d.name, true);
+        }
+        for (const auto& d : s.cols) {
+            if (!d.references) continue;
+            ForeignKey fk = *d.references;
+            fk.column = d.name;
+            AddForeignKey(s.name, fk);
+        }
+        for (const auto& fk : s.foreign_keys) AddForeignKey(s.name, fk);
+    } catch (...) {
+        try {
+            catalog_->DropTable(s.name);
+        } catch (...) {
+        }
+        throw;
     }
     return {{}, {}, "CREATE TABLE"};
+}
+
+void Database::AddForeignKey(const std::string& table, ForeignKey fk) {
+    fk.table = table;
+    if (fk.name.empty()) fk.name = catalog_->NewForeignKeyName(table, fk.column);
+    catalog_->CreateForeignKey(std::move(fk));
 }
 
 QueryResult Database::RunCreateIndex(const CreateIndexStmt& s) {
@@ -142,6 +165,26 @@ QueryResult Database::RunAlterTable(const AlterTableStmt& s) {
                     if (i->name == pk_index)
                         throw DbError("multiple primary keys for table \"" + s.table + "\" are not allowed");
             }
+            // A REFERENCES clause is fully checked before the table is rewritten:
+            // the target, and that the value every existing row gets is present.
+            std::optional<ForeignKey> fk;
+            if (d.references) {
+                fk = *d.references;
+                fk->table = s.table;
+                fk->column = d.name;
+                if (fk->name.empty()) fk->name = catalog_->NewForeignKeyName(s.table, d.name);
+                if (catalog_->GetForeignKey(fk->name)) throw DbError("constraint \"" + fk->name + "\" already exists");
+                catalog_->ResolveForeignKey(&*fk, d.type);
+                if (!null_fill && t->row_count > 0) {
+                    Value key = def->CastTo(d.type);
+                    if (!catalog_->KeyTaken(catalog_->UniqueIndexOn(fk->ref_table, fk->ref_column), key))
+                        throw DbError("column \"" + d.name + "\" cannot reference \"" + fk->ref_table +
+                                      "\": its DEFAULT " + key.ToString() + " is not present there");
+                }
+                if ((fk->on_delete == FkAction::SET_NULL || fk->on_update == FkAction::SET_NULL) && d.not_null)
+                    throw DbError("foreign key constraint \"" + fk->name + "\" cannot SET NULL: column \"" + d.name +
+                                  "\" is NOT NULL");
+            }
             std::vector<Column> cols = t->schema.Columns();
             Column c{};
             c.name = d.name;
@@ -158,18 +201,35 @@ QueryResult Database::RunAlterTable(const AlterTableStmt& s) {
                 catalog_->CreateIndex(pk_index, s.table, d.name, true);
             else if (d.unique)
                 catalog_->CreateIndex(s.table + "_" + d.name + "_key", s.table, d.name, true);
+            if (fk) catalog_->CreateForeignKey(*fk);
             break;
         }
         case A::DROP_COLUMN: {
             int col = t->schema.Find("", s.name);
             if (col < 0) throw DbError("column \"" + s.name + "\" of relation \"" + s.table + "\" does not exist");
             if (t->schema.Size() == 1) throw DbError("cannot drop the only column of table \"" + s.table + "\"");
+            // A referenced column can't go; the column's own foreign keys go with it.
+            for (ForeignKey* fk : catalog_->ForeignKeysTo(s.table))
+                if (fk->ref_column == s.name && !(fk->table == s.table && fk->column == s.name))
+                    throw DbError("cannot drop column \"" + s.name + "\" of table \"" + s.table +
+                                  "\" because foreign key constraint \"" + fk->name + "\" on table \"" + fk->table +
+                                  "\" references it");
             std::vector<Column> cols = t->schema.Columns();
             cols.erase(cols.begin() + col);
             catalog_->RewriteTable(t, cols, [col](Row r) {
                 r.erase(r.begin() + col);
                 return r;
             });
+            for (ForeignKey* fk : catalog_->ForeignKeysOf(s.table))
+                if (fk->column == s.name) catalog_->DropForeignKey(std::string(fk->name));
+            break;
+        }
+        case A::ADD_FOREIGN_KEY: AddForeignKey(s.table, s.foreign_key); break;
+        case A::DROP_CONSTRAINT: {
+            ForeignKey* fk = catalog_->GetForeignKey(s.name);
+            if (!fk || fk->table != s.table)
+                throw DbError("constraint \"" + s.name + "\" of relation \"" + s.table + "\" does not exist");
+            catalog_->DropForeignKey(s.name);
             break;
         }
     }
@@ -185,72 +245,10 @@ QueryResult Database::RunDrop(const DropStmt& s) {
     return {{}, {}, "DROP TABLE"};
 }
 
-namespace {
-
-[[noreturn]] void ThrowDuplicate(const IndexInfo* idx, const Value& key) {
-    throw DbError("duplicate key value violates unique constraint \"" + idx->name + "\": " + idx->column + "=" +
-                  key.ToString());
-}
-
-std::string SerializeChecked(const Schema& schema, const Row& row) {
-    std::string tuple = SerializeTuple(schema, row);
-    if (tuple.size() > TablePage::MAX_TUPLE)
-        throw DbError("row is too large (" + std::to_string(tuple.size()) + " bytes, max " +
-                      std::to_string(TablePage::MAX_TUPLE) + ")");
-    return tuple;
-}
-
-bool SameKey(const Value& a, const Value& b) {
-    return a.IsNull() == b.IsNull() && (a.IsNull() || a.Compare(b) == 0);
-}
-
-}  // namespace
-
-// Casts a full row to the column types and enforces NOT NULL.
-Row Database::PrepareRow(const TableInfo* t, Row row) const {
-    const Schema& schema = t->schema;
-    for (size_t i = 0; i < schema.Size(); ++i) {
-        row[i] = row[i].CastTo(schema.At(i).type);
-        if (row[i].IsNull() && schema.At(i).not_null)
-            throw DbError("null value in column \"" + schema.At(i).name + "\" violates not-null constraint");
-    }
-    return row;
-}
-
-// Statement atomicity without a log: every check that can fail runs before the
-// first byte is written, so a failing statement leaves the table untouched.
-void Database::InsertRows(TableInfo* t, const std::vector<Row>& input) {
-    const Schema& schema = t->schema;
-    std::vector<Row> rows;
-    std::vector<std::string> tuples;
-    rows.reserve(input.size());
-    tuples.reserve(input.size());
-    for (const Row& r : input) {
-        rows.push_back(PrepareRow(t, r));
-        tuples.push_back(SerializeChecked(schema, rows.back()));
-    }
-
-    auto indexes = catalog_->IndexesOf(t->name);
-    for (IndexInfo* idx : indexes) {
-        if (!idx->unique) continue;
-        std::unordered_set<std::string> seen;  // duplicates inside this statement (by value)
-        for (const Row& r : rows) {
-            const Value& v = r[static_cast<size_t>(idx->col_idx)];
-            if (v.IsNull()) continue;
-            std::string vk;
-            v.AppendKey(&vk);
-            if (!seen.insert(std::move(vk)).second || catalog_->KeyTaken(idx, v)) ThrowDuplicate(idx, v);
-        }
-    }
-
-    for (size_t i = 0; i < rows.size(); ++i) {
-        RID rid = t->heap->Insert(tuples[i]);
-        for (IndexInfo* idx : indexes) {
-            const Value& v = rows[i][static_cast<size_t>(idx->col_idx)];
-            if (!v.IsNull()) idx->tree->Insert(idx->KeyOf(v), rid);
-        }
-        ++t->row_count;
-    }
+void Database::InsertRows(TableInfo* t, const std::vector<Row>& rows) {
+    WriteSet ws(catalog_.get());
+    for (const Row& r : rows) ws.Insert(t, r);
+    ws.Apply();
 }
 
 QueryResult Database::RunInsert(const InsertStmt& s) {
@@ -334,22 +332,17 @@ QueryResult Database::RunExplain(const ExplainStmt& s) {
 QueryResult Database::RunDelete(const DeleteStmt& s) {
     TableInfo* t = catalog_->RequireTable(s.table);
     auto scan = planner_->PlanTableScan(t, s.where);
-    // Phase 1: collect victims (so we never modify the structure we are scanning).
-    std::vector<std::pair<RID, Row>> victims;
+    // Collect the victims first, so we never modify the structure we are scanning.
+    WriteSet ws(catalog_.get());
+    size_t n = 0;
     scan->Init();
     Row row;
-    while (scan->Next(&row)) victims.emplace_back(scan->CurrentRid(), row);
-    // Phase 2: delete from indexes and heap.
-    auto indexes = catalog_->IndexesOf(t->name);
-    for (auto& [rid, r] : victims) {
-        for (IndexInfo* idx : indexes) {
-            const Value& v = r[static_cast<size_t>(idx->col_idx)];
-            if (!v.IsNull()) idx->tree->Remove(idx->KeyOf(v), rid);
-        }
-        t->heap->Delete(rid);
-        --t->row_count;
+    while (scan->Next(&row)) {
+        ws.Delete(t, scan->CurrentRid(), row);
+        ++n;
     }
-    return {{}, {}, "DELETE " + std::to_string(victims.size())};
+    ws.Apply();  // ON DELETE actions may change or delete rows of other tables too
+    return {{}, {}, "DELETE " + std::to_string(n)};
 }
 
 QueryResult Database::RunUpdate(const UpdateStmt& s) {
@@ -372,61 +365,15 @@ QueryResult Database::RunUpdate(const UpdateStmt& s) {
     Row row;
     while (scan->Next(&row)) targets.emplace_back(scan->CurrentRid(), row);
 
-    // Phase 1: compute and validate every new row. Nothing is written yet, so any
-    // error here (division by zero, NOT NULL, row too large, ...) changes nothing.
-    std::vector<Row> new_rows;
-    std::vector<std::string> tuples;
-    new_rows.reserve(targets.size());
-    tuples.reserve(targets.size());
+    // Compute every new row; nothing is written before ws.Apply() has checked
+    // them all, so any error (division by zero, NOT NULL, ...) changes nothing.
+    WriteSet ws(catalog_.get());
     for (auto& [rid, old_row] : targets) {
         Row new_row = old_row;
         for (auto& [idx, e] : sets) new_row[idx] = Evaluate(*e, old_row);
-        new_rows.push_back(PrepareRow(t, std::move(new_row)));
-        tuples.push_back(SerializeChecked(schema, new_rows.back()));
+        ws.Update(t, rid, old_row, std::move(new_row));
     }
-
-    // Uniqueness is checked against the state *after* the statement (as the SQL
-    // standard requires), so "SET id = id + 1" works although rows collide midway.
-    // A new key conflicts if another target gets it too, or if a row that is not
-    // being updated already has it.
-    auto indexes = catalog_->IndexesOf(t->name);
-    std::set<RID> target_rids;
-    for (const auto& tr : targets) target_rids.insert(tr.first);
-    for (IndexInfo* ix : indexes) {
-        if (!ix->unique) continue;
-        const auto col = static_cast<size_t>(ix->col_idx);
-        std::unordered_set<std::string> seen;
-        for (size_t i = 0; i < targets.size(); ++i) {
-            const Value& nv = new_rows[i][col];
-            if (nv.IsNull()) continue;
-            std::string vk;
-            nv.AppendKey(&vk);
-            if (!seen.insert(std::move(vk)).second) ThrowDuplicate(ix, nv);
-            if (SameKey(targets[i].second[col], nv)) continue;  // keeps its own key
-            if (catalog_->KeyTaken(ix, nv, [&](RID r) { return target_rids.count(r) > 0; })) ThrowDuplicate(ix, nv);
-        }
-    }
-
-    // Phase 2: apply. Heap first (a tuple that grows may move to a new RID), then
-    // all index removals before any insertion, so entries of different rows can
-    // never clash with each other mid-way.
-    std::vector<RID> new_rids;
-    new_rids.reserve(targets.size());
-    for (size_t i = 0; i < targets.size(); ++i) new_rids.push_back(t->heap->Update(targets[i].first, tuples[i]));
-    for (IndexInfo* ix : indexes) {
-        const auto col = static_cast<size_t>(ix->col_idx);
-        auto changed = [&](size_t i) {
-            return new_rids[i] != targets[i].first || !SameKey(targets[i].second[col], new_rows[i][col]);
-        };
-        for (size_t i = 0; i < targets.size(); ++i) {
-            const Value& ov = targets[i].second[col];
-            if (changed(i) && !ov.IsNull()) ix->tree->Remove(ix->KeyOf(ov), targets[i].first);
-        }
-        for (size_t i = 0; i < targets.size(); ++i) {
-            const Value& nv = new_rows[i][col];
-            if (changed(i) && !nv.IsNull()) ix->tree->Insert(ix->KeyOf(nv), new_rids[i]);
-        }
-    }
+    ws.Apply();
     return {{}, {}, "UPDATE " + std::to_string(targets.size())};
 }
 
@@ -447,6 +394,25 @@ QueryResult Database::Populate(const std::string& table, int64_t n, uint32_t see
             unique_idx[static_cast<size_t>(idx->col_idx)] = idx;
         }
     if (!schema.Columns().empty() && schema.At(0).type == TypeId::INT) sequential[0] = true;
+    // Foreign key columns (unless unique) get keys picked from the referenced
+    // table as it is now, or NULL if it is empty.
+    std::vector<std::optional<std::vector<Value>>> fk_keys(schema.Size());
+    for (ForeignKey* fk : catalog_->ForeignKeysOf(table)) {
+        const auto col = static_cast<size_t>(schema.Find("", fk->column));
+        if (unique_idx[col] || fk_keys[col]) continue;
+        TableInfo* parent = catalog_->RequireTable(fk->ref_table);
+        const auto pcol = static_cast<size_t>(parent->schema.Find("", fk->ref_column));
+        auto& keys = fk_keys[col].emplace();
+        auto it = parent->heap->Begin();
+        RID rid;
+        std::string buf;
+        constexpr size_t kMaxKeys = size_t{1} << 20;
+        while (keys.size() < kMaxKeys && it.Next(&rid, &buf)) {
+            Row r = DeserializeTuple(parent->schema, buf.data(), buf.size());
+            if (!r[pcol].IsNull()) keys.push_back(std::move(r[pcol]));
+        }
+        sequential[col] = false;
+    }
     std::vector<int64_t> next_id(schema.Size(), 1);
     {
         auto it = t->heap->Begin();
@@ -466,6 +432,11 @@ QueryResult Database::Populate(const std::string& table, int64_t n, uint32_t see
     for (int64_t k = 0; k < n; ++k) {
         Row r;
         for (size_t i = 0; i < schema.Size(); ++i) {
+            if (fk_keys[i]) {
+                const auto& keys = *fk_keys[i];
+                r.push_back(keys.empty() ? Value::Null() : keys[rng() % keys.size()]);
+                continue;
+            }
             switch (schema.At(i).type) {
                 case TypeId::INT:
                     r.push_back(Value::Int(sequential[i] ? next_id[i]++ : static_cast<int64_t>(rng() % 1000)));

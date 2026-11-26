@@ -213,6 +213,18 @@ std::string Catalog::Serialize() const {
             WriteValue(w, *c.default_value);
         }
     }
+    // Foreign keys: [count u32] then (name, table, column, ref_table, ref_column,
+    // on_delete u8, on_update u8) each. Appended last as well.
+    w.U32(static_cast<uint32_t>(foreign_keys_.size()));
+    for (auto& [name, fk] : foreign_keys_) {
+        w.Str(fk->name);
+        w.Str(fk->table);
+        w.Str(fk->column);
+        w.Str(fk->ref_table);
+        w.Str(fk->ref_column);
+        w.U8(static_cast<uint8_t>(fk->on_delete));
+        w.U8(static_cast<uint8_t>(fk->on_update));
+    }
     return std::move(w.buf);
 }
 
@@ -291,6 +303,30 @@ void Catalog::Load() {
             t->schema = Schema(std::move(cols));
         }
     }
+    if (r.pos < data.size()) {  // absent in files from before foreign keys existed
+        uint32_t nfk = r.U32();
+        auto read_action = [&r] {
+            uint8_t a = r.U8();
+            if (a > static_cast<uint8_t>(FkAction::SET_DEFAULT)) throw DbError("catalog is corrupt (bad foreign key)");
+            return static_cast<FkAction>(a);
+        };
+        for (uint32_t i = 0; i < nfk; ++i) {
+            auto fk = std::make_unique<ForeignKey>();
+            fk->name = r.Str();
+            fk->table = r.Str();
+            fk->column = r.Str();
+            fk->ref_table = r.Str();
+            fk->ref_column = r.Str();
+            fk->on_delete = read_action();
+            fk->on_update = read_action();
+            if (RequireTable(fk->table)->schema.Find("", fk->column) < 0 ||
+                RequireTable(fk->ref_table)->schema.Find("", fk->ref_column) < 0 ||
+                !UniqueIndexOn(fk->ref_table, fk->ref_column))
+                throw DbError("catalog is corrupt (bad foreign key)");
+            std::string name = fk->name;
+            foreign_keys_[name] = std::move(fk);
+        }
+    }
 }
 
 TableInfo* Catalog::CreateTable(const std::string& name, std::vector<Column> cols) {
@@ -324,6 +360,14 @@ TableInfo* Catalog::RequireTable(const std::string& name) {
 
 void Catalog::DropTable(const std::string& name) {
     TableInfo* t = RequireTable(name);
+    for (ForeignKey* fk : ForeignKeysTo(name))
+        if (fk->table != name)
+            throw DbError("cannot drop table \"" + name + "\" because foreign key constraint \"" + fk->name +
+                          "\" on table \"" + fk->table + "\" references it");
+    for (ForeignKey* fk : ForeignKeysOf(name)) {
+        std::string fk_name = fk->name;  // erase destroys *fk
+        foreign_keys_.erase(fk_name);
+    }
     std::vector<page_id_t> pages = t->heap->Pages();
     for (auto it = indexes_.begin(); it != indexes_.end();) {
         if (it->second->table == name) {
@@ -351,9 +395,20 @@ void Catalog::RenameTable(const std::string& name, const std::string& new_name) 
     t->name = new_name;
     for (auto& [n, idx] : indexes_)
         if (idx->table == name) idx->table = new_name;
+    for (auto& [n, fk] : foreign_keys_) {
+        if (fk->table == name) fk->table = new_name;
+        if (fk->ref_table == name) fk->ref_table = new_name;
+    }
     auto node = tables_.extract(name);
     node.key() = new_name;
     tables_.insert(std::move(node));
+    // The primary key is recognized by its index name, so it moves along.
+    if (indexes_.count(name + "_pkey") && !indexes_.count(new_name + "_pkey")) {
+        auto idx = indexes_.extract(name + "_pkey");
+        idx.key() = new_name + "_pkey";
+        idx.mapped()->name = new_name + "_pkey";
+        indexes_.insert(std::move(idx));
+    }
 }
 
 void Catalog::RenameColumn(const std::string& table, const std::string& column, const std::string& new_name) {
@@ -367,6 +422,10 @@ void Catalog::RenameColumn(const std::string& table, const std::string& column, 
     t->schema = Schema(std::move(cols));
     for (auto& [n, idx] : indexes_)
         if (idx->table == table && idx->column == column) idx->column = new_name;
+    for (auto& [n, fk] : foreign_keys_) {
+        if (fk->table == table && fk->column == column) fk->column = new_name;
+        if (fk->ref_table == table && fk->ref_column == column) fk->ref_column = new_name;
+    }
 }
 
 void Catalog::RewriteTable(TableInfo* t, std::vector<Column> cols, const std::function<Row(Row)>& convert) {
@@ -395,7 +454,7 @@ void Catalog::RewriteTable(TableInfo* t, std::vector<Column> cols, const std::fu
     for (IndexInfo* idx : IndexesOf(t->name)) {
         if (new_schema.Find("", idx->column) >= 0) keep.push_back({idx->name, idx->column, idx->unique});
         std::string name = idx->name;  // DropIndex destroys *idx
-        DropIndex(name);
+        DropIndexUnchecked(name);      // recreated below, so foreign keys keep their index
     }
     page_id_t first = TableHeap::Create(bpm_);
     auto heap = std::make_unique<TableHeap>(bpm_, first);
@@ -456,6 +515,24 @@ IndexInfo* Catalog::CreateIndex(const std::string& name, const std::string& tabl
 void Catalog::DropIndex(const std::string& name) {
     auto it = indexes_.find(name);
     if (it == indexes_.end()) throw DbError("index \"" + name + "\" does not exist");
+    const IndexInfo* idx = it->second.get();
+    if (idx->unique) {
+        bool other_unique = false;
+        for (auto& [n, other] : indexes_)
+            if (n != name && other->unique && other->table == idx->table && other->column == idx->column)
+                other_unique = true;
+        if (!other_unique)
+            for (ForeignKey* fk : ForeignKeysTo(idx->table))
+                if (fk->ref_column == idx->column)
+                    throw DbError("cannot drop index \"" + name + "\" because foreign key constraint \"" + fk->name +
+                                  "\" on table \"" + fk->table + "\" requires it");
+    }
+    DropIndexUnchecked(name);
+}
+
+void Catalog::DropIndexUnchecked(const std::string& name) {
+    auto it = indexes_.find(name);
+    if (it == indexes_.end()) throw DbError("index \"" + name + "\" does not exist");
     std::vector<page_id_t> pages = it->second->tree->Pages();
     indexes_.erase(it);
     FreePages(pages);
@@ -504,6 +581,116 @@ std::vector<IndexInfo*> Catalog::Indexes() {
     std::vector<IndexInfo*> out;
     for (auto& [n, i] : indexes_) out.push_back(i.get());
     return out;
+}
+
+IndexInfo* Catalog::PrimaryKeyIndex(const std::string& table) {
+    auto it = indexes_.find(table + "_pkey");
+    return it != indexes_.end() && it->second->table == table && it->second->unique ? it->second.get() : nullptr;
+}
+
+IndexInfo* Catalog::UniqueIndexOn(const std::string& table, const std::string& column) {
+    IndexInfo* pk = PrimaryKeyIndex(table);
+    if (pk && pk->column == column) return pk;
+    for (auto& [n, idx] : indexes_)
+        if (idx->unique && idx->table == table && idx->column == column) return idx.get();
+    return nullptr;
+}
+
+IndexInfo* Catalog::IndexOn(const std::string& table, const std::string& column) {
+    if (IndexInfo* u = UniqueIndexOn(table, column)) return u;
+    for (auto& [n, idx] : indexes_)
+        if (idx->table == table && idx->column == column) return idx.get();
+    return nullptr;
+}
+
+void Catalog::ResolveForeignKey(ForeignKey* fk, TypeId child_type) {
+    TableInfo* parent = GetTable(fk->ref_table);
+    if (!parent) throw DbError("referenced table \"" + fk->ref_table + "\" does not exist");
+    if (fk->ref_column.empty()) {
+        IndexInfo* pk = PrimaryKeyIndex(fk->ref_table);
+        if (!pk) throw DbError("there is no primary key for referenced table \"" + fk->ref_table + "\"");
+        fk->ref_column = pk->column;
+    }
+    int col = parent->schema.Find("", fk->ref_column);
+    if (col < 0)
+        throw DbError("column \"" + fk->ref_column + "\" referenced in foreign key constraint does not exist in table \"" +
+                      fk->ref_table + "\"");
+    if (!UniqueIndexOn(fk->ref_table, fk->ref_column))
+        throw DbError("there is no unique constraint on column \"" + fk->ref_column + "\" of referenced table \"" +
+                      fk->ref_table + "\" (it must be the PRIMARY KEY or UNIQUE)");
+    TypeId parent_type = parent->schema.At(static_cast<size_t>(col)).type;
+    if (parent_type != child_type)
+        throw DbError("foreign key columns \"" + fk->column + "\" and \"" + fk->ref_column +
+                      "\" are of incompatible types: " + TypeName(child_type) + " and " + TypeName(parent_type));
+}
+
+ForeignKey* Catalog::CreateForeignKey(ForeignKey fk) {
+    if (foreign_keys_.count(fk.name)) throw DbError("constraint \"" + fk.name + "\" already exists");
+    TableInfo* child = RequireTable(fk.table);
+    int col = child->schema.Find("", fk.column);
+    if (col < 0)
+        throw DbError("column \"" + fk.column + "\" referenced in foreign key constraint does not exist in table \"" +
+                      fk.table + "\"");
+    ResolveForeignKey(&fk, child->schema.At(static_cast<size_t>(col)).type);
+    if (fk.on_delete == FkAction::SET_NULL || fk.on_update == FkAction::SET_NULL) {
+        if (child->schema.At(static_cast<size_t>(col)).not_null)
+            throw DbError("foreign key constraint \"" + fk.name + "\" cannot SET NULL: column \"" + fk.column +
+                          "\" is NOT NULL");
+    }
+
+    // Every existing row must already satisfy the constraint.
+    IndexInfo* parent_idx = UniqueIndexOn(fk.ref_table, fk.ref_column);
+    auto it = child->heap->Begin();
+    RID rid;
+    std::string buf;
+    while (it.Next(&rid, &buf)) {
+        Row row = DeserializeTuple(child->schema, buf.data(), buf.size());
+        const Value& v = row[static_cast<size_t>(col)];
+        if (!v.IsNull() && !KeyTaken(parent_idx, v))
+            throw DbError("foreign key constraint \"" + fk.name + "\" is violated by an existing row of table \"" +
+                          fk.table + "\": key (" + fk.column + ")=(" + v.ToString() + ") is not present in table \"" +
+                          fk.ref_table + "\"");
+    }
+    auto owned = std::make_unique<ForeignKey>(std::move(fk));
+    ForeignKey* raw = owned.get();
+    foreign_keys_[raw->name] = std::move(owned);
+    return raw;
+}
+
+void Catalog::DropForeignKey(const std::string& name) {
+    if (!foreign_keys_.erase(name)) throw DbError("constraint \"" + name + "\" does not exist");
+}
+
+ForeignKey* Catalog::GetForeignKey(const std::string& name) {
+    auto it = foreign_keys_.find(name);
+    return it == foreign_keys_.end() ? nullptr : it->second.get();
+}
+
+std::vector<ForeignKey*> Catalog::ForeignKeys() {
+    std::vector<ForeignKey*> out;
+    for (auto& [n, fk] : foreign_keys_) out.push_back(fk.get());
+    return out;
+}
+
+std::vector<ForeignKey*> Catalog::ForeignKeysOf(const std::string& table) {
+    std::vector<ForeignKey*> out;
+    for (auto& [n, fk] : foreign_keys_)
+        if (fk->table == table) out.push_back(fk.get());
+    return out;
+}
+
+std::vector<ForeignKey*> Catalog::ForeignKeysTo(const std::string& table) {
+    std::vector<ForeignKey*> out;
+    for (auto& [n, fk] : foreign_keys_)
+        if (fk->ref_table == table) out.push_back(fk.get());
+    return out;
+}
+
+std::string Catalog::NewForeignKeyName(const std::string& table, const std::string& column) {
+    std::string base = table + "_" + column + "_fkey";
+    std::string name = base;
+    for (int i = 1; foreign_keys_.count(name); ++i) name = base + std::to_string(i);
+    return name;
 }
 
 }  // namespace minidb
