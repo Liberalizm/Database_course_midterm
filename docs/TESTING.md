@@ -27,6 +27,7 @@ tests/
 └── e2e/                     the real shell binary, compared to golden output
     ├── run_case.cmake       runner: N.sql -> compare with N.expected
     ├── basic/               queries, joins, aggregates, EXPLAIN
+    ├── advanced/            LEFT JOIN, functions, subqueries, set ops, TEXT keys, ALTER TABLE
     ├── errors/              error messages; the shell keeps going after errors
     └── persistence/         3 separate shell processes on the same file
 ```
@@ -48,7 +49,7 @@ Isolation techniques:
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build --parallel
-ctest --test-dir build -j 8 --output-on-failure    # everything (328 tests)
+ctest --test-dir build -j 8 --output-on-failure    # everything (329 tests)
 
 ctest --test-dir build -L storage                  # one layer
 ctest --test-dir build -L query
