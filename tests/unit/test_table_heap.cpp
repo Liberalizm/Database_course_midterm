@@ -1,5 +1,6 @@
 // Unit tests: TableHeap (a table as a linked list of slotted pages).
 #include <map>
+#include <random>
 
 #include "table_heap.h"
 #include "test_util.h"
@@ -104,6 +105,53 @@ TEST_F(TableHeapTest, WorksWithTinyBufferPool) {
     EXPECT_GT(bpm.Evictions(), 50u);
     EXPECT_EQ(ScanAll().size(), 5000u);
     EXPECT_EQ(bpm.PinnedFrames(), 0u) << "no page may stay pinned";
+}
+
+// Differential test: random inserts, deletes and size-changing updates (which
+// move tuples between pages) against a std::map, with a tiny buffer pool.
+TEST_F(TableHeapTest, RandomOperationsMatchReferenceModel) {
+    std::mt19937 rng(7);
+    std::map<RID, std::string> ref;
+    auto random_tuple = [&] {
+        size_t len = rng() % 8 == 0 ? 500 + rng() % 1500 : 1 + rng() % 60;  // mostly small, some big
+        std::string s(len, static_cast<char>('a' + rng() % 26));
+        s[0] = static_cast<char>('A' + rng() % 26);
+        return s;
+    };
+    for (int step = 0; step < 6000; ++step) {
+        int op = static_cast<int>(rng() % 10);
+        if (ref.empty() || op < 4) {
+            std::string tup = random_tuple();
+            RID rid = heap.Insert(tup);
+            ASSERT_EQ(ref.count(rid), 0u) << "Insert returned a live RID at step " << step;
+            ref[rid] = tup;
+        } else {
+            auto it = ref.begin();
+            std::advance(it, static_cast<long>(rng() % ref.size()));
+            RID rid = it->first;
+            if (op < 7) {
+                ASSERT_TRUE(heap.Delete(rid));
+                ASSERT_FALSE(heap.Delete(rid)) << "double delete must fail";
+                ref.erase(it);
+            } else {
+                std::string tup = random_tuple();
+                RID nrid = heap.Update(rid, tup);
+                ref.erase(it);
+                ASSERT_EQ(ref.count(nrid), 0u) << "Update moved onto a live RID at step " << step;
+                ref[nrid] = tup;
+            }
+        }
+        if (step % 250 == 0) {
+            ASSERT_EQ(ScanAll(), ref) << "step " << step;
+            std::string got;
+            for (const auto& [rid, tup] : ref) {
+                ASSERT_TRUE(heap.Get(rid, &got));
+                ASSERT_EQ(got, tup);
+            }
+        }
+    }
+    ASSERT_EQ(ScanAll(), ref);
+    EXPECT_EQ(bpm.PinnedFrames(), 0u);
 }
 
 }  // namespace

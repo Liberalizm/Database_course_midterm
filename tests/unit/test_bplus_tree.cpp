@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <climits>
 #include <random>
+#include <set>
 
 #include "bplus_tree.h"
 #include "test_util.h"
@@ -158,6 +159,71 @@ TEST_F(BPlusTreeTest, NoPinnedPagesLeftBehind) {
     }
     t.Remove(5, RID{5, 0});
     EXPECT_EQ(bpm.PinnedFrames(), 0u);
+}
+
+// Regression (found by the differential test below): emptying the rightmost
+// leaves made MaxKey report "no statistics" although the tree still had entries.
+TEST_F(BPlusTreeTest, MinMaxKeySkipEmptiedLeaves) {
+    BPlusTree t(&bpm, INVALID_PAGE_ID, 4, 4);
+    for (int i = 0; i < 200; ++i) t.Insert(i, RID{i, 0});
+    for (int i = 150; i < 200; ++i) t.Remove(i, RID{i, 0});  // many rightmost leaves become empty
+    for (int i = 0; i < 50; ++i) t.Remove(i, RID{i, 0});     // and many leftmost ones
+    int64_t mn = 0, mx = 0;
+    ASSERT_TRUE(t.MinKey(&mn));
+    ASSERT_TRUE(t.MaxKey(&mx));
+    EXPECT_EQ(mn, 50);
+    EXPECT_EQ(mx, 149);
+    for (int i = 50; i < 150; ++i) t.Remove(i, RID{i, 0});
+    EXPECT_FALSE(t.MinKey(&mn));
+    EXPECT_FALSE(t.MaxKey(&mx)) << "a tree whose entries were all deleted has no max";
+}
+
+// Differential test: a long random mix of inserts and removes (with many
+// duplicate keys and small nodes, so splits and emptied leaves are frequent)
+// must always agree with std::set on every query the tree supports.
+TEST_F(BPlusTreeTest, RandomOperationsMatchReferenceModel) {
+    for (uint32_t seed = 1; seed <= 5; ++seed) {
+        BPlusTree t(&bpm, INVALID_PAGE_ID, 4, 4);
+        std::set<IndexKey> ref;
+        std::mt19937 rng(seed);
+        auto random_entry = [&] {
+            return IndexKey{static_cast<int64_t>(rng() % 60) - 30, RID{static_cast<page_id_t>(rng() % 8), rng() % 4}};
+        };
+        for (int step = 0; step < 4000; ++step) {
+            IndexKey k = random_entry();
+            // Phases: grow, then mostly shrink (empties whole leaves), then grow again.
+            bool insert = (step / 1000) % 2 == 0 ? rng() % 4 != 0 : rng() % 4 == 0;
+            if (insert) {
+                ASSERT_EQ(t.Insert(k.key, k.rid), ref.insert(k).second) << "seed " << seed << " step " << step;
+            } else {
+                ASSERT_EQ(t.Remove(k.key, k.rid), ref.erase(k) == 1) << "seed " << seed << " step " << step;
+            }
+            if (step % 97 != 0) continue;
+
+            ASSERT_EQ(t.CheckAndCount(), ref.size());
+            std::vector<IndexKey> all;
+            for (auto it = t.Begin(); it.Valid(); it.Next()) all.push_back(it.Entry());
+            ASSERT_TRUE(std::equal(all.begin(), all.end(), ref.begin(), ref.end())) << "seed " << seed;
+            for (int64_t q = -32; q <= 32; q += 3) {
+                auto it = t.LowerBound(q);
+                auto rit = ref.lower_bound(IndexKey{q, RID{INT32_MIN, 0}});
+                ASSERT_EQ(it.Valid(), rit != ref.end()) << "LowerBound(" << q << ")";
+                if (it.Valid()) {
+                    ASSERT_EQ(it.Entry(), *rit) << "LowerBound(" << q << ")";
+                }
+                bool any = rit != ref.end() && rit->key == q;
+                ASSERT_EQ(t.ContainsKey(q), any) << "ContainsKey(" << q << ")";
+            }
+            int64_t mn = 0, mx = 0;
+            ASSERT_EQ(t.MinKey(&mn), !ref.empty());
+            ASSERT_EQ(t.MaxKey(&mx), !ref.empty());
+            if (!ref.empty()) {
+                EXPECT_EQ(mn, ref.begin()->key);
+                EXPECT_EQ(mx, ref.rbegin()->key);
+            }
+        }
+        EXPECT_EQ(bpm.PinnedFrames(), 0u);
+    }
 }
 
 }  // namespace

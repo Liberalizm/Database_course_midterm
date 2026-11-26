@@ -270,18 +270,24 @@ bool BPlusTree::MinKey(int64_t* out) const {
 
 bool BPlusTree::MaxKey(int64_t* out) const {
     if (root_ == INVALID_PAGE_ID) return false;
-    page_id_t pid = root_;
-    while (true) {
+    // Lazy deletes can leave the rightmost leaves empty, so this is a right-to-left
+    // depth-first search for the last non-empty leaf, not a single descent. Leaves
+    // have no back pointers, and usually the first leaf visited already answers.
+    std::vector<page_id_t> stack{root_};
+    while (!stack.empty()) {
+        page_id_t pid = stack.back();
+        stack.pop_back();
         PageGuard g = PageGuard::Fetch(bpm_, pid);
         const char* d = g.Data();
         int n = Size(d);
         if (IsLeaf(d)) {
-            if (n == 0) return false;  // rightmost leaf emptied by lazy deletes
+            if (n == 0) continue;
             *out = LeafKey(d, n - 1).key;
             return true;
         }
-        pid = Child(d, n - 1);
+        for (int i = 0; i < n; ++i) stack.push_back(Child(d, i));  // rightmost child on top
     }
+    return false;  // every entry was deleted
 }
 
 size_t BPlusTree::CheckAndCount() const {
