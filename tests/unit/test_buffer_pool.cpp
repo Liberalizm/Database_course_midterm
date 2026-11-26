@@ -1,4 +1,6 @@
 // Unit tests: BufferPoolManager + PageGuard (caching, pinning, eviction, write-back).
+#include <fstream>
+
 #include "buffer_pool.h"
 #include "test_util.h"
 
@@ -27,6 +29,36 @@ protected:
 };
 
 TEST_F(BufferPoolTest, RejectsTinyPool) { EXPECT_THROW(BufferPoolManager(4, &disk), DbError); }
+
+// A page that fails its checksum must not cost a frame: fetching it over and
+// over (more often than the pool has frames) keeps failing with the same error
+// and never exhausts the pool.
+TEST(BufferPoolCorruption, FailedReadDoesNotLeakAFrame) {
+    TempFile file;
+    {
+        DiskManager disk(file.path());
+        for (int i = 0; i < 12; ++i) disk.AllocatePage();
+    }
+    {
+        std::fstream raw(file.path(), std::ios::in | std::ios::out | std::ios::binary);
+        raw.seekp(static_cast<std::streamoff>(3 * DISK_PAGE_SIZE + 100));
+        raw.put('X');
+    }
+    DiskManager disk(file.path());
+    BufferPoolManager bpm(8, &disk);
+    for (int attempt = 0; attempt < 20; ++attempt) {
+        try {
+            bpm.FetchPage(3);
+            FAIL() << "page 3 is damaged";
+        } catch (const DbError& e) {
+            ASSERT_NE(std::string(e.what()).find("checksum"), std::string::npos) << e.what();
+        }
+    }
+    EXPECT_EQ(bpm.PinnedFrames(), 0u);
+    std::vector<PageGuard> all;  // every frame is still usable
+    for (page_id_t pid : {0, 1, 2, 4, 5, 6, 7, 8}) all.push_back(PageGuard::Fetch(&bpm, pid));
+    EXPECT_EQ(bpm.PinnedFrames(), 8u);
+}
 
 TEST_F(BufferPoolTest, NewPageIsPinnedZeroedAndAllocatedOnDisk) {
     BufferPoolManager bpm(8, &disk);

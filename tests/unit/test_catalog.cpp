@@ -24,6 +24,25 @@ protected:
         cat = std::make_unique<Catalog>(bpm.get());
     }
 
+    // Saves the catalog without its last `bytes` bytes and reopens it: this is how
+    // a file written by an older version (before a trailing section existed) looks.
+    void TruncateSavedCatalog(uint32_t bytes) {
+        cat->Save();
+        {
+            PageGuard g = PageGuard::Fetch(bpm.get(), CATALOG_PAGE_ID);
+            uint32_t total = ReadAs<uint32_t>(g.Data() + 4);
+            WriteAs<uint32_t>(g.Data() + 4, total - bytes);
+            g.MarkDirty();
+        }
+        bpm->FlushAll();
+        cat.reset();
+        bpm.reset();
+        disk.reset();
+        disk = std::make_unique<DiskManager>(file.path());
+        bpm = std::make_unique<BufferPoolManager>(32, disk.get());
+        cat = std::make_unique<Catalog>(bpm.get());
+    }
+
     static void AddRow(TableInfo* t, const Row& r) {
         t->heap->Insert(SerializeTuple(t->schema, r));
         ++t->row_count;
@@ -433,24 +452,67 @@ TEST_F(CatalogTest, ColumnDefaultsOfEveryTypeSurviveRestart) {
 
 TEST_F(CatalogTest, CatalogWithoutDefaultsSectionStillLoads) {
     // A file written before DEFAULT existed ends right after the free-page list.
-    // Simulate it by cutting the (empty) defaults section off the saved catalog.
+    // Simulate it by cutting the (empty) defaults and views sections off the saved catalog.
     cat->CreateTable("t", {Col("a", TypeId::INT)});
-    cat->Save();
-    {
-        PageGuard g = PageGuard::Fetch(bpm.get(), CATALOG_PAGE_ID);
-        uint32_t total = ReadAs<uint32_t>(g.Data() + 4);
-        WriteAs<uint32_t>(g.Data() + 4, total - 4);  // drop the trailing "0 defaults" count
-        g.MarkDirty();
-    }
-    bpm->FlushAll();
-    cat.reset();
-    bpm.reset();
-    disk.reset();
-    disk = std::make_unique<DiskManager>(file.path());
-    bpm = std::make_unique<BufferPoolManager>(32, disk.get());
-    cat = std::make_unique<Catalog>(bpm.get());
+    TruncateSavedCatalog(8);  // the trailing "0 defaults" and "0 views" counts
     EXPECT_NE(cat->GetTable("t"), nullptr);
     EXPECT_FALSE(cat->RequireTable("t")->schema.At(0).default_value);
+}
+
+TEST_F(CatalogTest, ViewsSurviveRestart) {
+    cat->CreateTable("t", {Col("a", TypeId::INT)});
+    cat->CreateView("v", {}, "SELECT a FROM t WHERE a > 1", false);
+    cat->CreateView("w", {"x", "y"}, "SELECT a, a * 2\nFROM t -- comment", false);
+    Reopen();
+    ASSERT_EQ(cat->Views().size(), 2u);
+    ViewInfo* v = cat->GetView("v");
+    ASSERT_NE(v, nullptr);
+    EXPECT_EQ(v->sql, "SELECT a FROM t WHERE a > 1");
+    EXPECT_TRUE(v->columns.empty());
+    ViewInfo* w = cat->GetView("w");
+    ASSERT_NE(w, nullptr);
+    EXPECT_EQ(w->sql, "SELECT a, a * 2\nFROM t -- comment");
+    EXPECT_EQ(w->columns, (std::vector<std::string>{"x", "y"}));
+    cat->DropView("v");
+    Reopen();
+    EXPECT_EQ(cat->GetView("v"), nullptr);
+    EXPECT_NE(cat->GetView("w"), nullptr);
+}
+
+TEST_F(CatalogTest, TablesAndViewsShareOneNamespace) {
+    cat->CreateTable("t", {Col("a", TypeId::INT)});
+    cat->CreateTable("u", {Col("a", TypeId::INT)});
+    cat->CreateView("v", {}, "SELECT 1", false);
+    EXPECT_THROW(cat->CreateView("t", {}, "SELECT 1", false), DbError);
+    EXPECT_THROW(cat->CreateView("t", {}, "SELECT 1", true), DbError) << "OR REPLACE never replaces a table";
+    EXPECT_THROW(cat->CreateView("v", {}, "SELECT 2", false), DbError);
+    EXPECT_THROW(cat->CreateTable("v", {Col("a", TypeId::INT)}), DbError);
+    EXPECT_THROW(cat->RenameTable("u", "v"), DbError);
+    EXPECT_THROW(cat->CreateView("w", {"a", "a"}, "SELECT 1, 2", false), DbError) << "duplicate column names";
+
+    cat->CreateView("v", {}, "SELECT 2", true);
+    EXPECT_EQ(cat->GetView("v")->sql, "SELECT 2");
+    EXPECT_EQ(cat->Views().size(), 1u);
+
+    // A view is not a table: everything that needs one says so.
+    EXPECT_EQ(cat->GetTable("v"), nullptr);
+    try {
+        cat->RequireTable("v");
+        FAIL() << "expected an error";
+    } catch (const DbError& e) {
+        EXPECT_NE(std::string(e.what()).find("is a view"), std::string::npos) << e.what();
+    }
+    EXPECT_THROW(cat->DropTable("v"), DbError);
+    EXPECT_THROW(cat->CreateIndex("v_i", "v", "a", false), DbError);
+    EXPECT_THROW(cat->DropView("t"), DbError);
+    EXPECT_THROW(cat->DropView("nope"), DbError);
+}
+
+TEST_F(CatalogTest, CatalogWithoutViewsSectionStillLoads) {
+    cat->CreateTable("t", {Col("a", TypeId::INT)});
+    TruncateSavedCatalog(4);  // drop the trailing "0 views" count
+    EXPECT_NE(cat->GetTable("t"), nullptr);
+    EXPECT_TRUE(cat->Views().empty());
 }
 
 // ---- multi-column indexes ----
@@ -558,23 +620,11 @@ TEST_F(CatalogTest, MultiColumnIndexSurvivesRestart) {
 
 TEST_F(CatalogTest, FileWithoutMultiColumnSectionStillLoads) {
     // Files written before multi-column indexes end right after the DEFAULT
-    // section. Recreate one by cutting off the (empty) last section: its count.
+    // section. Recreate one by cutting off the two (empty) sections after it.
     TableInfo* t = cat->CreateTable("t", {Col("a", TypeId::INT)});
     for (int i = 0; i < 10; ++i) AddRow(t, {I(i)});
     cat->CreateIndex("t_a", "t", "a", true);
-    cat->Save();
-    {
-        PageGuard g = PageGuard::Fetch(bpm.get(), CATALOG_PAGE_ID);
-        WriteAs<uint32_t>(g.Data() + 4, ReadAs<uint32_t>(g.Data() + 4) - 4);
-        g.MarkDirty();
-    }
-    cat.reset();  // no Save: keep the shortened catalog
-    bpm->FlushAll();
-    bpm.reset();
-    disk.reset();
-    disk = std::make_unique<DiskManager>(file.path());
-    bpm = std::make_unique<BufferPoolManager>(32, disk.get());
-    cat = std::make_unique<Catalog>(bpm.get());
+    TruncateSavedCatalog(8);  // the (empty) multi-column and views sections: their counts
     ASSERT_EQ(cat->IndexesOf("t").size(), 1u);
     IndexInfo* idx = cat->IndexesOf("t")[0];
     EXPECT_EQ(idx->columns, Cols{"a"});

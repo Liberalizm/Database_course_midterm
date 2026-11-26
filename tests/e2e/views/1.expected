@@ -1,0 +1,40 @@
+CREATE TABLE
+CREATE TABLE
+INSERT 3
+INSERT 4
+CREATE VIEW
+CREATE VIEW
+ name | dept | salary
+------+------+--------
+ ann  | eng  | 100
+ bob  | eng  | 80
+ cid  | ops  | 50
+ dan  | NULL | 70
+(4 rows)
+ dept | people | total
+------+--------+-------
+ eng  | 2      | 180
+ NULL | 1      | 70
+(2 rows)
+ name
+------
+ ann
+ bob
+(2 rows)
+INSERT 1
+ dept | people | total
+------+--------+-------
+ eng  | 2      | 180
+ hr   | 1      | 90
+ ops  | 1      | 50
+ NULL | 1      | 70
+(4 rows)
+ERROR: "staff" is a view, not a table
+ERROR: view "payroll": view "staff": view "staff" refers to itself
+ERROR: column "nope" does not exist
+  dept  (3 rows, 1 pages)
+  emp  (5 rows, 1 pages)
+  payroll  (view)
+  staff  (view)
+View "payroll"
+  CREATE VIEW payroll (dept, people, total) AS SELECT dept, COUNT(*), SUM(salary) FROM staff GROUP BY dept;

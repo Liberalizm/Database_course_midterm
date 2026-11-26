@@ -171,7 +171,8 @@ struct CreateIndexStmt {
 };
 
 struct DropStmt {
-    bool index = false;
+    bool index = false;  // DROP INDEX
+    bool view = false;   // DROP VIEW (neither: DROP TABLE)
     std::string name;
 };
 
@@ -191,12 +192,20 @@ struct SelectItem {
     std::string star_table;  // for t.*
 };
 
+// How a FROM entry is joined to everything before it. Joins are left-deep:
+// "a JOIN b ON ... RIGHT JOIN c ON ..." is "(a JOIN b) RIGHT JOIN c".
+//   LEFT:  rows of the left input without a partner are kept, NULL-padded
+//   RIGHT: rows of this table without a partner are kept, NULL-padded
+//   FULL:  both
+enum class JoinType { INNER, LEFT, RIGHT, FULL };
+
 struct TableRef {
     std::string name, alias;
-    // "... LEFT JOIN name ON on": every row of the tables before this one is kept,
-    // padded with NULLs when no row of this table satisfies `on`. Inner-join ON
-    // conditions are simply merged into WHERE, but a LEFT JOIN's must stay here.
-    bool left_join = false;
+    // "... <join> JOIN name ON on". An outer join's ON stays here: it decides which
+    // rows match, not which rows survive. Inner-join ON conditions are merged into
+    // WHERE, except before a RIGHT / FULL JOIN: that join keeps every row of its
+    // left input, so the inner ONs inside that input must be applied before it.
+    JoinType join = JoinType::INNER;
     // "(SELECT ...) alias": a subquery in FROM (derived table) instead of a stored table.
     std::shared_ptr<SelectStmt> subquery;
     ExprPtr on;
@@ -255,7 +264,18 @@ struct AlterTableStmt {
     std::string new_name;  // RENAME_COLUMN, RENAME_TABLE
 };
 
+// CREATE [OR REPLACE] VIEW name [(col, ...)] AS SELECT ...
+// The catalog keeps the query as text (`sql`, as written); every statement that
+// reads the view parses and plans it again, like a subquery in FROM.
+struct CreateViewStmt {
+    std::string name;
+    std::vector<std::string> columns;  // optional names for the output columns
+    std::shared_ptr<SelectStmt> select;
+    std::string sql;
+    bool or_replace = false;
+};
+
 using Statement = std::variant<CreateTableStmt, CreateIndexStmt, DropStmt, InsertStmt, SelectStmt, DeleteStmt,
-                               UpdateStmt, ExplainStmt, AlterTableStmt>;
+                               UpdateStmt, ExplainStmt, AlterTableStmt, CreateViewStmt>;
 
 }  // namespace minidb

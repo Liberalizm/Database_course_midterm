@@ -56,6 +56,8 @@ QueryResult Database::Run(const Statement& stmt) {
             r = RunUpdate(*s6);
         else if (auto* s7 = std::get_if<AlterTableStmt>(&stmt))
             r = RunAlterTable(*s7);
+        else if (auto* s8 = std::get_if<CreateViewStmt>(&stmt))
+            r = RunCreateView(*s8);
     } catch (...) {
         Checkpoint();  // keep catalog statistics consistent with whatever was written
         throw;
@@ -202,10 +204,27 @@ QueryResult Database::RunAlterTable(const AlterTableStmt& s) {
     return {{}, {}, "ALTER TABLE"};
 }
 
+QueryResult Database::RunCreateView(const CreateViewStmt& s) {
+    // Plan (without running) the query once, so a view that could never work is
+    // rejected now: unknown tables or columns, a wrong number of column names,
+    // duplicate column names, or (with OR REPLACE) a view that would read itself.
+    // A name clash is reported first, before any error in the query.
+    if (catalog_->GetTable(s.name)) throw DbError("a table named \"" + s.name + "\" already exists");
+    if (!s.or_replace && catalog_->GetView(s.name)) throw DbError("view \"" + s.name + "\" already exists");
+    Schema out;
+    planner_->PlanView(s.name, s.columns, *s.select, &out);
+    catalog_->CreateView(s.name, s.columns, s.sql, s.or_replace);
+    return {{}, {}, "CREATE VIEW"};
+}
+
 QueryResult Database::RunDrop(const DropStmt& s) {
     if (s.index) {
         catalog_->DropIndex(s.name);
         return {{}, {}, "DROP INDEX"};
+    }
+    if (s.view) {
+        catalog_->DropView(s.name);
+        return {{}, {}, "DROP VIEW"};
     }
     catalog_->DropTable(s.name);
     return {{}, {}, "DROP TABLE"};

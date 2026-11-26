@@ -190,60 +190,116 @@ std::string ProjectionExecutor::Describe() const {
 
 // ---------------- Nested loop join ----------------
 
-NestedLoopJoinExecutor::NestedLoopJoinExecutor(ExecPtr left, ExecPtr right, ExprPtr pred, bool left_outer)
-    : left_(std::move(left)), right_(std::move(right)), pred_(std::move(pred)), left_outer_(left_outer) {
+std::string JoinTypeName(JoinType type) {
+    switch (type) {
+        case JoinType::LEFT: return "Left Join";
+        case JoinType::RIGHT: return "Right Join";
+        case JoinType::FULL: return "Full Join";
+        default: return "Join";
+    }
+}
+
+// A row of `width` NULLs followed by `tail`, for an unmatched row of a join's
+// right / build input.
+static Row PadLeft(size_t width, const Row& tail) {
+    Row r(width);
+    r.insert(r.end(), tail.begin(), tail.end());
+    return r;
+}
+
+NestedLoopJoinExecutor::NestedLoopJoinExecutor(ExecPtr left, ExecPtr right, ExprPtr pred, JoinType type)
+    : left_(std::move(left)),
+      right_(std::move(right)),
+      pred_(std::move(pred)),
+      type_(type),
+      keep_left_(type == JoinType::LEFT || type == JoinType::FULL),
+      keep_right_(type == JoinType::RIGHT || type == JoinType::FULL) {
     schema_ = Schema::Concat(left_->OutSchema(), right_->OutSchema());
 }
 
 void NestedLoopJoinExecutor::InitImpl() {
     left_->Init();
-    have_left_ = false;
+    have_left_ = left_done_ = false;
+    right_rows_.clear();
+    right_matched_.clear();
+    unmatched_pos_ = 0;
+    if (keep_right_) {
+        right_->Init();
+        Row r;
+        while (right_->Next(&r)) right_rows_.push_back(std::move(r));
+        right_matched_.assign(right_rows_.size(), 0);
+    }
+}
+
+bool NestedLoopJoinExecutor::NextRight(Row* out, size_t* idx) {
+    if (!keep_right_) return right_->Next(out);
+    if (right_pos_ >= right_rows_.size()) return false;
+    *idx = right_pos_++;
+    *out = right_rows_[*idx];
+    return true;
 }
 
 bool NestedLoopJoinExecutor::NextImpl(Row* out) {
-    while (true) {
+    while (!left_done_) {
         if (!have_left_) {
-            if (!left_->Next(&left_row_)) return false;
-            right_->Init();  // rescan inner side
+            if (!left_->Next(&left_row_)) {
+                left_done_ = true;
+                break;
+            }
+            if (keep_right_)
+                right_pos_ = 0;
+            else
+                right_->Init();  // rescan inner side
             have_left_ = true;
             matched_ = false;
         }
         Row r;
-        while (right_->Next(&r)) {
+        size_t idx = 0;
+        while (NextRight(&r, &idx)) {
             Row c = left_row_;
             c.insert(c.end(), r.begin(), r.end());
             if (!pred_ || IsTrue(Evaluate(*pred_, c))) {
                 matched_ = true;
+                if (keep_right_) right_matched_[idx] = 1;
                 *out = std::move(c);
                 return true;
             }
         }
         have_left_ = false;
-        if (left_outer_ && !matched_) {
+        if (keep_left_ && !matched_) {
             *out = left_row_;
             out->resize(schema_.Size());  // NULLs for the right side
             return true;
         }
     }
+    while (unmatched_pos_ < right_rows_.size()) {  // keep_right_: right rows nobody matched
+        size_t i = unmatched_pos_++;
+        if (right_matched_[i]) continue;
+        *out = PadLeft(left_->OutSchema().Size(), right_rows_[i]);
+        return true;
+    }
+    return false;
 }
 
 std::string NestedLoopJoinExecutor::Describe() const {
-    std::string name = left_outer_ ? "Nested Loop Left Join" : "Nested Loop Join";
-    return name + (pred_ ? "  Join Filter: " + pred_->ToString() : std::string("  (cross product)"));
+    return "Nested Loop " + JoinTypeName(type_) +
+           (pred_ ? "  Join Filter: " + pred_->ToString() : std::string("  (cross product)"));
 }
 
 // ---------------- Hash join ----------------
 
 HashJoinExecutor::HashJoinExecutor(ExecPtr probe, ExecPtr build, std::vector<ExprPtr> probe_keys,
                                    std::vector<ExprPtr> build_keys, ExprPtr residual, std::string cond_text,
-                                   bool left_outer)
+                                   JoinType type)
     : probe_(std::move(probe)),
       build_(std::move(build)),
       probe_keys_(std::move(probe_keys)),
       build_keys_(std::move(build_keys)),
       residual_(std::move(residual)),
       cond_text_(std::move(cond_text)),
-      left_outer_(left_outer) {
+      type_(type),
+      keep_probe_(type == JoinType::LEFT || type == JoinType::FULL),
+      keep_build_(type == JoinType::RIGHT || type == JoinType::FULL) {
     schema_ = Schema::Concat(probe_->OutSchema(), build_->OutSchema());
 }
 
@@ -259,40 +315,51 @@ bool HashJoinExecutor::MakeKey(const std::vector<ExprPtr>& keys, const Row& row,
 
 void HashJoinExecutor::InitImpl() {
     table_.clear();
+    build_rows_.clear();
     build_->Init();
     Row r;
     std::string key;
     while (build_->Next(&r)) {
-        if (MakeKey(build_keys_, r, &key)) table_[key].push_back(r);
+        bool has_key = MakeKey(build_keys_, r, &key);
+        if (has_key) table_[key].push_back(build_rows_.size());
+        // A NULL key never joins; such a row is only needed to be emitted padded.
+        if (has_key || keep_build_) build_rows_.push_back(std::move(r));
     }
+    build_matched_.assign(keep_build_ ? build_rows_.size() : 0, 0);
     probe_->Init();
     matches_ = nullptr;
     match_idx_ = 0;
-    have_probe_ = false;
+    have_probe_ = probe_done_ = false;
+    unmatched_pos_ = 0;
 }
 
 bool HashJoinExecutor::NextImpl(Row* out) {
     std::string key;
-    while (true) {
+    while (!probe_done_) {
         if (have_probe_) {
             while (matches_ && match_idx_ < matches_->size()) {
-                const Row& b = (*matches_)[match_idx_++];
+                size_t bi = (*matches_)[match_idx_++];
+                const Row& b = build_rows_[bi];
                 Row c = probe_row_;
                 c.insert(c.end(), b.begin(), b.end());
                 if (!residual_ || IsTrue(Evaluate(*residual_, c))) {
                     matched_ = true;
+                    if (keep_build_) build_matched_[bi] = 1;
                     *out = std::move(c);
                     return true;
                 }
             }
             have_probe_ = false;
-            if (left_outer_ && !matched_) {  // no partner (or a NULL key): pad with NULLs
+            if (keep_probe_ && !matched_) {  // no partner (or a NULL key): pad with NULLs
                 *out = probe_row_;
                 out->resize(schema_.Size());
                 return true;
             }
         }
-        if (!probe_->Next(&probe_row_)) return false;
+        if (!probe_->Next(&probe_row_)) {
+            probe_done_ = true;
+            break;
+        }
         have_probe_ = true;
         matched_ = false;
         matches_ = nullptr;
@@ -302,10 +369,17 @@ bool HashJoinExecutor::NextImpl(Row* out) {
             if (it != table_.end()) matches_ = &it->second;
         }
     }
+    while (unmatched_pos_ < build_matched_.size()) {  // keep_build_: build rows nobody matched
+        size_t i = unmatched_pos_++;
+        if (build_matched_[i]) continue;
+        *out = PadLeft(probe_->OutSchema().Size(), build_rows_[i]);
+        return true;
+    }
+    return false;
 }
 
 std::string HashJoinExecutor::Describe() const {
-    std::string s = std::string(left_outer_ ? "Hash Left Join" : "Hash Join") + "  Hash Cond: " + cond_text_;
+    std::string s = "Hash " + JoinTypeName(type_) + "  Hash Cond: " + cond_text_;
     if (residual_) s += "  Join Filter: " + residual_->ToString();
     return s;
 }
