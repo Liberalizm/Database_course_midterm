@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <chrono>
 #include <random>
+#include <set>
+#include <unordered_set>
 
 namespace minidb {
 
@@ -101,26 +103,70 @@ QueryResult Database::RunDrop(const DropStmt& s) {
     return {{}, {}, "DROP TABLE"};
 }
 
-void Database::InsertRow(TableInfo* t, Row row) {
+namespace {
+
+[[noreturn]] void ThrowDuplicate(const IndexInfo* idx, int64_t key) {
+    throw DbError("duplicate key value violates unique constraint \"" + idx->name + "\": " + idx->column + "=" +
+                  std::to_string(key));
+}
+
+std::string SerializeChecked(const Schema& schema, const Row& row) {
+    std::string tuple = SerializeTuple(schema, row);
+    if (tuple.size() > TablePage::MAX_TUPLE)
+        throw DbError("row is too large (" + std::to_string(tuple.size()) + " bytes, max " +
+                      std::to_string(TablePage::MAX_TUPLE) + ")");
+    return tuple;
+}
+
+bool SameKey(const Value& a, const Value& b) {
+    return a.IsNull() == b.IsNull() && (a.IsNull() || a.AsInt() == b.AsInt());
+}
+
+}  // namespace
+
+// Casts a full row to the column types and enforces NOT NULL.
+Row Database::PrepareRow(const TableInfo* t, Row row) const {
     const Schema& schema = t->schema;
     for (size_t i = 0; i < schema.Size(); ++i) {
         row[i] = row[i].CastTo(schema.At(i).type);
         if (row[i].IsNull() && schema.At(i).not_null)
             throw DbError("null value in column \"" + schema.At(i).name + "\" violates not-null constraint");
     }
+    return row;
+}
+
+// Statement atomicity without a log: every check that can fail runs before the
+// first byte is written, so a failing statement leaves the table untouched.
+void Database::InsertRows(TableInfo* t, const std::vector<Row>& input) {
+    const Schema& schema = t->schema;
+    std::vector<Row> rows;
+    std::vector<std::string> tuples;
+    rows.reserve(input.size());
+    tuples.reserve(input.size());
+    for (const Row& r : input) {
+        rows.push_back(PrepareRow(t, r));
+        tuples.push_back(SerializeChecked(schema, rows.back()));
+    }
+
     auto indexes = catalog_->IndexesOf(t->name);
-    for (IndexInfo* idx : indexes) {  // check constraints before touching anything
-        const Value& v = row[static_cast<size_t>(idx->col_idx)];
-        if (idx->unique && !v.IsNull() && idx->tree->ContainsKey(v.AsInt()))
-            throw DbError("duplicate key value violates unique constraint \"" + idx->name + "\": " + idx->column +
-                          "=" + v.ToString());
-    }
-    RID rid = t->heap->Insert(SerializeTuple(schema, row));
     for (IndexInfo* idx : indexes) {
-        const Value& v = row[static_cast<size_t>(idx->col_idx)];
-        if (!v.IsNull()) idx->tree->Insert(v.AsInt(), rid);
+        if (!idx->unique) continue;
+        std::unordered_set<int64_t> seen;  // duplicates inside this statement
+        for (const Row& r : rows) {
+            const Value& v = r[static_cast<size_t>(idx->col_idx)];
+            if (v.IsNull()) continue;
+            if (!seen.insert(v.AsInt()).second || idx->tree->ContainsKey(v.AsInt())) ThrowDuplicate(idx, v.AsInt());
+        }
     }
-    ++t->row_count;
+
+    for (size_t i = 0; i < rows.size(); ++i) {
+        RID rid = t->heap->Insert(tuples[i]);
+        for (IndexInfo* idx : indexes) {
+            const Value& v = rows[i][static_cast<size_t>(idx->col_idx)];
+            if (!v.IsNull()) idx->tree->Insert(v.AsInt(), rid);
+        }
+        ++t->row_count;
+    }
 }
 
 QueryResult Database::RunInsert(const InsertStmt& s) {
@@ -153,15 +199,18 @@ QueryResult Database::RunInsert(const InsertStmt& s) {
         }
     }
 
+    std::vector<Row> rows;
+    rows.reserve(source.size());
     for (const auto& src : source) {
         if (src.size() != positions.size())
             throw DbError("INSERT has " + std::to_string(src.size()) + " values but " +
                           std::to_string(positions.size()) + " target columns");
         Row full(schema.Size());
         for (size_t i = 0; i < positions.size(); ++i) full[positions[i]] = src[i];
-        InsertRow(t, std::move(full));
+        rows.push_back(std::move(full));
     }
-    return {{}, {}, "INSERT " + std::to_string(source.size())};
+    InsertRows(t, rows);
+    return {{}, {}, "INSERT " + std::to_string(rows.size())};
 }
 
 QueryResult Database::RunSelect(const SelectStmt& s) {
@@ -232,28 +281,59 @@ QueryResult Database::RunUpdate(const UpdateStmt& s) {
     Row row;
     while (scan->Next(&row)) targets.emplace_back(scan->CurrentRid(), row);
 
-    auto indexes = catalog_->IndexesOf(t->name);
+    // Phase 1: compute and validate every new row. Nothing is written yet, so any
+    // error here (division by zero, NOT NULL, row too large, ...) changes nothing.
+    std::vector<Row> new_rows;
+    std::vector<std::string> tuples;
+    new_rows.reserve(targets.size());
+    tuples.reserve(targets.size());
     for (auto& [rid, old_row] : targets) {
         Row new_row = old_row;
-        for (auto& [idx, e] : sets) {
-            new_row[idx] = Evaluate(*e, old_row).CastTo(schema.At(idx).type);
-            if (new_row[idx].IsNull() && schema.At(idx).not_null)
-                throw DbError("null value in column \"" + schema.At(idx).name + "\" violates not-null constraint");
+        for (auto& [idx, e] : sets) new_row[idx] = Evaluate(*e, old_row);
+        new_rows.push_back(PrepareRow(t, std::move(new_row)));
+        tuples.push_back(SerializeChecked(schema, new_rows.back()));
+    }
+
+    // Uniqueness is checked against the state *after* the statement (as the SQL
+    // standard requires), so "SET id = id + 1" works although rows collide midway.
+    // A new key conflicts if another target gets it too, or if a row that is not
+    // being updated already has it.
+    auto indexes = catalog_->IndexesOf(t->name);
+    std::set<RID> target_rids;
+    for (const auto& tr : targets) target_rids.insert(tr.first);
+    for (IndexInfo* ix : indexes) {
+        if (!ix->unique) continue;
+        const auto col = static_cast<size_t>(ix->col_idx);
+        std::unordered_set<int64_t> seen;
+        for (size_t i = 0; i < targets.size(); ++i) {
+            const Value& nv = new_rows[i][col];
+            if (nv.IsNull()) continue;
+            int64_t key = nv.AsInt();
+            if (!seen.insert(key).second) ThrowDuplicate(ix, key);
+            if (SameKey(targets[i].second[col], nv)) continue;  // keeps its own key
+            for (auto it = ix->tree->LowerBound(key); it.Valid() && it.Entry().key == key; it.Next())
+                if (!target_rids.count(it.Entry().rid)) ThrowDuplicate(ix, key);
         }
-        for (IndexInfo* ix : indexes) {
-            const Value& nv = new_row[static_cast<size_t>(ix->col_idx)];
-            if (ix->unique && !nv.IsNull() && ix->tree->ContainsKey(nv.AsInt(), rid))
-                throw DbError("duplicate key value violates unique constraint \"" + ix->name + "\": " + ix->column +
-                              "=" + nv.ToString());
+    }
+
+    // Phase 2: apply. Heap first (a tuple that grows may move to a new RID), then
+    // all index removals before any insertion, so entries of different rows can
+    // never clash with each other mid-way.
+    std::vector<RID> new_rids;
+    new_rids.reserve(targets.size());
+    for (size_t i = 0; i < targets.size(); ++i) new_rids.push_back(t->heap->Update(targets[i].first, tuples[i]));
+    for (IndexInfo* ix : indexes) {
+        const auto col = static_cast<size_t>(ix->col_idx);
+        auto changed = [&](size_t i) {
+            return new_rids[i] != targets[i].first || !SameKey(targets[i].second[col], new_rows[i][col]);
+        };
+        for (size_t i = 0; i < targets.size(); ++i) {
+            const Value& ov = targets[i].second[col];
+            if (changed(i) && !ov.IsNull()) ix->tree->Remove(ov.AsInt(), targets[i].first);
         }
-        RID new_rid = t->heap->Update(rid, SerializeTuple(schema, new_row));
-        for (IndexInfo* ix : indexes) {
-            const Value& ov = old_row[static_cast<size_t>(ix->col_idx)];
-            const Value& nv = new_row[static_cast<size_t>(ix->col_idx)];
-            bool same = new_rid == rid && ov.IsNull() == nv.IsNull() && (ov.IsNull() || ov.AsInt() == nv.AsInt());
-            if (same) continue;
-            if (!ov.IsNull()) ix->tree->Remove(ov.AsInt(), rid);
-            if (!nv.IsNull()) ix->tree->Insert(nv.AsInt(), new_rid);
+        for (size_t i = 0; i < targets.size(); ++i) {
+            const Value& nv = new_rows[i][col];
+            if (changed(i) && !nv.IsNull()) ix->tree->Insert(nv.AsInt(), new_rids[i]);
         }
     }
     return {{}, {}, "UPDATE " + std::to_string(targets.size())};
@@ -283,6 +363,9 @@ QueryResult Database::Populate(const std::string& table, int64_t n, uint32_t see
         }
     }
 
+    // Rows are inserted in batches to bound memory use for very large n.
+    constexpr int64_t kBatch = 4096;
+    std::vector<Row> batch;
     for (int64_t k = 0; k < n; ++k) {
         Row r;
         for (size_t i = 0; i < schema.Size(); ++i) {
@@ -298,7 +381,11 @@ QueryResult Database::Populate(const std::string& table, int64_t n, uint32_t see
                 case TypeId::NULL_T: r.push_back(Value::Null()); break;
             }
         }
-        InsertRow(t, std::move(r));
+        batch.push_back(std::move(r));
+        if (static_cast<int64_t>(batch.size()) == kBatch || k + 1 == n) {
+            InsertRows(t, batch);
+            batch.clear();
+        }
     }
     Checkpoint();
     return {{}, {}, "INSERT " + std::to_string(n)};

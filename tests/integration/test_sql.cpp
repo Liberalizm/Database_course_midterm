@@ -130,6 +130,67 @@ TEST_F(SqlTest, Constraints) {
     ExpectIndexesConsistent("emp");
 }
 
+// A statement either applies completely or not at all, even when it touches many rows
+// and the error is only discovered at the 2nd, 3rd, ... row.
+TEST_F(SqlTest, FailedMultiRowInsertChangesNothing) {
+    SeedCompany();
+    EXPECT_THROW(db->Execute("INSERT INTO emp VALUES (10, 'new', 1, 1), (1, 'dup', 1, 1)"), DbError);
+    EXPECT_THROW(db->Execute("INSERT INTO emp VALUES (11, 'a', 1, 1), (11, 'b', 1, 1)"), DbError)
+        << "duplicates inside one statement";
+    EXPECT_THROW(db->Execute("INSERT INTO emp VALUES (12, 'a', 1, 1), (NULL, 'b', 1, 1)"), DbError);
+    EXPECT_THROW(db->Execute("INSERT INTO emp VALUES (13, 'a', 1, 1), (14, '" + std::string(5000, 'x') + "', 1, 1)"),
+                 DbError);
+    db->Execute("CREATE TABLE src (id INT)");
+    db->Execute("INSERT INTO src VALUES (20), (2)");
+    EXPECT_THROW(db->Execute("INSERT INTO emp (id) SELECT id FROM src"), DbError);
+    EXPECT_EQ(Scalar("SELECT COUNT(*) FROM emp"), 5);
+    EXPECT_EQ(Scalar("SELECT COUNT(*) FROM emp WHERE id >= 10"), 0);
+    ExpectIndexesConsistent("emp");
+}
+
+TEST_F(SqlTest, FailedMultiRowUpdateChangesNothing) {
+    SeedCompany();
+    EXPECT_THROW(db->Execute("UPDATE emp SET salary = 1 / (id - 3)"), DbError) << "fails at the 3rd row";
+    EXPECT_THROW(db->Execute("UPDATE emp SET id = 42"), DbError) << "duplicates inside one statement";
+    EXPECT_THROW(db->Execute("UPDATE emp SET id = id + 1 WHERE id <> 5"), DbError) << "4 -> 5 is taken";
+    db->Execute("UPDATE emp SET id = 15 WHERE id = 5");
+    EXPECT_THROW(db->Execute("UPDATE emp SET id = id + 11 WHERE id < 15"), DbError)
+        << "1..3 -> 12..14 are free, only the last row (4 -> 15) collides";
+    EXPECT_THROW(db->Execute("UPDATE emp SET name = '" + std::string(5000, 'x') + "' WHERE id > 2"), DbError);
+    EXPECT_THROW(db->Execute("UPDATE emp SET dept_id = NULL, id = NULL WHERE id > 3"), DbError);
+
+    auto rows = Q("SELECT id, name, salary FROM emp ORDER BY id");
+    ASSERT_EQ(rows.size(), 5u);
+    const int64_t ids[] = {1, 2, 3, 4, 15};
+    const double salaries[] = {100, 80, 50, 70, 60};
+    for (size_t i = 0; i < rows.size(); ++i) {
+        EXPECT_EQ(rows[i][0].AsInt(), ids[i]);
+        EXPECT_EQ(rows[i][1].AsText().size(), 3u) << "name of row " << i << " was changed";
+        EXPECT_DOUBLE_EQ(rows[i][2].AsDouble(), salaries[i]);
+    }
+    ExpectIndexesConsistent("emp");
+}
+
+// Unique constraints are checked against the state at the end of the statement, so
+// shifting all keys at once is fine even though rows temporarily "collide".
+TEST_F(SqlTest, UpdateChecksUniquenessAtEndOfStatement) {
+    SeedCompany();
+    EXPECT_EQ(Msg("UPDATE emp SET id = id + 1"), "UPDATE 5");
+    EXPECT_EQ(Scalar("SELECT MIN(id) FROM emp"), 2);
+    EXPECT_EQ(Scalar("SELECT MAX(id) FROM emp"), 6);
+    EXPECT_EQ(Msg("UPDATE emp SET id = 7 - id"), "UPDATE 5") << "reverses the order: every key swaps";
+    EXPECT_EQ(Q("SELECT name FROM emp WHERE id = 1")[0][0].AsText(), "eve");
+    EXPECT_EQ(Q("SELECT name FROM emp WHERE id = 5")[0][0].AsText(), "ann");
+    ExpectIndexesConsistent("emp");
+
+    // Rows that move to another page (grown tuples) keep their index entries right.
+    db->Execute("CREATE INDEX emp_dept ON emp (dept_id)");
+    EXPECT_EQ(Msg("UPDATE emp SET name = '" + std::string(1500, 'n') + "', id = id * 2"), "UPDATE 5");
+    EXPECT_EQ(Scalar("SELECT COUNT(*) FROM emp WHERE id = 10"), 1);
+    EXPECT_EQ(Scalar("SELECT COUNT(*) FROM emp WHERE dept_id = 1"), 2);
+    ExpectIndexesConsistent("emp");
+}
+
 TEST_F(SqlTest, UniqueColumnConstraint) {
     db->Execute("CREATE TABLE u (id INT, code INT UNIQUE)");
     db->Execute("INSERT INTO u VALUES (1, 100), (2, NULL), (3, NULL)");  // NULLs never conflict

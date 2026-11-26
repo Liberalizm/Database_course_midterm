@@ -47,7 +47,11 @@ private:
     QueryResult RunUpdate(const UpdateStmt& s);
     QueryResult RunExplain(const ExplainStmt& s);
 
-    void InsertRow(TableInfo* t, Row row);
+    // Write path. Each modifying statement is atomic: all constraints (types,
+    // NOT NULL, row size, uniqueness) are checked for every affected row before
+    // the first change is applied, so a failing statement changes nothing.
+    Row PrepareRow(const TableInfo* t, Row row) const;
+    void InsertRows(TableInfo* t, const std::vector<Row>& rows);
 
     std::unique_ptr<DiskManager> disk_;
     std::unique_ptr<BufferPoolManager> bpm_;

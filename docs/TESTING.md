@@ -47,7 +47,7 @@ Isolation techniques:
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build --parallel
-ctest --test-dir build -j 8 --output-on-failure    # everything (222 tests)
+ctest --test-dir build -j 8 --output-on-failure    # everything (225 tests)
 
 ctest --test-dir build -L storage                  # one layer
 ctest --test-dir build -L query
