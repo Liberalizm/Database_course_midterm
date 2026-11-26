@@ -1,0 +1,10 @@
+  items  (3 rows, 1 pages)
+  items_pkey ON items(id) UNIQUE  height=1
+  items_qty ON items(qty)  height=1
+ id | qty | label
+----+-----+--------
+ 1  | 10  | bolt
+ 3  | 10  | washer
+(2 rows)
+ERROR: duplicate key value violates unique constraint "items_pkey": id=1
+INSERT 1

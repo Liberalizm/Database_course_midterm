@@ -1,0 +1,15 @@
+ERROR: syntax error: unknown statement at or near "selec"
+ERROR: table "missing" does not exist
+CREATE TABLE
+ERROR: type mismatch: cannot store TEXT value 'x' in INT column
+INSERT 1
+ERROR: duplicate key value violates unique constraint "t_pkey": a=1
+ERROR: column "c" does not exist
+ERROR: division by zero
+ERROR: column "t.b" must appear in the GROUP BY clause or be used in an aggregate function
+unknown command .unknowncommand (try .help)
+ERROR: table "nope" does not exist
+ a | b
+---+-----
+ 1 | one
+(1 row)

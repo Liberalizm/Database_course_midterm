@@ -1,0 +1,7 @@
+# Golden files and scripts must keep LF endings on every platform,
+# otherwise end-to-end comparisons and bash scripts break on Windows checkouts.
+*.sql       text eol=lf
+*.expected  text eol=lf
+*.sh        text eol=lf
+*.cmake     text eol=lf
+*.yml       text eol=lf

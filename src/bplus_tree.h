@@ -57,11 +57,18 @@ public:
         page_id_t leaf_;
         int pos_;
         IndexKey cur_;
+        size_t hops_ = 0;  // leaves stepped over; more than the file has pages = a cycle
     };
 
     Iterator Begin() const;                  // smallest entry
     Iterator LowerBound(int64_t key) const;  // first entry with entry.key >= key
     int Height() const;
+    // Every node page of the tree (used to free them on DROP INDEX / DROP TABLE).
+    std::vector<page_id_t> Pages() const;
+
+    // Smallest / largest key (statistics for the planner). False if unknown/empty.
+    bool MinKey(int64_t* out) const;
+    bool MaxKey(int64_t* out) const;
 
     // Debug: verify sortedness of the leaf chain and return number of entries.
     size_t CheckAndCount() const;

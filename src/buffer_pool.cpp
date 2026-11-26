@@ -53,7 +53,12 @@ Page* BufferPoolManager::FetchPage(page_id_t pid) {
 Page* BufferPoolManager::NewPage(page_id_t* pid) {
     frame_id_t f;
     if (!GetFreeFrame(&f)) throw DbError("buffer pool exhausted: all frames are pinned");
-    *pid = disk_->AllocatePage();
+    if (!free_pages_.empty()) {  // lowest free id first keeps the file compact
+        *pid = *free_pages_.begin();
+        free_pages_.erase(free_pages_.begin());
+    } else {
+        *pid = disk_->AllocatePage();
+    }
     Page& p = frames_[f];
     p.Reset();
     p.id_ = *pid;
@@ -71,6 +76,22 @@ bool BufferPoolManager::UnpinPage(page_id_t pid, bool is_dirty) {
     if (is_dirty) p.dirty_ = true;
     if (--p.pin_count_ == 0) replacer_.Unpin(it->second);
     return true;
+}
+
+void BufferPoolManager::DeletePage(page_id_t pid) {
+    if (pid <= CATALOG_PAGE_ID || pid >= disk_->NumPages())
+        throw DbError("internal: cannot free page " + std::to_string(pid));
+    if (free_pages_.count(pid)) throw DbError("internal: page " + std::to_string(pid) + " freed twice");
+    auto it = page_table_.find(pid);
+    if (it != page_table_.end()) {
+        frame_id_t f = it->second;
+        if (frames_[f].pin_count_ > 0) throw DbError("internal: cannot free pinned page " + std::to_string(pid));
+        replacer_.Pin(f);  // no longer an eviction candidate: the frame becomes free
+        page_table_.erase(it);
+        frames_[f].Reset();
+        free_list_.push_back(f);
+    }
+    free_pages_.insert(pid);
 }
 
 void BufferPoolManager::FlushPage(page_id_t pid) {

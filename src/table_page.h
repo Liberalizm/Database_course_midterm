@@ -47,6 +47,10 @@ public:
     // Moves all live tuples to the end of the page, removing holes.
     void Compact();
     size_t LiveCount() const;
+    // Throws DbError if the header or a slot points outside the page (damaged file).
+    void CheckIntegrity() const;
+    // O(1) variant for single-slot operations: the header and `slot` only.
+    void CheckSlot(uint16_t slot) const;
 
 private:
     uint16_t FreeEnd() const { return ReadAs<uint16_t>(d_ + 6); }

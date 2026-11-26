@@ -1,0 +1,79 @@
+CREATE TABLE
+CREATE TABLE
+INSERT 3
+INSERT 4
+ name | staff
+------+-------
+ eng  | 2
+ hr   | 0
+ ops  | 1
+(3 rows)
+ who     | band
+---------+------
+ ANN (1) | high
+ BOB (1) | high
+ CID (2) | low
+ DAN (0) | mid
+(4 rows)
+ count(*) | count(dept_id) | count(DISTINCT dept_id)
+----------+----------------+-------------------------
+ 4        | 3              | 2
+(1 row)
+ name
+------
+ ann
+ bob
+(2 rows)
+ name
+------
+ hr
+(1 row)
+ dept_id | n
+---------+---
+ 1       | 2
+(1 row)
+ id
+----
+ 3
+(1 row)
+ name
+------
+ ann
+ bob
+ cid
+ dan
+(4 rows)
+ERROR: duplicate key value violates unique constraint "dept_name_key": name=eng
+CREATE TABLE
+INSERT 2000
+ QUERY PLAN
+-------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Projection: users.id  (cost=4.01 rows=1)
+     -> Index Scan using users_login_key on users  Index Cond: hash(users.login) = 6907710154329789525  Filter: users.login = 'login_77'  (cost=4.01 rows=1)
+ id
+----
+ 77
+(1 row)
+ALTER TABLE
+UPDATE 2
+ALTER TABLE
+ALTER TABLE
+ id | name | pay | email
+----+------+-----+----------
+ 1  | ann  | 100 | ann@corp
+ 2  | bob  | 80  | bob@corp
+ 3  | cid  | 50  | NULL
+ 4  | dan  | 70  | NULL
+(4 rows)
+Table "emp"
+  id  INT  NOT NULL
+  name  TEXT
+  pay  INT
+  email  TEXT
+  index emp_email_key (email) UNIQUE btree
+  index emp_pkey (id) UNIQUE btree
+ERROR: duplicate key value violates unique constraint "emp_pkey": id=1
+ count(*)
+----------
+ 4
+(1 row)

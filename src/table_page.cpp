@@ -9,6 +9,24 @@ void TablePage::Init() {
     SetFreeEnd(static_cast<uint16_t>(PAGE_SIZE));
 }
 
+// A damaged file must produce an error, not out-of-bounds memory access: the
+// header and every live slot have to describe ranges inside this page.
+void TablePage::CheckIntegrity() const {
+    size_t slots_end = HEADER + static_cast<size_t>(NumSlots()) * SLOT;
+    if (slots_end > PAGE_SIZE || FreeEnd() < slots_end || FreeEnd() > PAGE_SIZE)
+        throw DbError("table page is corrupt (bad header)");
+    size_t live = 0;
+    for (uint16_t i = 0; i < NumSlots(); ++i) {
+        uint16_t off = SlotOff(i);
+        if (off == 0) continue;
+        if (off < FreeEnd() || SlotLen(i) == 0 || static_cast<size_t>(off) + SlotLen(i) > PAGE_SIZE)
+            throw DbError("table page is corrupt (bad slot " + std::to_string(i) + ")");
+        live += SlotLen(i);
+    }
+    // Overlapping slots would make Compact() copy more bytes than the page holds.
+    if (live > PAGE_SIZE - FreeEnd()) throw DbError("table page is corrupt (overlapping slots)");
+}
+
 size_t TablePage::LiveBytes() const {
     size_t total = 0;
     for (uint16_t i = 0; i < NumSlots(); ++i)
@@ -24,6 +42,7 @@ size_t TablePage::LiveCount() const {
 }
 
 std::optional<uint16_t> TablePage::Insert(const char* data, size_t len) {
+    CheckIntegrity();
     if (len == 0 || len > MAX_TUPLE) return std::nullopt;
     uint16_t n = NumSlots();
     int slot = -1;
@@ -50,15 +69,31 @@ std::optional<uint16_t> TablePage::Insert(const char* data, size_t len) {
     return static_cast<uint16_t>(slot);
 }
 
+// Cheap O(1) check for operations that touch a single slot: the header and
+// that one slot (if live) must lie inside the page.
+void TablePage::CheckSlot(uint16_t slot) const {
+    size_t slots_end = HEADER + static_cast<size_t>(NumSlots()) * SLOT;
+    if (slots_end > PAGE_SIZE || FreeEnd() < slots_end || FreeEnd() > PAGE_SIZE)
+        throw DbError("table page is corrupt (bad header)");
+    if (slot >= NumSlots() || SlotOff(slot) == 0) return;
+    uint16_t off = SlotOff(slot);
+    if (off < FreeEnd() || SlotLen(slot) == 0 || static_cast<size_t>(off) + SlotLen(slot) > PAGE_SIZE)
+        throw DbError("table page is corrupt (bad slot " + std::to_string(slot) + ")");
+}
+
 bool TablePage::Get(uint16_t slot, std::string* out) const {
+    if (HEADER + static_cast<size_t>(NumSlots()) * SLOT > PAGE_SIZE) throw DbError("table page is corrupt (bad header)");
     if (slot >= NumSlots()) return false;
     uint16_t off = SlotOff(slot);
     if (off == 0) return false;
+    if (off < HEADER + static_cast<size_t>(NumSlots()) * SLOT || static_cast<size_t>(off) + SlotLen(slot) > PAGE_SIZE)
+        throw DbError("table page is corrupt (bad slot " + std::to_string(slot) + ")");
     out->assign(d_ + off, SlotLen(slot));
     return true;
 }
 
 bool TablePage::Delete(uint16_t slot) {
+    CheckSlot(slot);
     uint16_t n = NumSlots();
     if (slot >= n || SlotOff(slot) == 0) return false;
     SetSlot(slot, 0, 0);
@@ -69,6 +104,7 @@ bool TablePage::Delete(uint16_t slot) {
 }
 
 bool TablePage::Update(uint16_t slot, const char* data, size_t len) {
+    CheckSlot(slot);
     uint16_t n = NumSlots();
     if (slot >= n || SlotOff(slot) == 0) throw DbError("update of non-existent tuple");
     if (len == 0 || len > MAX_TUPLE) return false;
@@ -97,6 +133,7 @@ bool TablePage::Update(uint16_t slot, const char* data, size_t len) {
 }
 
 void TablePage::Compact() {
+    CheckIntegrity();
     char tmp[PAGE_SIZE];
     size_t end = PAGE_SIZE;
     for (uint16_t i = 0; i < NumSlots(); ++i) {

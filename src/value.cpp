@@ -21,7 +21,7 @@ int64_t Value::AsInt() const {
     switch (type_) {
         case TypeId::INT:
         case TypeId::BOOL: return i_;
-        case TypeId::DOUBLE: return static_cast<int64_t>(d_);
+        case TypeId::DOUBLE: return checked::FromDouble(d_);
         default: throw DbError(std::string("cannot use ") + TypeName(type_) + " as INT");
     }
 }
@@ -76,7 +76,7 @@ int Value::Compare(const Value& o) const {
 Value Value::CastTo(TypeId t) const {
     if (IsNull() || type_ == t) return *this;
     if (t == TypeId::DOUBLE && type_ == TypeId::INT) return Double(static_cast<double>(i_));
-    if (t == TypeId::INT && type_ == TypeId::DOUBLE) return Int(static_cast<int64_t>(d_));
+    if (t == TypeId::INT && type_ == TypeId::DOUBLE) return Int(checked::FromDouble(d_));
     throw DbError(std::string("type mismatch: cannot store ") + TypeName(type_) + " value '" + ToString() +
                   "' in " + TypeName(t) + " column");
 }

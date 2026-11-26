@@ -3,6 +3,7 @@
 
 #include <set>
 #include <string>
+#include <vector>
 
 #include "buffer_pool.h"
 #include "table_page.h"
@@ -24,6 +25,8 @@ public:
 
     page_id_t FirstPageId() const { return first_; }
     size_t PageCount() const { return page_count_; }
+    // Every page of the heap, in chain order (used to free them on DROP TABLE).
+    std::vector<page_id_t> Pages() const;
 
     // Sequential scan over all live tuples, page by page.
     class Iterator {
@@ -35,6 +38,7 @@ public:
         BufferPoolManager* bpm_;
         page_id_t page_;
         uint16_t slot_ = 0;
+        size_t hops_ = 0;  // pages visited; more than the file has = a cycle
     };
     Iterator Begin() const { return Iterator(bpm_, first_); }
 

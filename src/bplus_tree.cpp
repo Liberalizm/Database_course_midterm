@@ -46,6 +46,18 @@ void SetInEntry(char* d, int i, const IndexKey& k, page_id_t child) {
     WriteAs<page_id_t>(InEntry(d, i) + 16, child);
 }
 
+// Fetches a node and validates its header, so that a damaged index file results
+// in an error instead of reads beyond the end of the page.
+PageGuard FetchNode(BufferPoolManager* bpm, page_id_t pid) {
+    PageGuard g = PageGuard::Fetch(bpm, pid);
+    const char* d = g.Data();
+    bool leaf = d[0] == 1;
+    int cap = leaf ? BPlusTree::LEAF_CAPACITY : BPlusTree::INTERNAL_CAPACITY;
+    if ((d[0] != 0 && d[0] != 1) || Size(d) > cap || (!leaf && Size(d) < 1))
+        throw DbError("index page " + std::to_string(pid) + " is corrupt");
+    return g;
+}
+
 // Largest i >= 1 with key[i] <= k, or 0 if none (binary search).
 int ChildIndexFor(const char* d, const IndexKey& k) {
     int lo = 1, hi = Size(d) - 1, ans = 0;
@@ -85,7 +97,7 @@ BPlusTree::BPlusTree(BufferPoolManager* bpm, page_id_t root, int leaf_max, int i
 page_id_t BPlusTree::FindLeaf(const IndexKey& k, std::vector<page_id_t>* path) const {
     page_id_t pid = root_;
     while (true) {
-        PageGuard g = PageGuard::Fetch(bpm_, pid);
+        PageGuard g = FetchNode(bpm_, pid);
         if (IsLeaf(g.Data())) return pid;
         if (path) path->push_back(pid);
         pid = Child(g.Data(), ChildIndexFor(g.Data(), k));
@@ -110,7 +122,7 @@ bool BPlusTree::Insert(int64_t key, RID rid) {
     page_id_t new_id = INVALID_PAGE_ID;
     IndexKey sep;
     {
-        PageGuard g = PageGuard::Fetch(bpm_, leaf_id);
+        PageGuard g = FetchNode(bpm_, leaf_id);
         char* d = g.Data();
         int n = Size(d);
         int pos = LeafLowerBound(d, k);
@@ -158,7 +170,7 @@ void BPlusTree::InsertIntoParent(std::vector<page_id_t>& path, page_id_t left, c
     page_id_t new_id;
     IndexKey up;
     {
-        PageGuard g = PageGuard::Fetch(bpm_, parent);
+        PageGuard g = FetchNode(bpm_, parent);
         char* d = g.Data();
         int n = Size(d);
         int idx = -1;
@@ -193,7 +205,7 @@ bool BPlusTree::Remove(int64_t key, RID rid) {
     if (root_ == INVALID_PAGE_ID) return false;
     IndexKey k{key, rid};
     page_id_t leaf = FindLeaf(k, nullptr);
-    PageGuard g = PageGuard::Fetch(bpm_, leaf);
+    PageGuard g = FetchNode(bpm_, leaf);
     char* d = g.Data();
     int n = Size(d);
     int pos = LeafLowerBound(d, k);
@@ -215,7 +227,7 @@ BPlusTree::Iterator BPlusTree::Begin() const {
     if (root_ == INVALID_PAGE_ID) return Iterator(bpm_, INVALID_PAGE_ID, 0);
     page_id_t pid = root_;
     while (true) {
-        PageGuard g = PageGuard::Fetch(bpm_, pid);
+        PageGuard g = FetchNode(bpm_, pid);
         if (IsLeaf(g.Data())) break;
         pid = Child(g.Data(), 0);
     }
@@ -228,7 +240,7 @@ BPlusTree::Iterator BPlusTree::LowerBound(int64_t key) const {
     page_id_t leaf = FindLeaf(k, nullptr);
     int pos;
     {
-        PageGuard g = PageGuard::Fetch(bpm_, leaf);
+        PageGuard g = FetchNode(bpm_, leaf);
         pos = LeafLowerBound(g.Data(), k);
     }
     return Iterator(bpm_, leaf, pos);
@@ -239,11 +251,55 @@ int BPlusTree::Height() const {
     int h = 1;
     page_id_t pid = root_;
     while (true) {
-        PageGuard g = PageGuard::Fetch(bpm_, pid);
+        PageGuard g = FetchNode(bpm_, pid);
         if (IsLeaf(g.Data())) return h;
         pid = Child(g.Data(), 0);
         ++h;
     }
+}
+
+std::vector<page_id_t> BPlusTree::Pages() const {
+    std::vector<page_id_t> out;
+    if (root_ == INVALID_PAGE_ID) return out;
+    std::vector<page_id_t> stack{root_};
+    while (!stack.empty()) {
+        page_id_t pid = stack.back();
+        stack.pop_back();
+        out.push_back(pid);
+        PageGuard g = FetchNode(bpm_, pid);
+        if (IsLeaf(g.Data())) continue;
+        for (int i = 0; i < Size(g.Data()); ++i) stack.push_back(Child(g.Data(), i));
+    }
+    return out;
+}
+
+bool BPlusTree::MinKey(int64_t* out) const {
+    Iterator it = Begin();
+    if (!it.Valid()) return false;
+    *out = it.Entry().key;
+    return true;
+}
+
+bool BPlusTree::MaxKey(int64_t* out) const {
+    if (root_ == INVALID_PAGE_ID) return false;
+    // Lazy deletes can leave the rightmost leaves empty, so this is a right-to-left
+    // depth-first search for the last non-empty leaf, not a single descent. Leaves
+    // have no back pointers, and usually the first leaf visited already answers.
+    std::vector<page_id_t> stack{root_};
+    while (!stack.empty()) {
+        page_id_t pid = stack.back();
+        stack.pop_back();
+        PageGuard g = FetchNode(bpm_, pid);
+        const char* d = g.Data();
+        int n = Size(d);
+        if (IsLeaf(d)) {
+            if (n == 0) continue;
+            *out = LeafKey(d, n - 1).key;
+            return true;
+        }
+        for (int i = 0; i < n; ++i) stack.push_back(Child(d, i));  // rightmost child on top
+    }
+    return false;  // every entry was deleted
 }
 
 size_t BPlusTree::CheckAndCount() const {
@@ -272,12 +328,14 @@ void BPlusTree::Iterator::Next() {
 // Moves forward over exhausted / empty leaves until positioned on a real entry.
 void BPlusTree::Iterator::Normalize() {
     while (leaf_ != INVALID_PAGE_ID) {
-        PageGuard g = PageGuard::Fetch(bpm_, leaf_);
+        PageGuard g = FetchNode(bpm_, leaf_);
         if (pos_ < Size(g.Data())) {
             cur_ = LeafKey(g.Data(), pos_);
             return;
         }
         leaf_ = NextLeaf(g.Data());
+        if (++hops_ > static_cast<size_t>(bpm_->Disk()->NumPages()))
+            throw DbError("index is corrupt (cycle in the leaf chain)");
         pos_ = 0;
     }
 }

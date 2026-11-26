@@ -1,6 +1,7 @@
 // value.h - SQL values, column/schema descriptions and tuple (de)serialization.
 #pragma once
 
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -76,6 +77,7 @@ struct Column {
     TypeId type = TypeId::INT;
     std::string table;  // qualifier (table name or alias), may be empty
     bool not_null = false;
+    std::optional<Value> default_value;  // DEFAULT: used for columns an INSERT leaves out
 };
 
 class Schema {

@@ -1,0 +1,51 @@
+CREATE TABLE
+CREATE TABLE
+INSERT 3
+INSERT 5
+  groups  (3 rows, 1 pages)
+  students  (5 rows, 1 pages)
+Table "students"
+  id  INT  NOT NULL
+  name  TEXT
+  group_id  INT
+  gpa  DOUBLE
+  index students_pkey (id) UNIQUE btree
+ id | name  | group_id | gpa
+----+-------+----------+------
+ 1  | Alice | 1        | 3.9
+ 2  | Bob   | 1        | 3.1
+ 3  | Carol | 2        | 3.5
+ 4  | Dave  | 2        | NULL
+ 5  | Erin  | NULL     | 2.8
+(5 rows)
+ name  | gpa
+-------+-----
+ Alice | 3.9
+ Carol | 3.5
+(2 rows)
+ name  | title
+-------+--------
+ Alice | CS-101
+ Bob   | CS-101
+ Carol | CS-102
+ Dave  | CS-102
+(4 rows)
+ title  | n | avg_gpa
+--------+---+---------
+ CS-101 | 2 | 3.5
+ CS-102 | 2 | 3.5
+(2 rows)
+UPDATE 1
+DELETE 1
+ count(*) | min(gpa) | max(gpa)
+----------+----------+----------
+ 4        | 3        | 3.9
+(1 row)
+ group_id
+----------
+ 2
+(1 row)
+ QUERY PLAN
+---------------------------------------------------------------------------------------------
+ Projection: students.id, students.name, students.group_id, students.gpa  (cost=1.04 rows=1)
+     -> Seq Scan on students  Filter: students.id = 3  (cost=1.04 rows=1)

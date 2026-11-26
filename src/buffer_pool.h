@@ -2,6 +2,7 @@
 #pragma once
 
 #include <list>
+#include <set>
 #include <unordered_map>
 #include <vector>
 
@@ -75,10 +76,19 @@ public:
     ~BufferPoolManager();
 
     Page* FetchPage(page_id_t pid);
+    // Returns a zeroed, pinned page. Reuses a freed page if there is one, and
+    // only grows the database file when the free-page list is empty.
     Page* NewPage(page_id_t* pid);
     bool UnpinPage(page_id_t pid, bool is_dirty);
     void FlushPage(page_id_t pid);
     void FlushAll();
+
+    // Gives a page back for reuse (e.g. the pages of a dropped table). The page
+    // must not be pinned; its cached contents are discarded without write-back.
+    void DeletePage(page_id_t pid);
+    // The free-page list is persisted by the catalog, which restores it on startup.
+    const std::set<page_id_t>& FreePages() const { return free_pages_; }
+    void SetFreePages(std::set<page_id_t> pages) { free_pages_ = std::move(pages); }
 
     DiskManager* Disk() { return disk_; }
     size_t PoolSize() const { return frames_.size(); }
@@ -94,7 +104,8 @@ private:
 
     std::vector<Page> frames_;
     std::unordered_map<page_id_t, frame_id_t> page_table_;  // which page is in which frame
-    std::list<frame_id_t> free_list_;                         // frames never used yet
+    std::list<frame_id_t> free_list_;                         // frames holding no page
+    std::set<page_id_t> free_pages_;                          // pages on disk available for reuse
     LRUReplacer replacer_;
     DiskManager* disk_;
 
