@@ -44,6 +44,6 @@ INSERT 2000
 ---------+--------
  3       | db
 (1 row)
-ERROR: PRIMARY KEY / UNIQUE is only supported on INT and TEXT columns
+ERROR: PRIMARY KEY / UNIQUE is only supported on INT, TEXT, DATE and TIMESTAMP columns
 ERROR: primary key column "zz" does not exist
 ERROR: column "term" appears twice in index "bad_idx"

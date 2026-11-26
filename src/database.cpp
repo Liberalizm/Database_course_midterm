@@ -255,8 +255,8 @@ QueryResult Database::RunCreateTable(const CreateTableStmt& s) {
     auto check_types = [&](const std::vector<std::string>& key) {
         for (const auto& name : key)
             for (const auto& d : s.cols)
-                if (d.name == name && d.type != TypeId::INT && d.type != TypeId::TEXT)
-                    throw DbError("PRIMARY KEY / UNIQUE is only supported on INT and TEXT columns");
+                if (d.name == name && !IsIndexable(d.type))
+                    throw DbError("PRIMARY KEY / UNIQUE is only supported on INT, TEXT, DATE and TIMESTAMP columns");
     };
     check_types(pk);
     for (const auto& key : unique_keys) check_types(key);
@@ -317,8 +317,8 @@ QueryResult Database::RunAlterTable(const AlterTableStmt& s) {
             const ColumnDef& d = s.column;
             if (t->schema.Find("", d.name) >= 0)
                 throw DbError("column \"" + d.name + "\" of relation \"" + s.table + "\" already exists");
-            if ((d.primary_key || d.unique) && d.type != TypeId::INT && d.type != TypeId::TEXT)
-                throw DbError("PRIMARY KEY / UNIQUE is only supported on INT and TEXT columns");
+            if ((d.primary_key || d.unique) && !IsIndexable(d.type))
+                throw DbError("PRIMARY KEY / UNIQUE is only supported on INT, TEXT, DATE and TIMESTAMP columns");
             // Existing rows get the DEFAULT (or NULL), so NOT NULL needs a non-NULL
             // DEFAULT unless the table is empty, and a UNIQUE column cannot give the
             // same DEFAULT to several rows.
@@ -659,6 +659,11 @@ void Database::PopulateRows(const std::string& table, int64_t n, uint32_t seed) 
                     } else {
                         r.push_back(Value::Text(std::string(words[rng() % 16]) + "_" + std::to_string(rng() % 1000)));
                     }
+                    break;
+                case TypeId::DATE: r.push_back(Value::Date(DaysFromCivil(2020, 1, 1) + static_cast<int64_t>(rng() % 3650))); break;
+                case TypeId::TIMESTAMP:
+                    r.push_back(Value::Timestamp(DaysFromCivil(2020, 1, 1) * kSecondsPerDay +
+                                                 static_cast<int64_t>(rng() % (3650 * kSecondsPerDay))));
                     break;
                 case TypeId::NULL_T: r.push_back(Value::Null()); break;
             }

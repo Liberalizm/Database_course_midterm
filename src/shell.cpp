@@ -34,7 +34,9 @@ SQL (end every statement with ';'):
   SAVEPOINT s;  ROLLBACK TO [SAVEPOINT] s;  RELEASE [SAVEPOINT] s;
   Operators: = <> < <= > >= AND OR NOT + - * / % || LIKE BETWEEN IN IS [NOT] NULL
   CASE [x] WHEN ... THEN ... [ELSE ...] END
-  Functions: ABS ROUND LENGTH UPPER LOWER SUBSTR COALESCE NULLIF
+  Types: INT DOUBLE TEXT BOOL DATE TIMESTAMP   literals: DATE '2024-01-31'  TIMESTAMP '2024-01-31 12:00:00'
+  Functions: ABS ROUND LENGTH UPPER LOWER SUBSTR COALESCE NULLIF  CAST(x AS type)
+             DATE(x) YEAR MONTH DAY HOUR MINUTE SECOND   date +/- days, timestamp +/- seconds, d1 - d2
   Subqueries (may refer to the outer row): (SELECT ...)  x [NOT] IN (SELECT ...)  [NOT] EXISTS (SELECT ...)
                              FROM (SELECT ...) alias
   Aggregates: COUNT(*) COUNT(x) SUM AVG MIN MAX, each also with DISTINCT: COUNT(DISTINCT x)
@@ -202,7 +204,7 @@ bool Shell::RunMeta(const std::string& line) {
                 out_ << "  " << c.name << "  " << TypeName(c.type) << (c.not_null ? "  NOT NULL" : "");
                 if (c.default_value) {
                     const Value& d = *c.default_value;
-                    out_ << "  DEFAULT " << (d.Type() == TypeId::TEXT ? "'" + d.AsText() + "'" : d.ToString());
+                    out_ << "  DEFAULT " << d.ToSqlLiteral();
                 }
                 out_ << "\n";
             }

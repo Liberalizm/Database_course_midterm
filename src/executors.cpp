@@ -125,9 +125,19 @@ std::string IndexScanExecutor::Describe() const {
     auto side = [&](const IndexBound& b) {
         return b.has2 ? "(" + col + ", " + col2 + ")" : col;
     };
-    auto value = [](const IndexBound& b) {
-        return b.has2 ? "(" + std::to_string(b.value) + ", " + std::to_string(b.value2) + ")"
-                      : std::to_string(b.value);
+    // A DATE / TIMESTAMP key is shown as a literal of its type, not as a number.
+    auto key_text = [&](int64_t k, size_t col_pos, bool hashed) {
+        TypeId t = table_->schema.At(static_cast<size_t>(index_->col_idxs[col_pos])).type;
+        if (hashed || !IsTemporal(t)) return std::to_string(k);
+        try {
+            return (t == TypeId::DATE ? Value::Date(k) : Value::Timestamp(k)).ToSqlLiteral();
+        } catch (const DbError&) {  // a sentinel bound outside the calendar
+            return std::to_string(k);
+        }
+    };
+    auto value = [&](const IndexBound& b) {
+        std::string v = key_text(b.value, 0, index_->hashed);
+        return b.has2 ? "(" + v + ", " + key_text(b.value2, 1, index_->Key2Hashed()) + ")" : v;
     };
     if (lo_ && hi_ && lo_->inclusive && hi_->inclusive && lo_->value == hi_->value && lo_->has2 == hi_->has2 &&
         (!lo_->has2 || lo_->value2 == hi_->value2)) {

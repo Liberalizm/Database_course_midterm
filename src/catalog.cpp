@@ -76,6 +76,8 @@ void WriteValue(Writer& w, const Value& v) {
         }
         case TypeId::BOOL: w.U8(v.AsBool() ? 1 : 0); break;
         case TypeId::TEXT: w.Str(v.AsText()); break;
+        case TypeId::DATE: w.I64(v.AsDays()); break;
+        case TypeId::TIMESTAMP: w.I64(v.AsSeconds()); break;
         case TypeId::NULL_T: break;
     }
 }
@@ -91,6 +93,8 @@ Value ReadValue(Reader& r) {
         }
         case TypeId::BOOL: return Value::Bool(r.U8() != 0);
         case TypeId::TEXT: return Value::Text(r.Str());
+        case TypeId::DATE: return Value::Date(r.I64());
+        case TypeId::TIMESTAMP: return Value::Timestamp(r.I64());
         case TypeId::NULL_T: return Value::Null();
     }
     throw DbError("catalog is corrupt (bad value type)");
@@ -284,7 +288,9 @@ void Catalog::Load() {
         for (uint32_t j = 0; j < nc; ++j) {
             Column c;
             c.name = r.Str();
-            c.type = static_cast<TypeId>(r.U8());
+            uint8_t type = r.U8();
+            if (type == 0 || type > kMaxTypeId) throw DbError("catalog is corrupt (bad column type)");
+            c.type = static_cast<TypeId>(type);
             c.not_null = r.U8() != 0;
             c.table = t->name;
             cols.push_back(c);
@@ -403,8 +409,8 @@ void Catalog::ResolveIndexColumns(IndexInfo* idx, const Schema& schema) {
         int col = schema.Find("", name);
         if (col < 0) throw DbError("column \"" + name + "\" does not exist in table \"" + idx->table + "\"");
         TypeId type = schema.At(static_cast<size_t>(col)).type;
-        if (type != TypeId::INT && type != TypeId::TEXT)
-            throw DbError("indexes are only supported on INT and TEXT columns (\"" + name + "\" is " + TypeName(type) +
+        if (!IsIndexable(type))
+            throw DbError("indexes are only supported on INT, TEXT, DATE and TIMESTAMP columns (\"" + name + "\" is " + TypeName(type) +
                           ")");
         idx->col_idxs.push_back(col);
     }
@@ -674,6 +680,8 @@ int64_t IndexKeyPart(const Value& v) {
     switch (v.Type()) {
         case TypeId::INT: return v.AsInt();
         case TypeId::TEXT: return HashTextKey(v.AsText());
+        case TypeId::DATE: return v.AsDays();
+        case TypeId::TIMESTAMP: return v.AsSeconds();
         default: throw DbError(std::string("internal: cannot index a ") + TypeName(v.Type()) + " value");
     }
 }

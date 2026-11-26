@@ -354,5 +354,81 @@ TEST(Expression, TreeHeightIsTrackedAndCapped) {
     EXPECT_THROW(Bin(BinOp::ADD, chain, C(I(1))), DbError);
 }
 
+// ---- DATE / TIMESTAMP ----
+
+Value Dt(const char* s) { return Value::Date(ParseDate(s)); }
+Value Ts(const char* s) { return Value::Timestamp(ParseTimestamp(s)); }
+Value Fn(const char* name, std::vector<ExprPtr> args) { return Eval(Expr::Func(name, std::move(args))); }
+
+TEST(Expression, DateArithmetic) {
+    EXPECT_EQ(Eval(Bin(BinOp::ADD, C(Dt("2024-02-28")), C(I(1)))).ToString(), "2024-02-29");
+    EXPECT_EQ(Eval(Bin(BinOp::ADD, C(I(2)), C(Dt("2023-12-31")))).ToString(), "2024-01-02");
+    EXPECT_EQ(Eval(Bin(BinOp::SUB, C(Dt("2024-03-01")), C(I(1)))).ToString(), "2024-02-29");
+    Value diff = Eval(Bin(BinOp::SUB, C(Dt("2025-01-01")), C(Dt("2024-01-01"))));
+    EXPECT_EQ(diff.Type(), TypeId::INT);
+    EXPECT_EQ(diff.AsInt(), 366);
+    EXPECT_EQ(Eval(Bin(BinOp::ADD, C(Dt("2024-01-01")), C(N()))).IsNull(), true);
+}
+
+TEST(Expression, TimestampArithmetic) {
+    EXPECT_EQ(Eval(Bin(BinOp::ADD, C(Ts("2024-01-01 23:59:30")), C(I(45)))).ToString(), "2024-01-02 00:00:15");
+    EXPECT_EQ(Eval(Bin(BinOp::SUB, C(Ts("2024-01-02 00:00:00")), C(Dt("2024-01-01")))).AsInt(), 86400);
+    EXPECT_EQ(Eval(Bin(BinOp::SUB, C(Ts("2024-01-01 00:00:00")), C(Ts("2024-01-01 01:00:00")))).AsInt(), -3600);
+}
+
+TEST(Expression, InvalidTemporalArithmeticIsAnError) {
+    EXPECT_THROW(Eval(Bin(BinOp::ADD, C(Dt("2024-01-01")), C(Dt("2024-01-01")))), DbError);
+    EXPECT_THROW(Eval(Bin(BinOp::MUL, C(Dt("2024-01-01")), C(I(2)))), DbError);
+    EXPECT_THROW(Eval(Bin(BinOp::SUB, C(I(2)), C(Dt("2024-01-01")))), DbError);
+    EXPECT_THROW(Eval(Bin(BinOp::ADD, C(Dt("2024-01-01")), C(D(1.5)))), DbError);
+    EXPECT_THROW(Eval(Bin(BinOp::ADD, C(Dt("9999-12-31")), C(I(1)))), DbError) << "past year 9999";
+    EXPECT_THROW(Eval(Bin(BinOp::ADD, C(Dt("2024-01-01")), C(I(INT64_MAX)))), DbError) << "overflow";
+}
+
+TEST(Expression, DateParts) {
+    std::vector<std::pair<const char*, int64_t>> want = {{"year", 2024}, {"month", 2},   {"day", 29},
+                                                         {"hour", 13},   {"minute", 5}, {"second", 9}};
+    for (auto& [fn, v] : want) EXPECT_EQ(Fn(fn, {C(Ts("2024-02-29 13:05:09"))}).AsInt(), v) << fn;
+    EXPECT_EQ(Fn("hour", {C(Dt("2024-02-29"))}).AsInt(), 0);
+    EXPECT_EQ(Fn("year", {C(Ts("1969-12-31 23:00:00"))}).AsInt(), 1969);
+    EXPECT_EQ(Fn("hour", {C(Ts("1969-12-31 23:00:00"))}).AsInt(), 23);
+    EXPECT_TRUE(Fn("year", {C(N())}).IsNull());
+    EXPECT_THROW(Fn("year", {C(T("2024-01-01"))}), DbError);
+}
+
+TEST(Expression, DateFunction) {
+    EXPECT_EQ(Fn("date", {C(Ts("2024-02-29 13:05:09"))}).ToString(), "2024-02-29");
+    EXPECT_EQ(Fn("date", {C(T("2024-02-29"))}).Type(), TypeId::DATE);
+    EXPECT_THROW(Fn("date", {C(I(1))}), DbError);
+}
+
+ExprPtr Cast(ExprPtr x, TypeId t) { return Expr::Func("cast", {std::move(x), C(I(static_cast<int64_t>(t)))}); }
+
+TEST(Expression, Cast) {
+    EXPECT_EQ(Eval(Cast(C(T(" 42 ")), TypeId::INT)).AsInt(), 42);
+    EXPECT_DOUBLE_EQ(Eval(Cast(C(T("2.5")), TypeId::DOUBLE)).AsDouble(), 2.5);
+    EXPECT_EQ(Eval(Cast(C(T("TRUE")), TypeId::BOOL)).AsBool(), true);
+    EXPECT_EQ(Eval(Cast(C(I(0)), TypeId::BOOL)).AsBool(), false);
+    EXPECT_EQ(Eval(Cast(C(B(true)), TypeId::INT)).AsInt(), 1);
+    EXPECT_EQ(Eval(Cast(C(D(3.9)), TypeId::INT)).AsInt(), 3);
+    EXPECT_EQ(Eval(Cast(C(I(7)), TypeId::TEXT)).AsText(), "7");
+    EXPECT_EQ(Eval(Cast(C(Dt("2024-01-02")), TypeId::TEXT)).AsText(), "2024-01-02");
+    EXPECT_EQ(Eval(Cast(C(T("2024-01-02")), TypeId::TIMESTAMP)).ToString(), "2024-01-02 00:00:00");
+    EXPECT_EQ(Eval(Cast(C(Ts("2024-01-02 10:00:00")), TypeId::DATE)).ToString(), "2024-01-02");
+    EXPECT_TRUE(Eval(Cast(C(N()), TypeId::INT)).IsNull());
+    for (const char* bad : {"4x", "", "99999999999999999999", "1.5"})
+        EXPECT_THROW(Eval(Cast(C(T(bad)), TypeId::INT)), DbError) << bad;
+    EXPECT_THROW(Eval(Cast(C(T("nope")), TypeId::BOOL)), DbError);
+    EXPECT_THROW(Eval(Cast(C(I(1)), TypeId::DATE)), DbError);
+    EXPECT_THROW(Eval(Cast(C(Dt("2024-01-01")), TypeId::INT)), DbError);
+    EXPECT_EQ(Cast(C(T("1")), TypeId::INT)->ToString(), "CAST('1' AS INT)");
+}
+
+TEST(Expression, TemporalConstantsPrintAsLiterals) {
+    EXPECT_EQ(C(Dt("2024-01-02"))->ToString(), "DATE '2024-01-02'");
+    EXPECT_EQ(C(Ts("2024-01-02 03:04:05"))->ToString(), "TIMESTAMP '2024-01-02 03:04:05'");
+    EXPECT_EQ(C(T("it's"))->ToString(), "'it''s'");
+}
+
 }  // namespace
 }  // namespace minidb

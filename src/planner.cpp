@@ -78,7 +78,7 @@ bool MatchKeyPredicate(const Expr& e, const std::string& alias, const std::strin
     if (c->table != alias || c->column != column) return false;
     if (k->value.Type() != type) return false;
     if (type == TypeId::TEXT && o != BinOp::EQ) return false;
-    if (type != TypeId::TEXT && type != TypeId::INT) return false;
+    if (!IsIndexable(type)) return false;
     *op = o;
     *constant = &k->value;
     return true;

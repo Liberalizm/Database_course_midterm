@@ -37,7 +37,7 @@ Type `.help` in the shell for the SQL summary and the meta commands
 
 | Area | Supported |
 |---|---|
-| Types | `INT` (64-bit), `DOUBLE`, `TEXT`, `BOOL`, `NULL` |
+| Types | `INT` (64-bit), `DOUBLE`, `TEXT`, `BOOL`, `DATE`, `TIMESTAMP` (second precision, no time zone, years 1-9999), `NULL`; literals `DATE '2024-01-31'`, `TIMESTAMP '2024-01-31 12:00:00'`, and text in a date context (`d >= '2024-01-01'`) |
 | DDL | `CREATE TABLE` with `PRIMARY KEY`, `UNIQUE`, `NOT NULL`, `DEFAULT`, `REFERENCES` / `FOREIGN KEY`, and composite `PRIMARY KEY (a, b)` / `UNIQUE (a, b)` table constraints; `CREATE [UNIQUE] INDEX` on one or more columns; `CREATE [OR REPLACE] VIEW v [(cols)] AS SELECT ...`; `DROP TABLE / INDEX / VIEW`; `ALTER TABLE ADD / DROP / RENAME [COLUMN]`, `RENAME TO`, `ADD [CONSTRAINT n] FOREIGN KEY`, `DROP CONSTRAINT` |
 | Foreign keys | single-column, to a `PRIMARY KEY` or `UNIQUE` column (the primary key if none is named); `ON DELETE` / `ON UPDATE` `NO ACTION` (default), `RESTRICT`, `CASCADE`, `SET NULL`, `SET DEFAULT`; self-references; checked at the end of each statement |
 | DML | `INSERT ... VALUES / SELECT`, `UPDATE`, `DELETE` — each statement is atomic |
@@ -46,7 +46,7 @@ Type `.help` in the shell for the SQL summary and the meta commands
 | Set operations | `UNION`, `INTERSECT`, `EXCEPT`, each with or without `ALL` |
 | Subqueries | scalar `(SELECT ...)`, `x [NOT] IN (SELECT ...)`, `[NOT] EXISTS (...)`, derived tables `FROM (SELECT ...) alias`; correlated subqueries (referring to the outer row) in `WHERE` (also of `UPDATE` / `DELETE`), `HAVING`, the select list and `UPDATE ... SET` (the row being updated); subqueries in `INSERT ... VALUES` may be correlated within themselves |
 | Expressions | arithmetic (overflow-checked), comparisons, `AND / OR / NOT` with three-valued logic, `LIKE`, `BETWEEN`, `IN (list)`, `IS [NOT] NULL`, `||`, `CASE` |
-| Functions | `ABS`, `ROUND`, `LENGTH`, `UPPER`, `LOWER`, `SUBSTR`, `COALESCE`, `NULLIF` |
+| Functions | `ABS`, `ROUND`, `LENGTH`, `UPPER`, `LOWER`, `SUBSTR`, `COALESCE`, `NULLIF`, `CAST(x AS type)`, `DATE(x)`, `YEAR`, `MONTH`, `DAY`, `HOUR`, `MINUTE`, `SECOND`; date `+`/`-` days, timestamp `+`/`-` seconds, `d1 - d2` (days) |
 | Aggregates | `COUNT(*)`, `COUNT / SUM / AVG / MIN / MAX`, each also with `DISTINCT` |
 | Tools | `EXPLAIN` and `EXPLAIN ANALYZE` |
 
@@ -132,7 +132,7 @@ slots are also validated on access, so a bad page that somehow has a valid
 checksum still produces an error rather than a crash.
 
 **Indexes.** A B+ tree whose entries are (key, RID) pairs, which makes
-non-unique indexes natural. `INT` columns are indexed by value (equality and
+non-unique indexes natural. `INT`, `DATE` and `TIMESTAMP` columns are indexed by value (equality and
 range scans); `TEXT` columns by a 64-bit FNV-1a hash (equality only). Hashes
 can collide, so uniqueness checks compare the real values and index scans
 re-check the condition. Deletes are lazy (nodes are never merged).
@@ -252,7 +252,7 @@ process crashes, but not if the machine loses power.
   columns are applied after the view's rows are produced.
 - Joins are left-deep: no parenthesized joins, and a `RIGHT` / `FULL JOIN`
   cannot follow a comma-separated `FROM` list (write `CROSS JOIN` instead).
-- Indexes on `INT` and `TEXT` columns only. A multi-column index is not used
+- Indexes on `INT`, `TEXT`, `DATE` and `TIMESTAMP` columns only. A multi-column index is not used
   for a range on a column after the second, or on a `TEXT` column.
 - Foreign keys are single-column (they cannot reference a composite
   key), and `RESTRICT` behaves like `NO ACTION` (both are checked at the

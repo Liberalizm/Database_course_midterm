@@ -36,7 +36,7 @@ std::string Expr::ToString() const {
     };
     switch (kind) {
         case ExprKind::CONST:
-            return value.Type() == TypeId::TEXT ? "'" + value.AsText() + "'" : value.ToString();
+            return value.ToSqlLiteral();
         case ExprKind::COLUMN: return table.empty() ? column : table + "." + column;
         case ExprKind::BINARY: return wrap(left) + " " + BinOpSymbol(op) + " " + wrap(right);
         case ExprKind::UNARY: return (uop == UnaryOp::NOT ? "NOT " : "-") + wrap(left);
@@ -62,6 +62,8 @@ std::string Expr::ToString() const {
             return wrap(left) + (negated ? " NOT IN " : " IN ") + "(" + std::to_string(in_set->size() + (in_set_has_null ? 1 : 0)) + " values)";
         case ExprKind::FUNC: {
             std::string s;
+            if (func == "cast")
+                return "CAST(" + args[0]->ToString() + " AS " + TypeName(static_cast<TypeId>(args[1]->value.AsInt())) + ")";
             if (func == "case") {
                 s = "CASE";
                 size_t i = 0;
@@ -147,8 +149,27 @@ bool LikeMatch(const std::string& s, const std::string& p) {
 
 namespace {
 
+// DATE +/- INT days, TIMESTAMP +/- INT seconds, and the difference of two
+// dates (in days) or of two timestamps (in seconds; a DATE counts as midnight).
+Value TemporalArithmetic(BinOp op, const Value& l, const Value& r) {
+    auto shift = [](const Value& t, int64_t n) {
+        return t.Type() == TypeId::DATE ? Value::Date(checked::Add(t.AsDays(), n))
+                                        : Value::Timestamp(checked::Add(t.AsSeconds(), n));
+    };
+    if (op == BinOp::ADD && IsTemporal(l.Type()) && r.Type() == TypeId::INT) return shift(l, r.AsInt());
+    if (op == BinOp::ADD && l.Type() == TypeId::INT && IsTemporal(r.Type())) return shift(r, l.AsInt());
+    if (op == BinOp::SUB && IsTemporal(l.Type()) && r.Type() == TypeId::INT) return shift(l, checked::Neg(r.AsInt()));
+    if (op == BinOp::SUB && IsTemporal(l.Type()) && IsTemporal(r.Type())) {
+        if (l.Type() == TypeId::DATE && r.Type() == TypeId::DATE) return Value::Int(checked::Sub(l.AsDays(), r.AsDays()));
+        return Value::Int(checked::Sub(l.AsSeconds(), r.AsSeconds()));
+    }
+    throw DbError(std::string("operator ") + BinOpSymbol(op) + " is not defined for " + TypeName(l.Type()) + " and " +
+                  TypeName(r.Type()));
+}
+
 Value Arithmetic(BinOp op, const Value& l, const Value& r) {
     if (l.IsNull() || r.IsNull()) return Value::Null();
+    if (IsTemporal(l.Type()) || IsTemporal(r.Type())) return TemporalArithmetic(op, l, r);
     if (!l.IsNumeric() || !r.IsNumeric())
         throw DbError(std::string("operator ") + BinOpSymbol(op) + " requires numeric operands, got " +
                       TypeName(l.Type()) + " and " + TypeName(r.Type()));
@@ -204,6 +225,54 @@ int64_t IntArg(const Value& v, const std::string& fn) {
     return v.AsInt();
 }
 
+// CAST(v AS t). Unlike the implicit conversion on store (Value::CastTo), this
+// also converts between TEXT and the other types.
+Value CastValue(const Value& v, TypeId t) {
+    if (v.IsNull() || v.Type() == t) return v;
+    auto fail = [&]() -> Value {
+        throw DbError(std::string("cannot cast ") + TypeName(v.Type()) + " value '" + v.ToString() + "' to " +
+                      TypeName(t));
+    };
+    if (t == TypeId::TEXT) return Value::Text(v.ToString());
+    if (v.Type() == TypeId::TEXT) {
+        const std::string& s = v.AsText();
+        size_t b = s.find_first_not_of(" \t"), e = s.find_last_not_of(" \t");
+        std::string x = b == std::string::npos ? "" : s.substr(b, e - b + 1);
+        size_t used = 0;
+        switch (t) {
+            case TypeId::INT:
+                try {
+                    int64_t i = std::stoll(x, &used);
+                    if (used == x.size()) return Value::Int(i);
+                } catch (const std::exception&) {
+                }
+                return fail();
+            case TypeId::DOUBLE:
+                try {
+                    double d = std::stod(x, &used);
+                    if (used == x.size() && std::isfinite(d)) return Value::Double(d);
+                } catch (const std::exception&) {
+                }
+                return fail();
+            case TypeId::BOOL: {
+                std::string l = x;
+                for (char& c : l) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                if (l == "true" || l == "t" || l == "1") return Value::Bool(true);
+                if (l == "false" || l == "f" || l == "0") return Value::Bool(false);
+                return fail();
+            }
+            case TypeId::DATE: return Value::Date(ParseDate(x));
+            case TypeId::TIMESTAMP: return Value::Timestamp(ParseTimestamp(x));
+            default: return fail();
+        }
+    }
+    if (t == TypeId::BOOL && v.Type() == TypeId::INT) return Value::Bool(v.AsInt() != 0);
+    if (t == TypeId::INT && v.Type() == TypeId::BOOL) return Value::Int(v.AsBool() ? 1 : 0);
+    const bool numeric = (t == TypeId::INT || t == TypeId::DOUBLE) && v.IsNumeric();
+    if (numeric || (IsTemporal(t) && IsTemporal(v.Type()))) return v.CastTo(t);
+    return fail();
+}
+
 // Scalar functions and CASE. The parser has already checked the argument counts.
 Value EvaluateFunction(const Expr& e, const Row& row) {
     const std::string& fn = e.func;
@@ -253,6 +322,30 @@ Value EvaluateFunction(const Expr& e, const Row& row) {
         double r = std::round(v[0].AsDouble() * scale) / scale;
         if (!std::isfinite(r)) throw DbError("value out of range: overflow");
         return v[0].Type() == TypeId::INT ? Value::Int(checked::FromDouble(r)) : Value::Double(r);
+    }
+    if (fn == "cast") return CastValue(v[0], static_cast<TypeId>(Evaluate(*args[1], row).AsInt()));
+    if (fn == "date") {
+        if (v[0].Type() != TypeId::TEXT && !IsTemporal(v[0].Type()))
+            throw DbError("function date requires a TEXT, DATE or TIMESTAMP argument, not " +
+                          std::string(TypeName(v[0].Type())));
+        return v[0].CastTo(TypeId::DATE);
+    }
+    if (fn == "year" || fn == "month" || fn == "day" || fn == "hour" || fn == "minute" || fn == "second") {
+        if (!IsTemporal(v[0].Type()))
+            throw DbError("function " + fn + " requires a DATE or TIMESTAMP argument, not " +
+                          std::string(TypeName(v[0].Type())));
+        const int64_t secs = v[0].AsSeconds();
+        const int64_t days = secs / kSecondsPerDay - (secs % kSecondsPerDay < 0);
+        const int64_t in_day = secs - days * kSecondsPerDay;
+        int64_t y;
+        unsigned m, d;
+        CivilFromDays(days, &y, &m, &d);
+        if (fn == "year") return Value::Int(y);
+        if (fn == "month") return Value::Int(m);
+        if (fn == "day") return Value::Int(d);
+        if (fn == "hour") return Value::Int(in_day / 3600);
+        if (fn == "minute") return Value::Int(in_day / 60 % 60);
+        return Value::Int(in_day % 60);
     }
     if (fn == "length") return Value::Int(static_cast<int64_t>(TextArg(v[0], fn).size()));
     if (fn == "upper" || fn == "lower") {

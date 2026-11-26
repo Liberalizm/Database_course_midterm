@@ -26,12 +26,14 @@ tests/
 ├── integration/             whole engine via the Database API (SQL in, rows out)
 │   ├── test_sql.cpp         DDL/DML, constraints, index consistency, index-vs-scan
 │   ├── test_persistence.cpp data survives restarts; crash at every point of the log; rollback on I/O errors
+│   ├── test_temporal.cpp    DATE / TIMESTAMP: storage, comparison, arithmetic, indexes, reopen
 │   ├── test_foreign_keys.cpp FOREIGN KEY checks, actions, DDL guards, randomized invariants
 │   └── test_transactions.cpp BEGIN/COMMIT/ROLLBACK, savepoints, crash at every write, model check
 └── e2e/                     the real shell binary, compared to golden output
     ├── run_case.cmake       runner: N.sql -> compare with N.expected
     ├── basic/               queries, joins, aggregates, EXPLAIN
     ├── advanced/            LEFT JOIN, functions, subqueries, set ops, TEXT keys, ALTER TABLE
+    ├── dates/               DATE / TIMESTAMP columns, functions, CAST, index (2 steps: restart)
     ├── composite/           composite PRIMARY KEY / UNIQUE, multi-column indexes (2 steps: restart)
     ├── errors/              error messages; the shell keeps going after errors
     ├── foreign_keys/        referential actions, .schema, constraints after a restart
