@@ -170,6 +170,18 @@ TEST(Parser, Subqueries) {
     EXPECT_THROW(ParseExpr("(SELECT 1"), DbError);
 }
 
+TEST(Parser, ColumnDefaults) {
+    auto c = ParseOne<CreateTableStmt>("CREATE TABLE t (a INT DEFAULT -1 NOT NULL, b TEXT DEFAULT 'x' || 'y', c INT)");
+    ASSERT_EQ(c.cols.size(), 3u);
+    ASSERT_TRUE(c.cols[0].default_expr);
+    EXPECT_EQ(c.cols[0].default_expr->value.AsInt(), -1);
+    EXPECT_TRUE(c.cols[0].not_null) << "NOT NULL after DEFAULT is still a constraint";
+    EXPECT_EQ(c.cols[1].default_expr->ToString(), "'x' || 'y'");
+    EXPECT_FALSE(c.cols[2].default_expr);
+    EXPECT_TRUE(ParseOne<AlterTableStmt>("ALTER TABLE t ADD n INT DEFAULT 0").column.default_expr);
+    EXPECT_THROW(Parser("CREATE TABLE t (a INT DEFAULT)").ParseAll(), DbError);
+}
+
 TEST(Parser, AlterTable) {
     using A = AlterTableStmt::Action;
     auto add = ParseOne<AlterTableStmt>("ALTER TABLE t ADD COLUMN email TEXT UNIQUE");

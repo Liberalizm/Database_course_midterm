@@ -267,6 +267,10 @@ ColumnDef Parser::ParseColumnDef() {
             d.not_null = true;
         } else if (AcceptKw("unique")) {
             d.unique = true;
+        } else if (AcceptKw("default")) {
+            // A full comparison would swallow e.g. "NOT NULL" after it, so the
+            // default is an arithmetic / string expression (|| level).
+            d.default_expr = ParseConcat();
         } else if (AcceptKw("null")) {
         } else {
             break;

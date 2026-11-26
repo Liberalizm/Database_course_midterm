@@ -143,6 +143,7 @@ struct ColumnDef {
     bool primary_key = false;
     bool not_null = false;
     bool unique = false;
+    ExprPtr default_expr;  // DEFAULT <constant expression>
 };
 
 struct CreateTableStmt {

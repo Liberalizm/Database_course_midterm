@@ -62,6 +62,40 @@ struct Reader {
 constexpr size_t CAT_HDR = 8;
 constexpr size_t CAT_CAP = PAGE_SIZE - CAT_HDR;
 
+// A Value in the catalog: [type u8][payload] (INT / DOUBLE 8 bytes, BOOL 1, TEXT string).
+void WriteValue(Writer& w, const Value& v) {
+    w.U8(static_cast<uint8_t>(v.Type()));
+    switch (v.Type()) {
+        case TypeId::INT: w.I64(v.AsInt()); break;
+        case TypeId::DOUBLE: {
+            double d = v.AsDouble();
+            int64_t bits;
+            std::memcpy(&bits, &d, sizeof bits);
+            w.I64(bits);
+            break;
+        }
+        case TypeId::BOOL: w.U8(v.AsBool() ? 1 : 0); break;
+        case TypeId::TEXT: w.Str(v.AsText()); break;
+        case TypeId::NULL_T: break;
+    }
+}
+
+Value ReadValue(Reader& r) {
+    switch (static_cast<TypeId>(r.U8())) {
+        case TypeId::INT: return Value::Int(r.I64());
+        case TypeId::DOUBLE: {
+            int64_t bits = r.I64();
+            double d;
+            std::memcpy(&d, &bits, sizeof d);
+            return Value::Double(d);
+        }
+        case TypeId::BOOL: return Value::Bool(r.U8() != 0);
+        case TypeId::TEXT: return Value::Text(r.Str());
+        case TypeId::NULL_T: return Value::Null();
+    }
+    throw DbError("catalog is corrupt (bad value type)");
+}
+
 }  // namespace
 
 Catalog::Catalog(BufferPoolManager* bpm) : bpm_(bpm) {
@@ -164,6 +198,21 @@ std::string Catalog::Serialize() const {
     // section existed simply end here; Load treats that as "no free pages".
     w.U32(static_cast<uint32_t>(bpm_->FreePages().size()));
     for (page_id_t p : bpm_->FreePages()) w.I32(p);
+    // Column DEFAULT values: [count u32] then (table, column index, value) each.
+    // Also appended last, so older files (without the section) still load.
+    uint32_t ndefaults = 0;
+    for (auto& [name, t] : tables_)
+        for (const auto& c : t->schema.Columns()) ndefaults += c.default_value ? 1 : 0;
+    w.U32(ndefaults);
+    for (auto& [name, t] : tables_) {
+        for (size_t i = 0; i < t->schema.Size(); ++i) {
+            const Column& c = t->schema.At(i);
+            if (!c.default_value) continue;
+            w.Str(t->name);
+            w.U32(static_cast<uint32_t>(i));
+            WriteValue(w, *c.default_value);
+        }
+    }
     return std::move(w.buf);
 }
 
@@ -230,6 +279,18 @@ void Catalog::Load() {
         }
     }
     bpm_->SetFreePages(std::move(free_pages));
+    if (r.pos < data.size()) {  // absent in files from before DEFAULT existed
+        uint32_t nd = r.U32();
+        for (uint32_t i = 0; i < nd; ++i) {
+            TableInfo* t = RequireTable(r.Str());
+            uint32_t col = r.U32();
+            Value v = ReadValue(r);
+            if (col >= t->schema.Size()) throw DbError("catalog is corrupt (bad DEFAULT)");
+            std::vector<Column> cols = t->schema.Columns();
+            cols[col].default_value = std::move(v);
+            t->schema = Schema(std::move(cols));
+        }
+    }
 }
 
 TableInfo* Catalog::CreateTable(const std::string& name, std::vector<Column> cols) {

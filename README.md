@@ -35,7 +35,7 @@ SQL summary and the meta commands (`.tables`, `.schema t`, `.indexes`,
 | Area | Supported |
 |---|---|
 | Types | `INT` (64-bit), `DOUBLE`, `TEXT`, `BOOL`, `NULL` |
-| DDL | `CREATE TABLE` with `PRIMARY KEY`, `UNIQUE`, `NOT NULL`; `CREATE [UNIQUE] INDEX`; `DROP TABLE / INDEX`; `ALTER TABLE ADD / DROP / RENAME [COLUMN]`, `RENAME TO` |
+| DDL | `CREATE TABLE` with `PRIMARY KEY`, `UNIQUE`, `NOT NULL`, `DEFAULT`; `CREATE [UNIQUE] INDEX`; `DROP TABLE / INDEX`; `ALTER TABLE ADD / DROP / RENAME [COLUMN]`, `RENAME TO` |
 | DML | `INSERT ... VALUES / SELECT`, `UPDATE`, `DELETE` — each statement is atomic |
 | Queries | `SELECT [DISTINCT]`, `WHERE`, `[INNER] JOIN`, `LEFT [OUTER] JOIN`, `CROSS JOIN` / comma joins, `GROUP BY`, `HAVING`, `ORDER BY` (names, aliases, positions), `LIMIT` / `OFFSET` |
 | Set operations | `UNION`, `INTERSECT`, `EXCEPT`, each with or without `ALL` |
@@ -122,7 +122,7 @@ the middle of a statement can leave it partially written.
 - No transactions or concurrency: one connection, autocommit only.
 - No write-ahead log (see above) and no page checksums.
 - Subqueries cannot refer to columns of the outer query (correlated).
-- No `RIGHT` / `FULL` joins, `DEFAULT` values, foreign keys or views.
+- No `RIGHT` / `FULL` joins, foreign keys or views; `DEFAULT` must be a constant.
 - Indexes on `INT` and `TEXT` columns only; one column per index.
 - B+ tree nodes are not merged after deletes.
 

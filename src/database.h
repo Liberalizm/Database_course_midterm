@@ -42,6 +42,7 @@ private:
     QueryResult RunCreateIndex(const CreateIndexStmt& s);
     QueryResult RunDrop(const DropStmt& s);
     QueryResult RunAlterTable(const AlterTableStmt& s);
+    std::optional<Value> EvalDefault(const ColumnDef& d);
     QueryResult RunInsert(const InsertStmt& s);
     QueryResult RunSelect(const SelectStmt& s);
     QueryResult RunDelete(const DeleteStmt& s);

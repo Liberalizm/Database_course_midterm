@@ -512,6 +512,45 @@ TEST_F(SqlTest, AlterTableOnEmptyTableAllowsNotNullAndPrimaryKey) {
     EXPECT_EQ(Scalar("SELECT id FROM t"), 10) << "id was added after a: VALUES (1, 10) set a = 1, id = 10";
 }
 
+TEST_F(SqlTest, ColumnDefaults) {
+    db->Execute("CREATE TABLE orders (id INT PRIMARY KEY, status TEXT NOT NULL DEFAULT 'new', qty INT DEFAULT 2 * 5, "
+                "paid BOOL DEFAULT FALSE, note TEXT)");
+    db->Execute("INSERT INTO orders (id) VALUES (1)");
+    auto r = Q("SELECT status, qty, paid, note FROM orders WHERE id = 1");
+    EXPECT_EQ(r[0][0].AsText(), "new");
+    EXPECT_EQ(r[0][1].AsInt(), 10) << "a constant expression, evaluated once";
+    EXPECT_FALSE(r[0][2].AsBool());
+    EXPECT_TRUE(r[0][3].IsNull()) << "no DEFAULT -> NULL";
+    db->Execute("INSERT INTO orders (id, qty) VALUES (2, NULL)");
+    EXPECT_TRUE(Q("SELECT qty FROM orders WHERE id = 2")[0][0].IsNull()) << "an explicit NULL is not replaced";
+    EXPECT_THROW(db->Execute("INSERT INTO orders (id, status) VALUES (3, NULL)"), DbError) << "NOT NULL still applies";
+    db->Execute("CREATE TABLE src (k INT)");
+    db->Execute("INSERT INTO src VALUES (7), (8)");
+    EXPECT_EQ(Msg("INSERT INTO orders (id) SELECT k FROM src"), "INSERT 2");
+    EXPECT_EQ(Scalar("SELECT COUNT(*) FROM orders WHERE status = 'new'"), 4) << "ids 1, 2, 7, 8";
+
+    // ALTER TABLE ADD with a DEFAULT fills the existing rows, so NOT NULL works on a non-empty table.
+    EXPECT_EQ(Msg("ALTER TABLE orders ADD COLUMN priority INT NOT NULL DEFAULT 3"), "ALTER TABLE");
+    EXPECT_EQ(Scalar("SELECT COUNT(*) FROM orders WHERE priority = 3"), 4);
+    EXPECT_THROW(db->Execute("ALTER TABLE orders ADD COLUMN code INT UNIQUE DEFAULT 1"), DbError)
+        << "the same default in every row would violate UNIQUE";
+    EXPECT_EQ(Msg("ALTER TABLE orders ADD COLUMN code INT UNIQUE"), "ALTER TABLE") << "NULLs do not conflict";
+
+    // Invalid defaults.
+    EXPECT_THROW(db->Execute("CREATE TABLE bad (a INT DEFAULT b, b INT)"), DbError) << "not a constant";
+    EXPECT_THROW(db->Execute("CREATE TABLE bad (a INT NOT NULL DEFAULT NULL)"), DbError);
+    EXPECT_THROW(db->Execute("CREATE TABLE bad (a INT DEFAULT 'text')"), DbError);
+    EXPECT_THROW(db->Execute("CREATE TABLE bad (a INT DEFAULT 1 / 0)"), DbError);
+    EXPECT_EQ(db->GetCatalog().GetTable("bad"), nullptr);
+
+    // Defaults survive a restart.
+    db.reset();
+    db = std::make_unique<Database>(file.path(), 64);
+    db->Execute("INSERT INTO orders (id) VALUES (99)");
+    EXPECT_EQ(Q("SELECT status FROM orders WHERE id = 99")[0][0].AsText(), "new");
+    EXPECT_EQ(Scalar("SELECT priority FROM orders WHERE id = 99"), 3);
+}
+
 TEST_F(SqlTest, QuotedIdentifiersAreNeverKeywords) {
     db->Execute("CREATE TABLE \"select\" (\"left\" INT, \"right\" TEXT, \"null\" INT)");
     db->Execute("INSERT INTO \"select\" (\"left\", \"right\", \"null\") VALUES (1, 'r', 7)");

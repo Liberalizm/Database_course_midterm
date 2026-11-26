@@ -15,7 +15,7 @@ namespace {
 const char* kHelp = R"(MiniDB - a relational database written from scratch.
 
 SQL (end every statement with ';'):
-  CREATE TABLE t (id INT PRIMARY KEY, name TEXT, score DOUBLE, ok BOOL);
+  CREATE TABLE t (id INT PRIMARY KEY, name TEXT NOT NULL DEFAULT '?', score DOUBLE, ok BOOL);
   CREATE [UNIQUE] INDEX idx ON t (col);        DROP TABLE t;  DROP INDEX idx;
   ALTER TABLE t ADD [COLUMN] c TYPE [UNIQUE] | DROP [COLUMN] c | RENAME [COLUMN] a TO b | RENAME TO u;
   INSERT INTO t VALUES (1, 'a', 2.5, true), (2, 'b', NULL, false);
@@ -176,8 +176,14 @@ bool Shell::RunMeta(const std::string& line) {
             in >> name;
             TableInfo* t = db_.GetCatalog().RequireTable(name);
             out_ << "Table \"" << t->name << "\"\n";
-            for (const auto& c : t->schema.Columns())
-                out_ << "  " << c.name << "  " << TypeName(c.type) << (c.not_null ? "  NOT NULL" : "") << "\n";
+            for (const auto& c : t->schema.Columns()) {
+                out_ << "  " << c.name << "  " << TypeName(c.type) << (c.not_null ? "  NOT NULL" : "");
+                if (c.default_value) {
+                    const Value& d = *c.default_value;
+                    out_ << "  DEFAULT " << (d.Type() == TypeId::TEXT ? "'" + d.AsText() + "'" : d.ToString());
+                }
+                out_ << "\n";
+            }
             for (IndexInfo* i : db_.GetCatalog().IndexesOf(name))
                 out_ << "  index " << i->name << " (" << i->column << ")" << (i->unique ? " UNIQUE" : "") << " btree\n";
         } else if (cmd == ".stats") {

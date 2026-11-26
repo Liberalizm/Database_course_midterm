@@ -65,6 +65,23 @@ QueryResult Database::Run(const Statement& stmt) {
     return r;
 }
 
+// Evaluates a column's DEFAULT once, when the column is defined: it must be a
+// constant expression, it is stored cast to the column type, and a NOT NULL
+// column cannot default to NULL.
+std::optional<Value> Database::EvalDefault(const ColumnDef& d) {
+    if (!d.default_expr) return std::nullopt;
+    if (ContainsAggregate(*d.default_expr)) throw DbError("DEFAULT cannot contain aggregate functions");
+    Value v;
+    try {
+        v = Evaluate(*BindExpr(planner_->ResolveSubqueries(d.default_expr), Schema{}), {});
+    } catch (const DbError& e) {
+        throw DbError("invalid DEFAULT for column \"" + d.name + "\" (it must be a constant): " + e.what());
+    }
+    v = v.CastTo(d.type);
+    if (v.IsNull() && d.not_null) throw DbError("column \"" + d.name + "\" is NOT NULL but its DEFAULT is NULL");
+    return v;
+}
+
 QueryResult Database::RunCreateTable(const CreateTableStmt& s) {
     std::vector<Column> cols;
     std::string pk;
@@ -73,6 +90,7 @@ QueryResult Database::RunCreateTable(const CreateTableStmt& s) {
         c.name = d.name;
         c.type = d.type;
         c.not_null = d.not_null;
+        c.default_value = EvalDefault(d);
         cols.push_back(c);
         if (d.primary_key) {
             if (!pk.empty()) throw DbError("multiple primary keys for table \"" + s.name + "\" are not allowed");
@@ -108,11 +126,16 @@ QueryResult Database::RunAlterTable(const AlterTableStmt& s) {
                 throw DbError("column \"" + d.name + "\" of relation \"" + s.table + "\" already exists");
             if ((d.primary_key || d.unique) && d.type != TypeId::INT && d.type != TypeId::TEXT)
                 throw DbError("PRIMARY KEY / UNIQUE is only supported on INT and TEXT columns");
-            // Existing rows get NULL in the new column (DEFAULT is not supported),
-            // so NOT NULL / PRIMARY KEY are only possible while the table is empty.
-            if (d.not_null && t->row_count > 0)
+            // Existing rows get the DEFAULT (or NULL), so NOT NULL needs a non-NULL
+            // DEFAULT unless the table is empty, and a UNIQUE column cannot give the
+            // same DEFAULT to several rows.
+            std::optional<Value> def = EvalDefault(d);
+            bool null_fill = !def || def->IsNull();
+            if (d.not_null && null_fill && t->row_count > 0)
                 throw DbError("column \"" + d.name + "\" cannot be NOT NULL: \"" + s.table +
-                              "\" already has rows, which would get NULL");
+                              "\" already has rows, which would get NULL (add a DEFAULT)");
+            if ((d.unique || d.primary_key) && !null_fill && t->row_count > 1)
+                throw DbError("column \"" + d.name + "\" cannot be UNIQUE: its DEFAULT would be the same in every existing row");
             std::string pk_index = s.table + "_pkey";
             if (d.primary_key) {
                 for (IndexInfo* i : catalog_->IndexesOf(s.table))
@@ -124,9 +147,11 @@ QueryResult Database::RunAlterTable(const AlterTableStmt& s) {
             c.name = d.name;
             c.type = d.type;
             c.not_null = d.not_null;
+            c.default_value = def;
             cols.push_back(c);
-            catalog_->RewriteTable(t, cols, [](Row r) {
-                r.push_back(Value::Null());
+            Value fill = def ? *def : Value::Null();
+            catalog_->RewriteTable(t, cols, [&fill](Row r) {
+                r.push_back(fill);
                 return r;
             });
             if (d.primary_key)
@@ -267,6 +292,8 @@ QueryResult Database::RunInsert(const InsertStmt& s) {
             throw DbError("INSERT has " + std::to_string(src.size()) + " values but " +
                           std::to_string(positions.size()) + " target columns");
         Row full(schema.Size());
+        for (size_t i = 0; i < schema.Size(); ++i)  // columns left out get their DEFAULT (or NULL)
+            if (schema.At(i).default_value) full[i] = *schema.At(i).default_value;
         for (size_t i = 0; i < positions.size(); ++i) full[positions[i]] = src[i];
         rows.push_back(std::move(full));
     }

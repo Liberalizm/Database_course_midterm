@@ -410,5 +410,48 @@ TEST_F(CatalogTest, FailedRewriteLeavesTheTableUntouched) {
     EXPECT_EQ(cat->IndexesOf("t").size(), 1u) << "indexes are only dropped after all checks passed";
 }
 
+TEST_F(CatalogTest, ColumnDefaultsOfEveryTypeSurviveRestart) {
+    std::vector<Column> cols = {Col("i", TypeId::INT), Col("d", TypeId::DOUBLE), Col("b", TypeId::BOOL),
+                                Col("t", TypeId::TEXT), Col("n", TypeId::INT), Col("none", TypeId::INT)};
+    cols[0].default_value = I(-42);
+    cols[1].default_value = D(2.75);
+    cols[2].default_value = B(true);
+    cols[3].default_value = T("hello");
+    cols[4].default_value = N();  // an explicit DEFAULT NULL
+    cat->CreateTable("t", cols);
+    Reopen();
+    const Schema& s = cat->RequireTable("t")->schema;
+    ASSERT_TRUE(s.At(0).default_value && s.At(1).default_value && s.At(2).default_value && s.At(3).default_value);
+    EXPECT_EQ(s.At(0).default_value->AsInt(), -42);
+    EXPECT_DOUBLE_EQ(s.At(1).default_value->AsDouble(), 2.75);
+    EXPECT_TRUE(s.At(2).default_value->AsBool());
+    EXPECT_EQ(s.At(3).default_value->AsText(), "hello");
+    ASSERT_TRUE(s.At(4).default_value);
+    EXPECT_TRUE(s.At(4).default_value->IsNull());
+    EXPECT_FALSE(s.At(5).default_value);
+}
+
+TEST_F(CatalogTest, CatalogWithoutDefaultsSectionStillLoads) {
+    // A file written before DEFAULT existed ends right after the free-page list.
+    // Simulate it by cutting the (empty) defaults section off the saved catalog.
+    cat->CreateTable("t", {Col("a", TypeId::INT)});
+    cat->Save();
+    {
+        PageGuard g = PageGuard::Fetch(bpm.get(), CATALOG_PAGE_ID);
+        uint32_t total = ReadAs<uint32_t>(g.Data() + 4);
+        WriteAs<uint32_t>(g.Data() + 4, total - 4);  // drop the trailing "0 defaults" count
+        g.MarkDirty();
+    }
+    bpm->FlushAll();
+    cat.reset();
+    bpm.reset();
+    disk.reset();
+    disk = std::make_unique<DiskManager>(file.path());
+    bpm = std::make_unique<BufferPoolManager>(32, disk.get());
+    cat = std::make_unique<Catalog>(bpm.get());
+    EXPECT_NE(cat->GetTable("t"), nullptr);
+    EXPECT_FALSE(cat->RequireTable("t")->schema.At(0).default_value);
+}
+
 }  // namespace
 }  // namespace minidb
