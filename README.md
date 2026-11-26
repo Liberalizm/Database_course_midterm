@@ -135,7 +135,10 @@ checksum still produces an error rather than a crash.
 non-unique indexes natural. `INT`, `DATE` and `TIMESTAMP` columns are indexed by value (equality and
 range scans); `TEXT` columns by a 64-bit FNV-1a hash (equality only). Hashes
 can collide, so uniqueness checks compare the real values and index scans
-re-check the condition. Deletes are lazy (nodes are never merged).
+re-check the condition. A delete that leaves a node less than half full
+borrows entries from a sibling or merges the two; the freed page goes to the
+free-page list, and a root left with one child is replaced by it, so an index
+shrinks with its table.
 
 A multi-column index — also behind `PRIMARY KEY (a, b)` and `UNIQUE (a, b)` —
 uses a "wide" tree with a second 64-bit key part: entries are
@@ -257,7 +260,6 @@ process crashes, but not if the machine loses power.
 - Foreign keys are single-column (they cannot reference a composite
   key), and `RESTRICT` behaves like `NO ACTION` (both are checked at the
   end of the statement).
-- B+ tree nodes are not merged after deletes.
 
 ## Tests
 

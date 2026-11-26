@@ -226,16 +226,121 @@ void BPlusTree::InsertIntoParent(std::vector<page_id_t>& path, page_id_t left, c
 bool BPlusTree::Remove(const IndexKey& k) {
     const Layout L{wide_};
     if (root_ == INVALID_PAGE_ID) return false;
-    page_id_t leaf = FindLeaf(k, nullptr);
-    PageGuard g = FetchNode(bpm_, leaf, L);
-    char* d = g.Data();
-    int n = Size(d);
-    int pos = LeafLowerBound(d, k, L);
-    if (pos >= n || !(LeafKey(d, pos, L) == k)) return false;
-    std::memmove(LeafEntry(d, pos, L), LeafEntry(d, pos + 1, L), static_cast<size_t>(n - pos - 1) * L.LeafEntry());
-    SetSize(d, n - 1);
-    g.MarkDirty();
+    std::vector<page_id_t> path;
+    page_id_t leaf = FindLeaf(k, &path);
+    int n;
+    {
+        PageGuard g = FetchNode(bpm_, leaf, L);
+        char* d = g.Data();
+        n = Size(d);
+        int pos = LeafLowerBound(d, k, L);
+        if (pos >= n || !(LeafKey(d, pos, L) == k)) return false;
+        std::memmove(LeafEntry(d, pos, L), LeafEntry(d, pos + 1, L), static_cast<size_t>(n - pos - 1) * L.LeafEntry());
+        SetSize(d, --n);
+        g.MarkDirty();
+    }
+    // The root may hold any number of entries (an empty root leaf is an empty tree).
+    if (!path.empty() && n < LeafMin()) Rebalance(path, leaf);
     return true;
+}
+
+// `node` (a child of path.back()) has fallen below its minimum size. Together
+// with an adjacent sibling under the same parent it either fits into one node
+// (merge: the right one is freed and its separator removed from the parent) or
+// is split evenly again (redistribute: only the separator changes). Siblings
+// under one parent are also neighbours in the leaf chain, so the chain stays
+// intact. A merge can make the parent underflow in turn; a root left with a
+// single child is replaced by that child, so the tree shrinks by one level.
+void BPlusTree::Rebalance(std::vector<page_id_t>& path, page_id_t node) {
+    const Layout L{wide_};
+    const page_id_t parent = path.back();
+    path.pop_back();
+    page_id_t freed = INVALID_PAGE_ID;
+    int parent_size;
+    {
+        PageGuard pg = FetchNode(bpm_, parent, L);
+        char* p = pg.Data();
+        const int pn = Size(p);
+        int idx = -1;
+        for (int i = 0; i < pn; ++i)
+            if (Child(p, i, L) == node) idx = i;
+        if (idx < 0) throw DbError("index corruption: child not found in parent");
+        if (pn < 2) return;  // no sibling to work with
+        const int s = idx > 0 ? idx : idx + 1;  // the right node of the pair is child s
+        const page_id_t left_id = Child(p, s - 1, L), right_id = Child(p, s, L);
+        PageGuard lg = FetchNode(bpm_, left_id, L), rg = FetchNode(bpm_, right_id, L);
+        char* ld = lg.Data();
+        char* rd = rg.Data();
+        if (IsLeaf(ld) != IsLeaf(rd)) throw DbError("index corruption: siblings of different kinds");
+        const int ln = Size(ld), rn = Size(rd);
+
+        if (IsLeaf(ld)) {
+            std::vector<IndexKey> all;
+            all.reserve(static_cast<size_t>(ln + rn));
+            for (int i = 0; i < ln; ++i) all.push_back(LeafKey(ld, i, L));
+            for (int i = 0; i < rn; ++i) all.push_back(LeafKey(rd, i, L));
+            const int t = static_cast<int>(all.size());
+            if (t < leaf_max_) {  // merge into the left leaf
+                for (int i = 0; i < t; ++i) WriteKey(LeafEntry(ld, i, L), all[static_cast<size_t>(i)], L);
+                SetSize(ld, t);
+                SetNextLeaf(ld, NextLeaf(rd));
+                freed = right_id;
+            } else {  // redistribute
+                const int h = t / 2;
+                for (int i = 0; i < h; ++i) WriteKey(LeafEntry(ld, i, L), all[static_cast<size_t>(i)], L);
+                for (int i = h; i < t; ++i) WriteKey(LeafEntry(rd, i - h, L), all[static_cast<size_t>(i)], L);
+                SetSize(ld, h);
+                SetSize(rd, t - h);
+                SetInEntry(p, s, all[static_cast<size_t>(h)], right_id, L);
+            }
+        } else {
+            // Internal: the parent's separator comes down in front of the right
+            // node's first child (whose own key slot is unused).
+            std::vector<std::pair<IndexKey, page_id_t>> all;
+            all.reserve(static_cast<size_t>(ln + rn));
+            for (int i = 0; i < ln; ++i) all.emplace_back(InKey(ld, i, L), Child(ld, i, L));
+            all.emplace_back(InKey(p, s, L), Child(rd, 0, L));
+            for (int i = 1; i < rn; ++i) all.emplace_back(InKey(rd, i, L), Child(rd, i, L));
+            const int t = static_cast<int>(all.size());
+            auto put = [&](char* d, int from, int to) {
+                for (int i = from; i < to; ++i)
+                    SetInEntry(d, i - from, all[static_cast<size_t>(i)].first, all[static_cast<size_t>(i)].second, L);
+                SetSize(d, to - from);
+            };
+            if (t < internal_max_) {
+                put(ld, 0, t);
+                freed = right_id;
+            } else {
+                const int h = t / 2;
+                put(ld, 0, h);
+                put(rd, h, t);
+                SetInEntry(p, s, all[static_cast<size_t>(h)].first, right_id, L);
+            }
+        }
+        lg.MarkDirty();
+        rg.MarkDirty();
+        if (freed != INVALID_PAGE_ID) {  // drop the right node's entry from the parent
+            std::memmove(InEntry(p, s, L), InEntry(p, s + 1, L), static_cast<size_t>(pn - s - 1) * L.InEntry());
+            SetSize(p, pn - 1);
+        }
+        pg.MarkDirty();
+        parent_size = Size(p);
+    }
+    if (freed != INVALID_PAGE_ID) bpm_->DeletePage(freed);  // unpinned now
+
+    if (path.empty()) {  // `parent` is the root
+        if (parent_size == 1) {
+            page_id_t only;
+            {
+                PageGuard pg = FetchNode(bpm_, parent, L);
+                only = Child(pg.Data(), 0, L);
+            }
+            root_ = only;
+            bpm_->DeletePage(parent);
+        }
+    } else if (parent_size < InternalMin()) {
+        Rebalance(path, parent);
+    }
 }
 
 bool BPlusTree::ContainsKey(int64_t key, RID except) const {
@@ -309,9 +414,9 @@ bool BPlusTree::MinKey(int64_t* out) const {
 bool BPlusTree::MaxKey(int64_t* out) const {
     const Layout L{wide_};
     if (root_ == INVALID_PAGE_ID) return false;
-    // Lazy deletes can leave the rightmost leaves empty, so this is a right-to-left
-    // depth-first search for the last non-empty leaf, not a single descent. Leaves
-    // have no back pointers, and usually the first leaf visited already answers.
+    // Trees written before deletes rebalanced (and a root leaf) can hold empty
+    // leaves, so this is a right-to-left depth-first search for the last non-empty
+    // leaf, not a single descent. Usually the first leaf visited already answers.
     std::vector<page_id_t> stack{root_};
     while (!stack.empty()) {
         page_id_t pid = stack.back();
@@ -340,6 +445,67 @@ size_t BPlusTree::CheckAndCount() const {
         ++n;
     }
     return n;
+}
+
+namespace {
+
+struct StructureCheck {
+    BufferPoolManager* bpm;
+    Layout L;
+    int leaf_min, internal_min;
+    int leaf_depth = -1;
+    std::vector<page_id_t> leaves;  // in key order
+    size_t entries = 0;
+
+    [[noreturn]] static void Fail(page_id_t pid, const std::string& what) {
+        throw DbError("index structure broken at page " + std::to_string(pid) + ": " + what);
+    }
+
+    // Every entry of the subtree at `pid` must lie in [lo, hi) (unbounded when null).
+    void Visit(page_id_t pid, int depth, bool is_root, const IndexKey* lo, const IndexKey* hi) {
+        PageGuard g = FetchNode(bpm, pid, L);
+        const char* d = g.Data();
+        const int n = Size(d);
+        if (IsLeaf(d)) {
+            if (leaf_depth < 0) leaf_depth = depth;
+            if (depth != leaf_depth) Fail(pid, "leaves at different depths");
+            if (!is_root && n < leaf_min) Fail(pid, "leaf underfull");
+            for (int i = 0; i < n; ++i) {
+                IndexKey k = LeafKey(d, i, L);
+                if ((i > 0 && !(LeafKey(d, i - 1, L) < k)) || (lo && k < *lo) || (hi && !(k < *hi)))
+                    Fail(pid, "leaf entry out of order");
+            }
+            leaves.push_back(pid);
+            entries += static_cast<size_t>(n);
+            return;
+        }
+        if (!is_root && n < internal_min) Fail(pid, "internal node underfull");
+        if (is_root && n < 2) Fail(pid, "internal root with a single child");
+        std::vector<std::pair<IndexKey, page_id_t>> kids;
+        for (int i = 0; i < n; ++i) kids.emplace_back(InKey(d, i, L), Child(d, i, L));
+        g = PageGuard();  // unpin before descending
+        for (int i = 0; i < n; ++i) {
+            const IndexKey* klo = i == 0 ? lo : &kids[static_cast<size_t>(i)].first;
+            const IndexKey* khi = i + 1 < n ? &kids[static_cast<size_t>(i) + 1].first : hi;
+            if (klo && khi && !(*klo < *khi)) Fail(pid, "separators out of order");
+            Visit(kids[static_cast<size_t>(i)].second, depth + 1, false, klo, khi);
+        }
+    }
+};
+
+}  // namespace
+
+size_t BPlusTree::CheckStructure() const {
+    if (root_ == INVALID_PAGE_ID) return 0;
+    StructureCheck c{bpm_, Layout{wide_}, LeafMin(), InternalMin()};
+    c.Visit(root_, 0, true, nullptr, nullptr);
+    // The leaf chain must link exactly the leaves, in key order.
+    for (size_t i = 0; i < c.leaves.size(); ++i) {
+        PageGuard g = FetchNode(bpm_, c.leaves[i], Layout{wide_});
+        page_id_t want = i + 1 < c.leaves.size() ? c.leaves[i + 1] : INVALID_PAGE_ID;
+        if (NextLeaf(g.Data()) != want) StructureCheck::Fail(c.leaves[i], "leaf chain broken");
+    }
+    return c.entries;
 }
 
 BPlusTree::Iterator::Iterator(BufferPoolManager* bpm, page_id_t leaf, int pos, bool wide)
