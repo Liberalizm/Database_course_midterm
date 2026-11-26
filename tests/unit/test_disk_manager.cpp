@@ -364,5 +364,70 @@ TEST(DiskManager, InjectedWriteFailure) {
     EXPECT_NO_THROW(disk.WritePage(0, buf));
 }
 
+TEST(DiskManager, SavepointsUndoWritesAndAllocations) {
+    TempFile f;
+    DiskManager disk(f.path());
+    char buf[PAGE_SIZE];
+    disk.AllocatePage();
+    Fill(buf, 'a');
+    disk.WritePage(0, buf);
+    disk.Commit();
+
+    Fill(buf, 'b');
+    disk.WritePage(0, buf);
+    disk.Savepoint();
+    EXPECT_EQ(disk.SavepointDepth(), 1u);
+    Fill(buf, 'c');
+    disk.WritePage(0, buf);
+    EXPECT_EQ(disk.AllocatePage(), 1);
+    disk.WritePage(1, buf);
+    disk.RollbackToSavepoint();
+    EXPECT_EQ(disk.NumPages(), 1) << "the allocation since the savepoint is undone";
+    EXPECT_EQ(FirstByte(disk, 0), 'b') << "the write before the savepoint stays";
+    EXPECT_EQ(disk.SavepointDepth(), 1u);
+    EXPECT_EQ(disk.AllocatePage(), 1);
+    disk.ReleaseSavepoint();
+    disk.Commit();
+    EXPECT_EQ(disk.NumPages(), 2);
+    EXPECT_EQ(FirstByte(disk, 0), 'b');
+    EXPECT_EQ(FirstByte(disk, 1), 0) << "allocated again, never written";
+    EXPECT_THROW(disk.ReleaseSavepoint(), DbError);
+}
+
+TEST(DiskManager, CommitEndsTheSavepoints) {
+    TempFile f;
+    DiskManager disk(f.path());
+    disk.Savepoint();
+    disk.Savepoint();
+    disk.Commit();  // nothing to commit, but the savepoints still end
+    EXPECT_EQ(disk.SavepointDepth(), 0u);
+    EXPECT_EQ(disk.Log().Marks(), 0u);
+    disk.Savepoint();
+    disk.AllocatePage();
+    disk.Rollback();
+    EXPECT_EQ(disk.SavepointDepth(), 0u);
+    EXPECT_EQ(disk.Log().Marks(), 0u);
+    EXPECT_EQ(disk.NumPages(), 0);
+}
+
+TEST(DiskManager, BeforeWriteHookSeesPagesAndTheCommitRecord) {
+    TempFile f;
+    DiskManager disk(f.path());
+    std::vector<page_id_t> seen;
+    disk.SetBeforeWriteHook([&](page_id_t pid) { seen.push_back(pid); });
+    char buf[PAGE_SIZE] = {};
+    disk.AllocatePage();
+    disk.AllocatePage();
+    disk.WritePage(1, buf);
+    disk.WritePage(0, buf);
+    disk.Commit();
+    disk.Commit();  // nothing to commit: no record
+    EXPECT_EQ(seen, (std::vector<page_id_t>{1, 0, INVALID_PAGE_ID}));
+    disk.SetBeforeWriteHook([](page_id_t) { throw DbError("disk gone"); });
+    EXPECT_THROW(disk.WritePage(0, buf), DbError);
+    EXPECT_EQ(disk.Log().UncommittedPageRecords(), 0u) << "a failed write reaches nothing";
+    disk.SetBeforeWriteHook(nullptr);
+}
+
 }  // namespace
 }  // namespace minidb

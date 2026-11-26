@@ -17,7 +17,8 @@
 
 namespace minidb::testing {
 
-// A unique database file path that is deleted before and after the test.
+// A unique database file path that is deleted before and after the test, together
+// with its write-ahead log ("<path>.wal").
 class TempFile {
 public:
     TempFile() {

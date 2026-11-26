@@ -182,7 +182,9 @@ uint64_t WriteAheadLog::WriteRecord(uint64_t offset, RecordType type, page_id_t 
 
 void WriteAheadLog::AppendPage(page_id_t pid, const char* data) {
     auto it = pending_.find(pid);
-    if (it != pending_.end()) {
+    // A record from before the innermost mark must stay as it is: rolling back to
+    // the mark returns to it.
+    if (it != pending_.end() && (marks_.empty() || it->second.offset - kRecordHeaderSize >= marks_.back().end)) {
         // Written before in this group (e.g. evicted twice during one statement):
         // overwrite that record, so a statement logs each page it changed once.
         // If a crash tears the record, recovery drops the uncommitted group; if
@@ -209,17 +211,42 @@ void WriteAheadLog::Commit(page_id_t num_pages) {
     has_commit_ = true;
     committed_num_pages_ = num_pages;
     committed_end_ = end_;
+    marks_.clear();
     committed_page_records_ = page_records_;
     ++txn_;
 }
 
 void WriteAheadLog::Rollback() {
+    // The state is reset first, so that even if cutting the file fails, nothing
+    // of the abandoned group can be committed later (and recovery ignores it).
     pending_.clear();
     pending_sum_ = 0;
-    if (end_ != committed_end_) file_.Truncate(committed_end_);
+    marks_.clear();
+    const uint64_t old_end = end_;
     end_ = committed_end_;
     page_records_ = committed_page_records_;
     ++txn_;  // never reuse the number of the abandoned group
+    if (old_end != committed_end_) file_.Truncate(committed_end_);
+}
+
+void WriteAheadLog::SetMark() { marks_.push_back({end_, page_records_, pending_sum_, pending_}); }
+
+void WriteAheadLog::RollbackToMark() {
+    if (marks_.empty()) throw DbError("internal: no write-ahead log mark to roll back to");
+    const Mark& m = marks_.back();
+    pending_ = m.pending;
+    pending_sum_ = m.pending_sum;
+    page_records_ = m.page_records;
+    const uint64_t old_end = end_;
+    end_ = m.end;
+    // The records cut off carry the group's transaction number. Should one of
+    // them survive a crash anyway, the COMMIT record's digest rejects it.
+    if (old_end != end_) file_.Truncate(end_);
+}
+
+void WriteAheadLog::ReleaseMark() {
+    if (marks_.empty()) throw DbError("internal: no write-ahead log mark to release");
+    marks_.pop_back();
 }
 
 bool WriteAheadLog::Find(page_id_t pid, char* out) {

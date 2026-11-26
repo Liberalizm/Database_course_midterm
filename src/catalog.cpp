@@ -250,6 +250,8 @@ std::string Catalog::Serialize() const {
 }
 
 void Catalog::Reload() {
+    views_.clear();
+    foreign_keys_.clear();
     indexes_.clear();
     tables_.clear();
     Load();

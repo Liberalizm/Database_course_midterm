@@ -1,0 +1,5 @@
+ id | owner | balance
+----+-------+---------
+ 1  | alice | 70
+ 2  | bob   | 80
+(2 rows)

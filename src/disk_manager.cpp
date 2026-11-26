@@ -81,6 +81,7 @@ void DiskManager::ReadPage(page_id_t pid, char* out) {
 
 void DiskManager::WritePage(page_id_t pid, const char* data) {
     if (pid < 0 || pid >= num_pages_) throw DbError("write of invalid page " + std::to_string(pid));
+    if (before_write_hook_) before_write_hook_(pid);
     if (fail_writes_after_ >= 0 && fail_writes_after_-- == 0) {
         fail_writes_after_ = 0;  // stays failed until the test resets it
         throw DbError("I/O error while writing page " + std::to_string(pid) + " (injected)");
@@ -92,16 +93,47 @@ void DiskManager::WritePage(page_id_t pid, const char* data) {
 page_id_t DiskManager::AllocatePage() { return num_pages_++; }
 
 void DiskManager::Commit() {
-    if (!HasUncommittedChanges()) return;
-    wal_->Commit(num_pages_);
-    committed_num_pages_ = num_pages_;
-    ++commits_;
-    if (options_.checkpoint_pages > 0 && wal_->PageRecords() >= options_.checkpoint_pages) Checkpoint();
+    if (HasUncommittedChanges()) {
+        if (before_write_hook_) before_write_hook_(INVALID_PAGE_ID);
+        wal_->Commit(num_pages_);  // ends the savepoints too
+        committed_num_pages_ = num_pages_;
+        ++commits_;
+    } else {
+        while (wal_->Marks() > 0) wal_->ReleaseMark();
+    }
+    savepoint_pages_.clear();
+    if (options_.checkpoint_pages > 0 && wal_->PageRecords() >= options_.checkpoint_pages) {
+        // The commit is durable already, so a failing checkpoint must not turn
+        // into an error of the commit. The log keeps every page, and the next
+        // checkpoint (at the latest on shutdown or reopen) tries again.
+        try {
+            Checkpoint();
+        } catch (const DbError&) {
+        }
+    }
 }
 
 void DiskManager::Rollback() {
-    wal_->Rollback();
+    savepoint_pages_.clear();
     num_pages_ = committed_num_pages_;
+    wal_->Rollback();
+}
+
+void DiskManager::Savepoint() {
+    wal_->SetMark();
+    savepoint_pages_.push_back(num_pages_);
+}
+
+void DiskManager::RollbackToSavepoint() {
+    if (savepoint_pages_.empty()) throw DbError("internal: no savepoint to roll back to");
+    num_pages_ = savepoint_pages_.back();
+    wal_->RollbackToMark();
+}
+
+void DiskManager::ReleaseSavepoint() {
+    if (savepoint_pages_.empty()) throw DbError("internal: no savepoint to release");
+    savepoint_pages_.pop_back();
+    wal_->ReleaseMark();
 }
 
 void DiskManager::Checkpoint() {

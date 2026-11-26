@@ -2,8 +2,10 @@
 // a write-ahead log, so that every commit is atomic and durable.
 #pragma once
 
+#include <functional>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include "common.h"
 #include "file_io.h"
@@ -59,6 +61,15 @@ public:
     void Checkpoint();
     bool HasUncommittedChanges() const { return wal_->HasUncommitted() || num_pages_ != committed_num_pages_; }
 
+    // Savepoints inside the uncommitted changes (a log mark plus the page count).
+    // They nest; Commit and Rollback end them all.
+    void Savepoint();
+    // Undoes every write and allocation since the innermost savepoint, which stays.
+    void RollbackToSavepoint();
+    // Ends the innermost savepoint, keeping its changes.
+    void ReleaseSavepoint();
+    size_t SavepointDepth() const { return savepoint_pages_.size(); }
+
     page_id_t NumPages() const { return num_pages_; }
     const std::string& Path() const { return path_; }
     const WriteAheadLog& Log() const { return *wal_; }
@@ -74,6 +85,11 @@ public:
     // Testing hook: after `n` more successful writes, every WritePage throws,
     // as if the disk had failed. Negative (the default): never.
     void FailWritesAfter(int64_t n) { fail_writes_after_ = n; }
+    // Testing hook: called right before each record goes to the log: a page
+    // (its id), or the COMMIT record (INVALID_PAGE_ID). Crash tests copy the
+    // files from here, to capture what a crash at this moment would leave
+    // behind; throwing from it acts like a failing disk.
+    void SetBeforeWriteHook(std::function<void(page_id_t)> hook) { before_write_hook_ = std::move(hook); }
 
 private:
     std::string path_;
@@ -88,6 +104,8 @@ private:
     uint64_t commits_ = 0;
     uint64_t checkpoints_ = 0;
     int64_t fail_writes_after_ = -1;
+    std::vector<page_id_t> savepoint_pages_;  // NumPages() at each savepoint
+    std::function<void(page_id_t)> before_write_hook_;
 };
 
 }  // namespace minidb

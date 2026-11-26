@@ -282,5 +282,143 @@ TEST(Wal, CloseAndRemoveDeletesTheFile) {
     EXPECT_FALSE(std::filesystem::exists(f.path()));
 }
 
+// ---- marks (savepoints inside a group) ----
+
+TEST(Wal, RollbackToMarkRestoresTheImagesAsOfTheMark) {
+    TempFile f;
+    WriteAheadLog wal(f.path(), false);
+    wal.AppendPage(0, Page('a').data());
+    wal.Commit(3);
+    wal.AppendPage(1, Page('b').data());
+    const uint64_t at_mark = wal.SizeBytes();
+    wal.SetMark();
+    EXPECT_EQ(wal.Marks(), 1u);
+    wal.AppendPage(1, Page('c').data());  // written before the mark: appended, not overwritten
+    wal.AppendPage(0, Page('d').data());
+    wal.AppendPage(2, Page('e').data());
+    wal.AppendPage(2, Page('f').data());  // written after the mark: overwritten in place
+    EXPECT_EQ(wal.SizeBytes(), at_mark + 3 * kPageRec);
+    EXPECT_EQ(Lookup(wal, 1), 'c');
+
+    wal.RollbackToMark();
+    EXPECT_EQ(wal.Marks(), 1u) << "the mark stays";
+    EXPECT_EQ(wal.SizeBytes(), at_mark);
+    EXPECT_EQ(std::filesystem::file_size(f.path()), at_mark);
+    EXPECT_EQ(Lookup(wal, 1), 'b');
+    EXPECT_EQ(Lookup(wal, 0), 'a') << "back to the committed image";
+    EXPECT_EQ(Lookup(wal, 2), 0);
+    EXPECT_TRUE(wal.HasUncommitted());
+
+    wal.AppendPage(2, Page('g').data());  // the group goes on from the mark
+    wal.ReleaseMark();
+    EXPECT_EQ(wal.Marks(), 0u);
+    wal.Commit(3);
+    EXPECT_EQ(Lookup(wal, 1), 'b');
+    EXPECT_EQ(Lookup(wal, 2), 'g');
+}
+
+TEST(Wal, NestedMarks) {
+    TempFile f;
+    WriteAheadLog wal(f.path(), false);
+    wal.AppendPage(0, Page('a').data());
+    wal.SetMark();
+    wal.AppendPage(0, Page('b').data());
+    wal.SetMark();
+    wal.AppendPage(0, Page('c').data());
+    wal.RollbackToMark();
+    EXPECT_EQ(Lookup(wal, 0), 'b');
+    wal.ReleaseMark();
+    wal.AppendPage(0, Page('d').data());  // after the outer mark only: overwrites 'b'
+    EXPECT_EQ(Lookup(wal, 0), 'd');
+    wal.RollbackToMark();
+    EXPECT_EQ(Lookup(wal, 0), 'a');
+    wal.ReleaseMark();
+    EXPECT_THROW(wal.ReleaseMark(), DbError);
+    EXPECT_THROW(wal.RollbackToMark(), DbError);
+}
+
+TEST(Wal, CommitAndRollbackDropTheMarks) {
+    TempFile f;
+    WriteAheadLog wal(f.path(), false);
+    wal.SetMark();
+    wal.AppendPage(0, Page('a').data());
+    wal.SetMark();
+    wal.Commit(1);
+    EXPECT_EQ(wal.Marks(), 0u);
+    wal.SetMark();
+    wal.AppendPage(0, Page('b').data());
+    wal.Rollback();
+    EXPECT_EQ(wal.Marks(), 0u);
+    EXPECT_EQ(Lookup(wal, 0), 'a');
+}
+
+// A group that went through marks holds some pages twice (the image from before
+// a mark, and the newer one appended after it). Recovery must apply the newer.
+TEST(Wal, GroupWithPagesLoggedTwiceRecoversTheNewestImages) {
+    TempFile f;
+    {
+        WriteAheadLog wal(f.path(), false);
+        wal.AppendPage(0, Page('a').data());
+        wal.AppendPage(1, Page('b').data());
+        wal.SetMark();
+        wal.AppendPage(0, Page('c').data());
+        wal.AppendPage(1, Page('x').data());
+        wal.RollbackToMark();
+        wal.AppendPage(1, Page('d').data());
+        wal.ReleaseMark();
+        wal.AppendPage(1, Page('e').data());  // no mark left: overwrites 'd' in place
+        wal.Commit(2);
+        EXPECT_EQ(wal.PageRecords(), 3u);
+    }
+    WriteAheadLog wal(f.path(), false);
+    EXPECT_EQ(wal.RecoveredCommits(), 1u);
+    EXPECT_EQ(Lookup(wal, 0), 'a');
+    EXPECT_EQ(Lookup(wal, 1), 'e');
+}
+
+// The records cut off by RollbackToMark carry the group's transaction number.
+// If one of them is found where a newer record should be (that write was lost),
+// the COMMIT record's digest must reject the group instead of applying it.
+TEST(Wal, StaleRecordCutOffByAMarkIsNotApplied) {
+    TempFile f;
+    std::vector<char> with_stale;
+    const size_t mark_at = kHdr + kPageRec;
+    {
+        WriteAheadLog wal(f.path(), false);
+        wal.AppendPage(0, Page('a').data());
+        wal.SetMark();
+        wal.AppendPage(1, Page('x').data());  // will be cut off
+        with_stale = ReadFileBytes(f.path());
+        wal.RollbackToMark();
+        wal.AppendPage(1, Page('y').data());  // lands where 'x' was
+        wal.Commit(2);
+    }
+    std::vector<char> bytes = ReadFileBytes(f.path());
+    std::copy(with_stale.begin() + static_cast<std::ptrdiff_t>(mark_at), with_stale.end(),
+              bytes.begin() + static_cast<std::ptrdiff_t>(mark_at));  // the write of 'y' was lost
+    WriteFileBytes(f.path(), bytes);
+    WriteAheadLog wal(f.path(), false);
+    EXPECT_EQ(wal.RecoveredCommits(), 0u);
+    EXPECT_EQ(Lookup(wal, 1), 0) << "the cut-off 'x' image must not be applied";
+}
+
+TEST(Wal, HeaderRecordsTheBasePageCount) {
+    TempFile f;
+    {
+        WriteAheadLog wal(f.path(), false, 7);
+        EXPECT_EQ(wal.BasePages(), 7);
+        wal.AppendPage(0, Page('a').data());
+        wal.Commit(9);
+    }
+    {
+        WriteAheadLog wal(f.path(), false, 3);  // a log with commits keeps its own
+        EXPECT_EQ(wal.BasePages(), 7);
+        wal.Reset(9);
+        EXPECT_EQ(wal.BasePages(), 9);
+    }
+    WriteAheadLog wal(f.path(), false, 4);  // an empty log starts over with the given count
+    EXPECT_EQ(wal.BasePages(), 4);
+}
+
 }  // namespace
 }  // namespace minidb

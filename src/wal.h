@@ -35,6 +35,7 @@
 #include <functional>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 #include "common.h"
 #include "file_io.h"
@@ -62,13 +63,27 @@ public:
     bool Find(page_id_t pid, char* out);
 
     // Adds a page image to the current (uncommitted) group. A page already in
-    // the group is overwritten in place, so a group holds each page once.
+    // the group is overwritten in place, so a group holds each page once, unless
+    // its record is older than the innermost mark (see below): then the new image
+    // is appended, and the old record stays for RollbackToMark.
     void AppendPage(page_id_t pid, const char* data);
     // Ends the current group with a COMMIT record (recording that the database
     // has `num_pages` pages) and fsyncs the log. Afterwards the group survives a crash.
     void Commit(page_id_t num_pages);
-    // Forgets the current group: its records are cut off the log.
+    // Forgets the current group: its records are cut off the log. Also drops
+    // every mark.
     void Rollback();
+
+    // Marks (savepoints) inside the current group. A mark remembers where the
+    // group ended when it was set; RollbackToMark cuts the log back to that
+    // point, which restores the newest image of every page as of then. Marks
+    // nest; Commit and Rollback drop them all.
+    void SetMark();
+    // Undoes every AppendPage since the innermost mark. The mark stays.
+    void RollbackToMark();
+    // Forgets the innermost mark, keeping the records written since.
+    void ReleaseMark();
+    size_t Marks() const { return marks_.size(); }
 
     bool HasUncommitted() const { return !pending_.empty(); }
     // True if the log holds at least one commit (since it was last emptied).
@@ -89,6 +104,7 @@ public:
     const std::string& Path() const { return path_; }
     uint64_t SizeBytes() const { return end_; }
     size_t PageRecords() const { return page_records_; }  // since the log was last emptied
+    size_t UncommittedPageRecords() const { return page_records_ - committed_page_records_; }
     uint64_t RecoveredCommits() const { return recovered_commits_; }
 
 private:
@@ -104,6 +120,12 @@ private:
     struct PendingPage {
         uint64_t offset;  // of the image
         uint64_t mix;     // the record's contribution to the group digest
+    };
+    struct Mark {
+        uint64_t end;                                        // end of the log when set
+        size_t page_records;
+        uint64_t pending_sum;
+        std::unordered_map<page_id_t, PendingPage> pending;  // the group as it was
     };
 
     std::string path_;
@@ -123,6 +145,7 @@ private:
     uint64_t end_ = kHeaderSize;            // end of the log
     size_t page_records_ = 0;
     uint64_t recovered_commits_ = 0;
+    std::vector<Mark> marks_;  // innermost last
 };
 
 }  // namespace minidb

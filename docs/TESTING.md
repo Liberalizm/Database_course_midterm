@@ -8,8 +8,8 @@ the part that broke.
 tests/
 ├── unit/                    one executable per component, tested in isolation
 │   ├── test_checksum        storage: CRC-32C and the per-page checksum
-│   ├── test_wal             storage: log format, commit groups, recovery from torn/stale/damaged logs
-│   ├── test_disk_manager    storage: page I/O through the log, checksums, commit/rollback/checkpoint, crashes
+│   ├── test_wal             storage: log format, commit groups, savepoint marks, recovery from torn/stale/damaged logs
+│   ├── test_disk_manager    storage: page I/O through the log, checksums, commit/rollback/savepoints/checkpoint, crashes
 │   ├── test_lru_replacer    storage: eviction policy
 │   ├── test_buffer_pool     storage: caching, pinning, write-back, PageGuard
 │   ├── test_value           storage: values, schemas, tuple serialization
@@ -26,7 +26,8 @@ tests/
 ├── integration/             whole engine via the Database API (SQL in, rows out)
 │   ├── test_sql.cpp         DDL/DML, constraints, index consistency, index-vs-scan
 │   ├── test_persistence.cpp data survives restarts; crash at every point of the log; rollback on I/O errors
-│   └── test_foreign_keys.cpp FOREIGN KEY checks, actions, DDL guards, randomized invariants
+│   ├── test_foreign_keys.cpp FOREIGN KEY checks, actions, DDL guards, randomized invariants
+│   └── test_transactions.cpp BEGIN/COMMIT/ROLLBACK, savepoints, crash at every write, model check
 └── e2e/                     the real shell binary, compared to golden output
     ├── run_case.cmake       runner: N.sql -> compare with N.expected
     ├── basic/               queries, joins, aggregates, EXPLAIN
@@ -35,6 +36,7 @@ tests/
     ├── errors/              error messages; the shell keeps going after errors
     ├── foreign_keys/        referential actions, .schema, constraints after a restart
     ├── persistence/         3 separate shell processes on the same file
+    ├── transactions/        rollback, commit, savepoints; an open transaction is gone after exit
     └── views/               CREATE / DROP VIEW, views over views, kept across a restart
 ```
 
@@ -54,9 +56,19 @@ Isolation techniques:
   file and its log while the database is still open (`CopyCrashImage`), or cut
   the log at every record boundary (and many points in between) and check that
   recovery yields exactly the state after the last complete commit. Torn,
-  damaged and stale log records are built by editing the log's bytes.
+  damaged and stale log records (also ones cut off by `ROLLBACK TO`) are built
+  by editing the log's bytes. `DiskManager::SetBeforeWriteHook` runs right
+  before every record goes to the log, and `Crash.*` copies the files from
+  there: for every single write of a transaction (with and without
+  savepoints) and of an autocommit statement, recovery must bring back the
+  state from before it, and after the `COMMIT` record the state after it.
 * **I/O errors** come from `DiskManager::FailWritesAfter(n)`, which makes page
-  writes fail from the n-th one on, in the middle of a statement or its commit.
+  writes fail from the n-th one on, or from the same hook throwing, in the
+  middle of a statement, of a transaction or of its `COMMIT` record.
+* **Transactions vs. a model**: `Transactions.RandomizedAgainstAModel` runs
+  random statements, failing statements, savepoints, commits, rollbacks and
+  restarts on a 12-frame buffer pool, and compares the table with a `std::map`
+  after every few steps.
 
 ## Running tests locally
 

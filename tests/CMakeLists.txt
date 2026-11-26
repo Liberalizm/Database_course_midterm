@@ -76,7 +76,8 @@ endforeach ()
 
 # ---- integration tests ----
 minidb_add_test(test_integration "integration" integration/test_sql.cpp integration/test_persistence.cpp
-        integration/test_foreign_keys.cpp)
+        integration/test_foreign_keys.cpp
+        integration/test_transactions.cpp)
 
 # ---- end-to-end tests of the shell binary ----
 file(GLOB MINIDB_E2E_CASES LIST_DIRECTORIES true ${CMAKE_CURRENT_SOURCE_DIR}/e2e/*)
