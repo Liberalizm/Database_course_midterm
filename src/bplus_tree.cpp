@@ -246,6 +246,21 @@ int BPlusTree::Height() const {
     }
 }
 
+std::vector<page_id_t> BPlusTree::Pages() const {
+    std::vector<page_id_t> out;
+    if (root_ == INVALID_PAGE_ID) return out;
+    std::vector<page_id_t> stack{root_};
+    while (!stack.empty()) {
+        page_id_t pid = stack.back();
+        stack.pop_back();
+        out.push_back(pid);
+        PageGuard g = PageGuard::Fetch(bpm_, pid);
+        if (IsLeaf(g.Data())) continue;
+        for (int i = 0; i < Size(g.Data()); ++i) stack.push_back(Child(g.Data(), i));
+    }
+    return out;
+}
+
 bool BPlusTree::MinKey(int64_t* out) const {
     Iterator it = Begin();
     if (!it.Valid()) return false;

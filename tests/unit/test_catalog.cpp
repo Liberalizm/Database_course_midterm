@@ -138,5 +138,100 @@ TEST_F(CatalogTest, RejectsForeignFile) {
     EXPECT_THROW(Catalog c(bpm.get()), DbError);
 }
 
+// Fills a table with enough rows to span many heap and index pages.
+static void FillWithIndex(Catalog* cat, const std::string& name, int rows) {
+    TableInfo* t = cat->CreateTable(name, {Col("id", TypeId::INT), Col("pad", TypeId::TEXT)});
+    for (int i = 0; i < rows; ++i) {
+        t->heap->Insert(SerializeTuple(t->schema, {Value::Int(i), Value::Text(std::string(100, 'p'))}));
+        ++t->row_count;
+    }
+    cat->CreateIndex(name + "_id", name, "id", true);
+}
+
+TEST_F(CatalogTest, DropTableFreesHeapAndIndexPagesForReuse) {
+    FillWithIndex(cat.get(), "a", 2000);
+    page_id_t size_with_a = disk->NumPages();
+    cat->DropTable("a");
+    EXPECT_GT(bpm->FreePages().size(), 50u) << "heap + index pages are given back";
+
+    FillWithIndex(cat.get(), "b", 2000);
+    EXPECT_EQ(disk->NumPages(), size_with_a) << "the same amount of data fits in the freed pages";
+    TableInfo* b = cat->RequireTable("b");
+    EXPECT_EQ(cat->IndexesOf("b")[0]->tree->CheckAndCount(), 2000u);
+    size_t rows = 0;
+    auto it = b->heap->Begin();
+    RID rid;
+    std::string buf;
+    while (it.Next(&rid, &buf)) ++rows;
+    EXPECT_EQ(rows, 2000u) << "reused pages start out empty";
+}
+
+TEST_F(CatalogTest, DropIndexFreesItsPages) {
+    FillWithIndex(cat.get(), "a", 2000);
+    size_t tree_pages = cat->IndexesOf("a")[0]->tree->Pages().size();
+    EXPECT_GT(tree_pages, 1u);
+    cat->DropIndex("a_id");
+    EXPECT_EQ(bpm->FreePages().size(), tree_pages);
+}
+
+TEST_F(CatalogTest, FreePageListSurvivesRestart) {
+    FillWithIndex(cat.get(), "a", 2000);
+    cat->CreateTable("keep", {Col("x", TypeId::INT)});
+    cat->DropTable("a");
+    auto free_before = bpm->FreePages();
+    page_id_t size = disk->NumPages();
+    Reopen();
+    EXPECT_EQ(bpm->FreePages(), free_before);
+    FillWithIndex(cat.get(), "c", 2000);
+    EXPECT_EQ(disk->NumPages(), size) << "pages freed before the restart are reused after it";
+    EXPECT_NE(cat->GetTable("keep"), nullptr);
+}
+
+TEST_F(CatalogTest, FailedUniqueIndexBuildDoesNotLeakPages) {
+    TableInfo* t = cat->CreateTable("t", {Col("k", TypeId::INT)});
+    for (int i = 0; i < 2000; ++i) AddRow(t, {Value::Int(i)});
+    AddRow(t, {Value::Int(5)});  // duplicate found only after the tree has grown
+    EXPECT_THROW(cat->CreateIndex("t_k", "t", "k", true), DbError);
+    EXPECT_GT(bpm->FreePages().size(), 1u);
+    EXPECT_TRUE(cat->IndexesOf("t").empty());
+}
+
+TEST_F(CatalogTest, CatalogGrowthDoesNotHandOutItsOwnPages) {
+    // Free some pages, then make the catalog big enough to need extra pages:
+    // the extension takes pages from the free list, and the list saved to disk
+    // must not still contain them.
+    // (The tables are created first: each one takes a heap page, which would
+    // otherwise use up the free list before the catalog grows.)
+    for (int i = 0; i < 150; ++i) {
+        std::vector<Column> cols;
+        for (int c = 0; c < 4; ++c) cols.push_back(Col("a_rather_long_column_name_" + std::to_string(c), TypeId::INT));
+        cat->CreateTable("table_number_" + std::to_string(i), cols);
+    }
+    FillWithIndex(cat.get(), "a", 2000);
+    cat->DropTable("a");
+    ASSERT_GT(bpm->FreePages().size(), 10u);
+    Reopen();  // saving grows the catalog chain using free pages
+    EXPECT_EQ(cat->Tables().size(), 150u);
+    // Walk the catalog's own page chain (next pointer in the first 4 bytes).
+    int chain = 0;
+    for (page_id_t p = CATALOG_PAGE_ID; p != INVALID_PAGE_ID; ++chain) {
+        EXPECT_EQ(bpm->FreePages().count(p), 0u) << "catalog page " << p << " is on the free list";
+        PageGuard g = PageGuard::Fetch(bpm.get(), p);
+        p = ReadAs<page_id_t>(g.Data());
+    }
+    EXPECT_GT(chain, 1) << "the catalog must have grown for this test to mean anything";
+
+    FillWithIndex(cat.get(), "big", 3000);  // must not land on catalog pages
+    Reopen();
+    EXPECT_EQ(cat->Tables().size(), 151u);
+    EXPECT_EQ(cat->IndexesOf("big")[0]->tree->CheckAndCount(), 3000u);
+    size_t rows = 0;
+    auto it = cat->RequireTable("big")->heap->Begin();
+    RID rid;
+    std::string buf;
+    while (it.Next(&rid, &buf)) ++rows;
+    EXPECT_EQ(rows, 3000u) << "heap pages were overwritten by the catalog";
+}
+
 }  // namespace
 }  // namespace minidb

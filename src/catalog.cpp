@@ -79,6 +79,45 @@ Catalog::Catalog(BufferPoolManager* bpm) : bpm_(bpm) {
 }
 
 void Catalog::Save() {
+    std::string data = Serialize();
+    // Make the chain long enough *before* writing. Growing it may take a page off
+    // the free-page list, which is part of the serialized data, so serialize again
+    // afterwards (the list only shrinks, so the data still fits).
+    size_t needed = std::max<size_t>(1, (data.size() + CAT_CAP - 1) / CAT_CAP);
+    bool grew = false;
+    page_id_t pid = CATALOG_PAGE_ID;
+    for (size_t i = 1; i < needed; ++i) {
+        PageGuard g = PageGuard::Fetch(bpm_, pid);
+        page_id_t next = ReadAs<page_id_t>(g.Data());
+        if (next == INVALID_PAGE_ID) {
+            PageGuard ng = PageGuard::New(bpm_, &next);
+            WriteAs<page_id_t>(ng.Data(), INVALID_PAGE_ID);
+            ng.MarkDirty();
+            WriteAs<page_id_t>(g.Data(), next);
+            g.MarkDirty();
+            grew = true;
+        }
+        pid = next;
+    }
+    if (grew) data = Serialize();
+
+    size_t off = 0;
+    pid = CATALOG_PAGE_ID;
+    while (true) {
+        PageGuard g = PageGuard::Fetch(bpm_, pid);
+        char* d = g.Data();
+        size_t chunk = std::min(CAT_CAP, data.size() - off);
+        if (pid == CATALOG_PAGE_ID) WriteAs<uint32_t>(d + 4, static_cast<uint32_t>(data.size()));
+        std::memcpy(d + CAT_HDR, data.data() + off, chunk);
+        off += chunk;
+        g.MarkDirty();
+        if (off >= data.size()) break;
+        pid = ReadAs<page_id_t>(d);
+        if (pid == INVALID_PAGE_ID) throw DbError("internal: catalog chain too short");
+    }
+}
+
+std::string Catalog::Serialize() const {
     Writer w;
     w.Str(kMagic);
     w.U32(static_cast<uint32_t>(tables_.size()));
@@ -101,28 +140,11 @@ void Catalog::Save() {
         w.U8(idx->unique ? 1 : 0);
         w.I32(idx->tree->Root());
     }
-
-    const std::string& data = w.buf;
-    size_t off = 0;
-    page_id_t pid = CATALOG_PAGE_ID;
-    while (true) {
-        PageGuard g = PageGuard::Fetch(bpm_, pid);
-        char* d = g.Data();
-        size_t chunk = std::min(CAT_CAP, data.size() - off);
-        if (pid == CATALOG_PAGE_ID) WriteAs<uint32_t>(d + 4, static_cast<uint32_t>(data.size()));
-        std::memcpy(d + CAT_HDR, data.data() + off, chunk);
-        off += chunk;
-        g.MarkDirty();
-        if (off >= data.size()) break;
-        page_id_t next = ReadAs<page_id_t>(d);
-        if (next == INVALID_PAGE_ID) {  // grow the catalog chain
-            PageGuard ng = PageGuard::New(bpm_, &next);
-            WriteAs<page_id_t>(ng.Data(), INVALID_PAGE_ID);
-            ng.MarkDirty();
-            WriteAs<page_id_t>(d, next);
-        }
-        pid = next;
-    }
+    // Free-page list (pages of dropped tables/indexes). Files written before this
+    // section existed simply end here; Load treats that as "no free pages".
+    w.U32(static_cast<uint32_t>(bpm_->FreePages().size()));
+    for (page_id_t p : bpm_->FreePages()) w.I32(p);
+    return std::move(w.buf);
 }
 
 void Catalog::Load() {
@@ -176,6 +198,16 @@ void Catalog::Load() {
         idx->tree = std::make_unique<BPlusTree>(bpm_, root);
         indexes_[idx->name] = std::move(idx);
     }
+    std::set<page_id_t> free_pages;
+    if (r.pos < data.size()) {  // absent in files from before page reuse existed
+        uint32_t nf = r.U32();
+        for (uint32_t i = 0; i < nf; ++i) {
+            page_id_t p = r.I32();
+            if (p <= CATALOG_PAGE_ID || p >= bpm_->Disk()->NumPages()) throw DbError("catalog is corrupt");
+            free_pages.insert(p);
+        }
+    }
+    bpm_->SetFreePages(std::move(free_pages));
 }
 
 TableInfo* Catalog::CreateTable(const std::string& name, std::vector<Column> cols) {
@@ -208,15 +240,23 @@ TableInfo* Catalog::RequireTable(const std::string& name) {
 }
 
 void Catalog::DropTable(const std::string& name) {
-    RequireTable(name);
+    TableInfo* t = RequireTable(name);
+    std::vector<page_id_t> pages = t->heap->Pages();
     for (auto it = indexes_.begin(); it != indexes_.end();) {
-        if (it->second->table == name)
+        if (it->second->table == name) {
+            auto tree_pages = it->second->tree->Pages();
+            pages.insert(pages.end(), tree_pages.begin(), tree_pages.end());
             it = indexes_.erase(it);
-        else
+        } else {
             ++it;
+        }
     }
     tables_.erase(name);
-    // NOTE: the table's pages are not returned to a free list (no page reuse yet).
+    FreePages(pages);  // reused by the next tables / indexes instead of growing the file
+}
+
+void Catalog::FreePages(const std::vector<page_id_t>& pages) {
+    for (page_id_t p : pages) bpm_->DeletePage(p);
 }
 
 IndexInfo* Catalog::CreateIndex(const std::string& name, const std::string& table, const std::string& column,
@@ -245,8 +285,10 @@ IndexInfo* Catalog::CreateIndex(const std::string& name, const std::string& tabl
         Row row = DeserializeTuple(t->schema, buf.data(), buf.size());
         if (row[col].IsNull()) continue;
         int64_t key = row[col].AsInt();
-        if (unique && idx->tree->ContainsKey(key))
+        if (unique && idx->tree->ContainsKey(key)) {
+            FreePages(idx->tree->Pages());  // don't leak the partially built tree
             throw DbError("could not create unique index \"" + name + "\": duplicate key " + std::to_string(key));
+        }
         idx->tree->Insert(key, rid);
     }
     IndexInfo* raw = idx.get();
@@ -255,7 +297,11 @@ IndexInfo* Catalog::CreateIndex(const std::string& name, const std::string& tabl
 }
 
 void Catalog::DropIndex(const std::string& name) {
-    if (!indexes_.erase(name)) throw DbError("index \"" + name + "\" does not exist");
+    auto it = indexes_.find(name);
+    if (it == indexes_.end()) throw DbError("index \"" + name + "\" does not exist");
+    std::vector<page_id_t> pages = it->second->tree->Pages();
+    indexes_.erase(it);
+    FreePages(pages);
 }
 
 std::vector<IndexInfo*> Catalog::IndexesOf(const std::string& table) {

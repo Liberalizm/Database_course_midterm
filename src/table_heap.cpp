@@ -91,6 +91,16 @@ RID TableHeap::Update(RID rid, const std::string& tuple) {
     return Insert(tuple);
 }
 
+std::vector<page_id_t> TableHeap::Pages() const {
+    std::vector<page_id_t> out;
+    for (page_id_t p = first_; p != INVALID_PAGE_ID;) {
+        out.push_back(p);
+        PageGuard g = PageGuard::Fetch(bpm_, p);
+        p = TablePage(g.Data()).NextPageId();
+    }
+    return out;
+}
+
 bool TableHeap::Iterator::Next(RID* rid, std::string* data) {
     while (page_ != INVALID_PAGE_ID) {
         PageGuard g = PageGuard::Fetch(bpm_, page_);

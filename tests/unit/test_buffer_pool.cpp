@@ -151,5 +151,68 @@ TEST_F(BufferPoolTest, DestructorFlushesDirtyPages) {
     EXPECT_STREQ(buf, "written by destructor");
 }
 
+TEST_F(BufferPoolTest, DeletedPagesAreReusedLowestFirstAndZeroed) {
+    BufferPoolManager bpm(8, &disk);
+    auto ids = MakePages(bpm, 5);  // pages 0..4, still cached and dirty
+    bpm.DeletePage(ids[3]);
+    bpm.DeletePage(ids[1]);
+    EXPECT_EQ(bpm.FreePages(), (std::set<page_id_t>{ids[1], ids[3]}));
+
+    page_id_t pid;
+    {
+        PageGuard g = PageGuard::New(&bpm, &pid);
+        EXPECT_EQ(pid, ids[1]) << "lowest free page first";
+        for (size_t i = 0; i < PAGE_SIZE; ++i) ASSERT_EQ(g.Data()[i], 0) << "old contents must not leak";
+    }
+    PageGuard::New(&bpm, &pid);
+    EXPECT_EQ(pid, ids[3]);
+    PageGuard::New(&bpm, &pid);
+    EXPECT_EQ(pid, 5) << "free list exhausted: the file grows again";
+    EXPECT_EQ(disk.NumPages(), 6);
+    EXPECT_TRUE(bpm.FreePages().empty());
+}
+
+TEST_F(BufferPoolTest, DeletedDirtyPageIsNotWrittenBack) {
+    BufferPoolManager bpm(8, &disk);
+    auto ids = MakePages(bpm, 2);
+    bpm.FlushAll();
+    {
+        PageGuard g = PageGuard::Fetch(&bpm, ids[1]);
+        std::strcpy(g.Data(), "garbage");
+        g.MarkDirty();
+    }
+    uint64_t writes = disk.Writes();
+    bpm.DeletePage(ids[1]);
+    bpm.FlushAll();
+    EXPECT_EQ(disk.Writes(), writes) << "a freed page needs no write-back";
+    EXPECT_EQ(bpm.PinnedFrames(), 0u);
+}
+
+TEST_F(BufferPoolTest, DeletePageRejectsMisuse) {
+    BufferPoolManager bpm(8, &disk);
+    auto ids = MakePages(bpm, 3);
+    PageGuard pinned = PageGuard::Fetch(&bpm, ids[1]);
+    EXPECT_THROW(bpm.DeletePage(ids[1]), DbError) << "pinned";
+    EXPECT_THROW(bpm.DeletePage(0), DbError) << "the catalog page is never freed";
+    EXPECT_THROW(bpm.DeletePage(99), DbError) << "beyond the end of the file";
+    bpm.DeletePage(ids[2]);
+    EXPECT_THROW(bpm.DeletePage(ids[2]), DbError) << "double free";
+}
+
+TEST_F(BufferPoolTest, FreedFramesAreReusedWhenThePoolIsFull) {
+    BufferPoolManager bpm(8, &disk);
+    std::vector<PageGuard> held;
+    for (int i = 0; i < 8; ++i) {
+        page_id_t pid;
+        held.push_back(PageGuard::New(&bpm, &pid));
+    }
+    page_id_t victim = held[7].Id();
+    held[7].Release();
+    bpm.DeletePage(victim);
+    page_id_t pid;
+    EXPECT_NO_THROW(PageGuard::New(&bpm, &pid)) << "the freed frame is available again";
+    EXPECT_EQ(pid, victim);
+}
+
 }  // namespace
 }  // namespace minidb

@@ -50,6 +50,8 @@ public:
 
 private:
     void Load();
+    std::string Serialize() const;
+    void FreePages(const std::vector<page_id_t>& pages);
 
     BufferPoolManager* bpm_;
     std::map<std::string, std::unique_ptr<TableInfo>> tables_;

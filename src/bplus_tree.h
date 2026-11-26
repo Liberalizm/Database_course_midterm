@@ -62,6 +62,8 @@ public:
     Iterator Begin() const;                  // smallest entry
     Iterator LowerBound(int64_t key) const;  // first entry with entry.key >= key
     int Height() const;
+    // Every node page of the tree (used to free them on DROP INDEX / DROP TABLE).
+    std::vector<page_id_t> Pages() const;
 
     // Smallest / largest key (statistics for the planner). False if unknown/empty.
     bool MinKey(int64_t* out) const;

@@ -78,5 +78,19 @@ TEST(Persistence, NotADatabaseFile) {
     EXPECT_THROW(Database(f.path(), 16), DbError);
 }
 
+TEST(Persistence, DroppedTablesDoNotGrowTheFileForever) {
+    TempFile f;
+    page_id_t after_first_cycle = 0;
+    for (int cycle = 0; cycle < 5; ++cycle) {
+        Database db(f.path(), 32);  // a restart between every cycle
+        db.Execute("CREATE TABLE scratch (id INT PRIMARY KEY, grp INT, s TEXT); CREATE INDEX scratch_grp ON scratch (grp)");
+        db.Populate("scratch", 2000);
+        EXPECT_EQ(Scalar(db, "SELECT COUNT(*) FROM scratch WHERE id > 0"), 2000);
+        db.Execute("DROP TABLE scratch");
+        if (cycle == 0) after_first_cycle = db.Disk().NumPages();
+        EXPECT_EQ(db.Disk().NumPages(), after_first_cycle) << "cycle " << cycle << " should only reuse freed pages";
+    }
+}
+
 }  // namespace
 }  // namespace minidb
