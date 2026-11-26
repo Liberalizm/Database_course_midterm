@@ -155,8 +155,8 @@ std::string ProjectionExecutor::Describe() const {
 
 // ---------------- Nested loop join ----------------
 
-NestedLoopJoinExecutor::NestedLoopJoinExecutor(ExecPtr left, ExecPtr right, ExprPtr pred)
-    : left_(std::move(left)), right_(std::move(right)), pred_(std::move(pred)) {
+NestedLoopJoinExecutor::NestedLoopJoinExecutor(ExecPtr left, ExecPtr right, ExprPtr pred, bool left_outer)
+    : left_(std::move(left)), right_(std::move(right)), pred_(std::move(pred)), left_outer_(left_outer) {
     schema_ = Schema::Concat(left_->OutSchema(), right_->OutSchema());
 }
 
@@ -171,34 +171,44 @@ bool NestedLoopJoinExecutor::NextImpl(Row* out) {
             if (!left_->Next(&left_row_)) return false;
             right_->Init();  // rescan inner side
             have_left_ = true;
+            matched_ = false;
         }
         Row r;
         while (right_->Next(&r)) {
             Row c = left_row_;
             c.insert(c.end(), r.begin(), r.end());
             if (!pred_ || IsTrue(Evaluate(*pred_, c))) {
+                matched_ = true;
                 *out = std::move(c);
                 return true;
             }
         }
         have_left_ = false;
+        if (left_outer_ && !matched_) {
+            *out = left_row_;
+            out->resize(schema_.Size());  // NULLs for the right side
+            return true;
+        }
     }
 }
 
 std::string NestedLoopJoinExecutor::Describe() const {
-    return "Nested Loop Join" + (pred_ ? "  Join Filter: " + pred_->ToString() : std::string("  (cross product)"));
+    std::string name = left_outer_ ? "Nested Loop Left Join" : "Nested Loop Join";
+    return name + (pred_ ? "  Join Filter: " + pred_->ToString() : std::string("  (cross product)"));
 }
 
 // ---------------- Hash join ----------------
 
 HashJoinExecutor::HashJoinExecutor(ExecPtr probe, ExecPtr build, std::vector<ExprPtr> probe_keys,
-                                   std::vector<ExprPtr> build_keys, ExprPtr residual, std::string cond_text)
+                                   std::vector<ExprPtr> build_keys, ExprPtr residual, std::string cond_text,
+                                   bool left_outer)
     : probe_(std::move(probe)),
       build_(std::move(build)),
       probe_keys_(std::move(probe_keys)),
       build_keys_(std::move(build_keys)),
       residual_(std::move(residual)),
-      cond_text_(std::move(cond_text)) {
+      cond_text_(std::move(cond_text)),
+      left_outer_(left_outer) {
     schema_ = Schema::Concat(probe_->OutSchema(), build_->OutSchema());
 }
 
@@ -223,34 +233,44 @@ void HashJoinExecutor::InitImpl() {
     probe_->Init();
     matches_ = nullptr;
     match_idx_ = 0;
+    have_probe_ = false;
 }
 
 bool HashJoinExecutor::NextImpl(Row* out) {
     std::string key;
     while (true) {
-        if (matches_ && match_idx_ < matches_->size()) {
-            const Row& b = (*matches_)[match_idx_++];
-            Row c = probe_row_;
-            c.insert(c.end(), b.begin(), b.end());
-            if (!residual_ || IsTrue(Evaluate(*residual_, c))) {
-                *out = std::move(c);
+        if (have_probe_) {
+            while (matches_ && match_idx_ < matches_->size()) {
+                const Row& b = (*matches_)[match_idx_++];
+                Row c = probe_row_;
+                c.insert(c.end(), b.begin(), b.end());
+                if (!residual_ || IsTrue(Evaluate(*residual_, c))) {
+                    matched_ = true;
+                    *out = std::move(c);
+                    return true;
+                }
+            }
+            have_probe_ = false;
+            if (left_outer_ && !matched_) {  // no partner (or a NULL key): pad with NULLs
+                *out = probe_row_;
+                out->resize(schema_.Size());
                 return true;
             }
-            continue;
         }
-        matches_ = nullptr;
         if (!probe_->Next(&probe_row_)) return false;
-        if (!MakeKey(probe_keys_, probe_row_, &key)) continue;
-        auto it = table_.find(key);
-        if (it != table_.end()) {
-            matches_ = &it->second;
-            match_idx_ = 0;
+        have_probe_ = true;
+        matched_ = false;
+        matches_ = nullptr;
+        match_idx_ = 0;
+        if (MakeKey(probe_keys_, probe_row_, &key)) {
+            auto it = table_.find(key);
+            if (it != table_.end()) matches_ = &it->second;
         }
     }
 }
 
 std::string HashJoinExecutor::Describe() const {
-    std::string s = "Hash Join  Hash Cond: " + cond_text_;
+    std::string s = std::string(left_outer_ ? "Hash Left Join" : "Hash Join") + "  Hash Cond: " + cond_text_;
     if (residual_) s += "  Join Filter: " + residual_->ToString();
     return s;
 }

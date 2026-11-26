@@ -116,6 +116,39 @@ TEST_F(PlannerTest, EquiJoinUsesHashJoinWithSmallerBuildSide) {
     EXPECT_TRUE(Has(kids[1]->Describe(), "on small")) << "build = small";
 }
 
+TEST_F(PlannerTest, LeftJoinAlwaysProbesWithThePreservedSide) {
+    // Even though `small` is the smaller input, it is the preserved side of the
+    // LEFT JOIN, so it must be probed, and `big` becomes the build side.
+    auto plan = PlanOf("SELECT * FROM small s LEFT JOIN big b ON b.grp = s.id");
+    const Executor* join = plan->Children().at(0);
+    ASSERT_TRUE(Has(join->Describe(), "Hash Left Join")) << join->Describe();
+    EXPECT_TRUE(Has(join->Children()[0]->Describe(), "on small"));
+    EXPECT_TRUE(Has(join->Children()[1]->Describe(), "on big"));
+    EXPECT_TRUE(Has(ExplainOf("SELECT * FROM tiny a LEFT JOIN tiny b ON a.v < b.v"), "Nested Loop Left Join"));
+}
+
+TEST_F(PlannerTest, LeftJoinFiltersAreAppliedOnTheCorrectSide) {
+    // ON condition on the right table alone -> filters its scan (still a LEFT JOIN).
+    auto on_plan = ExplainOf("SELECT * FROM tiny a LEFT JOIN tiny b ON a.id = b.id AND b.v > 10");
+    EXPECT_TRUE(Has(on_plan, "Seq Scan on tiny b  Filter: b.v > 10")) << on_plan;
+    EXPECT_EQ(Rows("SELECT * FROM tiny a LEFT JOIN tiny b ON a.id = b.id AND b.v > 10"), 3u);
+    // The same condition in WHERE must run *after* the join (it removes padded rows).
+    auto where_plan = ExplainOf("SELECT * FROM tiny a LEFT JOIN tiny b ON a.id = b.id WHERE b.v > 10");
+    EXPECT_FALSE(Has(where_plan, "Seq Scan on tiny b  Filter")) << where_plan;
+    EXPECT_TRUE(Has(where_plan, "Filter: b.v > 10")) << where_plan;
+    EXPECT_EQ(Rows("SELECT * FROM tiny a LEFT JOIN tiny b ON a.id = b.id WHERE b.v > 10"), 2u);
+    // WHERE on the preserved side is still pushed down.
+    EXPECT_TRUE(Has(ExplainOf("SELECT * FROM tiny a LEFT JOIN tiny b ON a.id = b.id WHERE a.v > 10"),
+                    "Seq Scan on tiny a  Filter: a.v > 10"));
+    // An ON condition on the left table alone must not drop left rows.
+    EXPECT_EQ(Rows("SELECT * FROM tiny a LEFT JOIN tiny b ON a.v > 10 AND a.id = b.id"), 3u);
+}
+
+TEST_F(PlannerTest, LeftJoinOnMayOnlyReferToTablesBeforeIt) {
+    EXPECT_THROW(PlanOf("SELECT * FROM tiny a LEFT JOIN tiny b ON b.id = c.id LEFT JOIN tiny c ON TRUE"), DbError);
+    EXPECT_THROW(PlanOf("SELECT * FROM tiny a LEFT JOIN tiny b ON COUNT(*) > 1"), DbError);
+}
+
 TEST_F(PlannerTest, NonEquiJoinUsesNestedLoop) {
     EXPECT_TRUE(Has(ExplainOf("SELECT * FROM small a, small b WHERE a.id < b.id"), "Nested Loop Join"));
     EXPECT_EQ(Rows("SELECT * FROM small a, small b WHERE a.id < b.id"), 50u * 49u / 2u);

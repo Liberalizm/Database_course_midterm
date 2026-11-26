@@ -19,7 +19,7 @@ SQL (end every statement with ';'):
   CREATE [UNIQUE] INDEX idx ON t (col);        DROP TABLE t;  DROP INDEX idx;
   INSERT INTO t VALUES (1, 'a', 2.5, true), (2, 'b', NULL, false);
   INSERT INTO t (id, name) SELECT ...;
-  SELECT [DISTINCT] cols | * FROM a [JOIN b ON ...] [, c] WHERE ...
+  SELECT [DISTINCT] cols | * FROM a [[LEFT] JOIN b ON ...] [, c] WHERE ...
          GROUP BY ... HAVING ... ORDER BY ... [DESC] LIMIT n OFFSET m;
   UPDATE t SET col = expr WHERE ...;           DELETE FROM t WHERE ...;
   EXPLAIN [ANALYZE] SELECT ...;

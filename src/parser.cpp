@@ -14,7 +14,8 @@ const std::set<std::string>& Reserved() {
         "join",   "inner",  "cross",  "on",      "and",    "or",      "not",    "as",      "asc",
         "desc",   "insert", "into",   "values",  "create", "table",   "index",  "drop",    "delete",
         "update", "set",    "explain", "analyze", "null",  "is",      "true",   "false",   "distinct",
-        "primary", "key",   "unique", "between", "in",     "like"};
+        "primary", "key",   "unique", "between", "in",     "like",    "left",   "right",   "full",
+        "outer"};
     return kw;
 }
 
@@ -48,6 +49,7 @@ std::vector<Token> Tokenize(const std::string& sql) {
             if (j == i + 1) throw DbError("zero-length quoted identifier");
             t.type = TokenType::IDENT;
             t.text = sql.substr(i + 1, j - i - 1);
+            t.quoted = true;
             i = j + 1;
         } else if (std::isdigit(c)) {
             size_t j = i;
@@ -132,7 +134,9 @@ Token Parser::Advance() {
     return t;
 }
 
-bool Parser::CheckKw(const char* kw) const { return Peek().type == TokenType::IDENT && Peek().text == kw; }
+bool Parser::CheckKw(const char* kw) const {
+    return Peek().type == TokenType::IDENT && !Peek().quoted && Peek().text == kw;
+}
 bool Parser::AcceptKw(const char* kw) {
     if (!CheckKw(kw)) return false;
     Advance();
@@ -153,12 +157,12 @@ void Parser::ExpectSym(const char* s) {
 
 std::string Parser::ExpectIdent() {
     const Token& t = Peek();
-    if (t.type != TokenType::IDENT || Reserved().count(t.text)) Error("expected identifier");
+    if (t.type != TokenType::IDENT || (!t.quoted && Reserved().count(t.text))) Error("expected identifier");
     return Advance().text;
 }
 
 bool Parser::IsAliasToken() const {
-    return Peek().type == TokenType::IDENT && !Reserved().count(Peek().text);
+    return Peek().type == TokenType::IDENT && (Peek().quoted || !Reserved().count(Peek().text));
 }
 
 int64_t Parser::ExpectInteger() {
@@ -369,6 +373,15 @@ SelectStmt Parser::ParseSelect() {
         while (true) {
             if (AcceptSym(",")) {
                 parse_ref();
+            } else if (AcceptKw("left")) {
+                AcceptKw("outer");
+                ExpectKw("join");
+                parse_ref();
+                ExpectKw("on");
+                s.from.back().left_join = true;
+                s.from.back().on = ParseExpr();
+            } else if (CheckKw("right") || CheckKw("full")) {
+                Error("only INNER, CROSS and LEFT joins are supported (rewrite RIGHT JOIN as LEFT JOIN)");
             } else if (CheckKw("join") || CheckKw("inner") || CheckKw("cross")) {
                 bool cross = AcceptKw("cross");
                 if (!cross) AcceptKw("inner");

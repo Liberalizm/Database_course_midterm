@@ -131,6 +131,80 @@ TEST(Executors, HashJoinIntAndDoubleKeysMatch) {
     EXPECT_EQ(Drain(j).size(), 1u);
 }
 
+// ---- LEFT JOIN (left_outer) ----
+
+// Rows rendered as text and sorted, so join outputs can be compared as multisets.
+std::vector<std::string> Canon(std::vector<Row> rows) {
+    std::vector<std::string> out;
+    for (const auto& r : rows) {
+        std::string s;
+        for (const auto& v : r) s += (v.IsNull() ? "NULL" : v.ToString()) + "|";
+        out.push_back(s);
+    }
+    std::sort(out.begin(), out.end());
+    return out;
+}
+
+TEST(Executors, NestedLoopLeftJoinPadsUnmatchedRowsWithNulls) {
+    Schema both = Schema::Concat(People(), Depts());
+    NestedLoopJoinExecutor j(Vec(People(), PeopleRows()), Vec(Depts(), DeptRows()),
+                             Bin(BinOp::EQ, ColRef(both, "p", "dept"), ColRef(both, "d", "id")), true);
+    auto rows = Drain(j);
+    ASSERT_EQ(rows.size(), 4u) << "every person exactly once (one dept each at most)";
+    EXPECT_EQ(rows[3][1].AsText(), "dan");
+    EXPECT_TRUE(rows[3][3].IsNull()) << "NULL dept never matches but the row is kept";
+    EXPECT_TRUE(rows[3][4].IsNull());
+    EXPECT_EQ(rows[3].size(), 5u);
+    EXPECT_NE(j.Describe().find("Left Join"), std::string::npos);
+}
+
+TEST(Executors, NestedLoopLeftJoinWithEmptyRightSide) {
+    NestedLoopJoinExecutor j(Vec(People(), PeopleRows()), Vec(Depts(), {}), nullptr, true);
+    auto rows = Drain(j);
+    ASSERT_EQ(rows.size(), 4u);
+    for (const auto& r : rows) EXPECT_TRUE(r[3].IsNull() && r[4].IsNull());
+    NestedLoopJoinExecutor inner(Vec(People(), PeopleRows()), Vec(Depts(), {}), nullptr);
+    EXPECT_TRUE(Drain(inner).empty());
+}
+
+TEST(Executors, HashLeftJoinDuplicatesNullKeysAndResidual) {
+    Schema l({Col("k", TypeId::INT, "l"), Col("v", TypeId::INT, "l")});
+    Schema r({Col("k", TypeId::INT, "r"), Col("w", TypeId::INT, "r")});
+    std::vector<Row> lrows = {{I(1), I(1)}, {I(1), I(9)}, {I(2), I(3)}, {N(), I(4)}};
+    std::vector<Row> rrows = {{I(1), I(5)}, {I(1), I(0)}, {I(3), I(9)}};
+    Schema both = Schema::Concat(l, r);
+    // l.k = r.k AND l.v < r.w: (1,1) matches (1,5); (1,9) matches nothing -> padded;
+    // (2,3) has no key partner -> padded; (NULL,4) never joins -> padded.
+    HashJoinExecutor j(Vec(l, lrows), Vec(r, rrows), {ColRef(l, "", "k")}, {ColRef(r, "", "k")},
+                       Bin(BinOp::LT, ColRef(both, "l", "v"), ColRef(both, "r", "w")), "", true);
+    auto rows = Canon(Drain(j));
+    std::vector<std::string> expected = {"1|1|1|5|", "1|9|NULL|NULL|", "2|3|NULL|NULL|", "NULL|4|NULL|NULL|"};
+    std::sort(expected.begin(), expected.end());
+    EXPECT_EQ(rows, expected);
+    EXPECT_EQ(Canon(Drain(j)), expected) << "re-initialization starts over";
+}
+
+TEST(Executors, HashLeftJoinAgreesWithNestedLoopLeftJoinOnRandomData) {
+    for (uint32_t seed = 1; seed <= 5; ++seed) {
+        std::mt19937 rng(seed);
+        Schema l({Col("a", TypeId::INT, "l"), Col("x", TypeId::INT, "l")});
+        Schema r({Col("b", TypeId::INT, "r"), Col("y", TypeId::INT, "r")});
+        std::vector<Row> lrows, rrows;
+        for (int i = 0; i < 200; ++i) lrows.push_back({rng() % 10 == 0 ? N() : I(rng() % 40), I(rng() % 5)});
+        for (int i = 0; i < 150; ++i) rrows.push_back({I(rng() % 60), I(rng() % 5)});
+        Schema both = Schema::Concat(l, r);
+        ExprPtr residual = Bin(BinOp::LE, ColRef(both, "", "x"), ColRef(both, "", "y"));
+        HashJoinExecutor hj(Vec(l, lrows), Vec(r, rrows), {ColRef(l, "", "a")}, {ColRef(r, "", "b")}, residual, "",
+                            true);
+        NestedLoopJoinExecutor nl(Vec(l, lrows), Vec(r, rrows),
+                                  Bin(BinOp::AND, Bin(BinOp::EQ, ColRef(both, "", "a"), ColRef(both, "", "b")), residual),
+                                  true);
+        auto h = Canon(Drain(hj));
+        EXPECT_EQ(h, Canon(Drain(nl))) << "seed " << seed;
+        EXPECT_GE(h.size(), lrows.size()) << "a LEFT JOIN never loses left rows";
+    }
+}
+
 TEST(Executors, AggregateWithGroups) {
     Schema s({Col("g", TypeId::TEXT), Col("x", TypeId::INT)});
     std::vector<Row> rows = {{T("a"), I(1)}, {T("b"), I(10)}, {T("a"), I(3)}, {T("a"), N()}, {T("b"), I(20)}};

@@ -139,6 +139,11 @@ struct SelectItem {
 
 struct TableRef {
     std::string name, alias;
+    // "... LEFT JOIN name ON on": every row of the tables before this one is kept,
+    // padded with NULLs when no row of this table satisfies `on`. Inner-join ON
+    // conditions are simply merged into WHERE, but a LEFT JOIN's must stay here.
+    bool left_join = false;
+    ExprPtr on;
 };
 
 struct OrderItem {

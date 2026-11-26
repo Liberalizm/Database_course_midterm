@@ -262,6 +262,61 @@ TEST_F(SqlTest, HashJoinAndNestedLoopAgree) {
     EXPECT_GT(hash, 0);
 }
 
+TEST_F(SqlTest, LeftJoin) {
+    SeedCompany();
+    auto r = Q("SELECT d.name, e.name FROM dept d LEFT JOIN emp e ON e.dept_id = d.id ORDER BY d.id, e.id");
+    ASSERT_EQ(r.size(), 5u);
+    EXPECT_EQ(r[4][0].AsText(), "empty");
+    EXPECT_TRUE(r[4][1].IsNull()) << "a department without employees is kept";
+    auto counts = Q("SELECT d.name, COUNT(e.id) FROM dept d LEFT JOIN emp e ON e.dept_id = d.id "
+                    "GROUP BY d.name ORDER BY d.name");
+    ASSERT_EQ(counts.size(), 3u);
+    EXPECT_EQ(counts[0][1].AsInt(), 0);  // empty
+    EXPECT_EQ(counts[1][1].AsInt(), 2);  // eng
+    EXPECT_EQ(Scalar("SELECT COUNT(*) FROM emp e LEFT JOIN dept d ON e.dept_id = d.id WHERE d.id IS NULL"), 1)
+        << "anti-join: eve has no department";
+    EXPECT_EQ(Scalar("SELECT COUNT(*) FROM emp e LEFT JOIN dept d ON e.dept_id = d.id LEFT JOIN emp m ON "
+                     "m.dept_id = d.id AND m.salary > e.salary"),
+              5)
+        << "chained left joins: bob -> ann and cid -> dan earn more; ann, dan, eve get one padded row each";
+    // Usable as a source for INSERT ... SELECT.
+    db->Execute("CREATE TABLE report (dept TEXT, n INT)");
+    EXPECT_EQ(Msg("INSERT INTO report SELECT d.name, e.id FROM dept d LEFT JOIN emp e ON e.dept_id = d.id"),
+              "INSERT 5");
+}
+
+TEST_F(SqlTest, QuotedIdentifiersAreNeverKeywords) {
+    db->Execute("CREATE TABLE \"select\" (\"left\" INT, \"right\" TEXT, \"null\" INT)");
+    db->Execute("INSERT INTO \"select\" (\"left\", \"right\", \"null\") VALUES (1, 'r', 7)");
+    auto r = Q("SELECT \"left\", \"right\", \"null\" FROM \"select\" WHERE \"left\" = 1");
+    ASSERT_EQ(r.size(), 1u);
+    EXPECT_EQ(r[0][1].AsText(), "r");
+    EXPECT_EQ(r[0][2].AsInt(), 7) << "\"null\" is a column, not the NULL literal";
+    EXPECT_EQ(Scalar("SELECT COUNT(*) FROM \"select\" \"left\" WHERE \"left\".\"left\" = 1"), 1) << "as an alias too";
+}
+
+// Differential: LEFT JOIN = inner join + every unmatched left row padded with NULLs,
+// for both the hash and the nested loop algorithm.
+TEST_F(SqlTest, LeftJoinMatchesItsDefinitionOnRandomData) {
+    db->Execute("CREATE TABLE a (id INT PRIMARY KEY, k INT); CREATE TABLE b (id INT PRIMARY KEY, k INT)");
+    db->Populate("a", 300);
+    db->Populate("b", 120);
+    db->Execute("UPDATE a SET k = NULL WHERE id % 17 = 0");
+    db->Execute("UPDATE b SET k = k + 1000 WHERE id % 3 = 0");  // fewer partners
+    int64_t inner = Scalar("SELECT COUNT(*) FROM a JOIN b ON a.k = b.k");
+    int64_t unmatched = 0;
+    std::map<int64_t, int> bkeys;
+    for (auto& row : Q("SELECT k FROM b")) bkeys[row[0].AsInt()]++;
+    for (auto& row : Q("SELECT k FROM a"))
+        if (row[0].IsNull() || !bkeys.count(row[0].AsInt())) ++unmatched;
+    ASSERT_GT(unmatched, 0);
+    int64_t hash = Scalar("SELECT COUNT(*) FROM a LEFT JOIN b ON a.k = b.k");
+    int64_t loop = Scalar("SELECT COUNT(*) FROM a LEFT JOIN b ON a.k <= b.k AND a.k >= b.k");
+    EXPECT_EQ(hash, inner + unmatched);
+    EXPECT_EQ(loop, inner + unmatched);
+    EXPECT_EQ(Scalar("SELECT COUNT(*) FROM a LEFT JOIN b ON a.k = b.k WHERE b.id IS NULL"), unmatched);
+}
+
 TEST_F(SqlTest, CorrectWithTinyBufferPool) {
     db.reset();
     db = std::make_unique<Database>(file.path(), 8);  // 8 frames = 32 KB of cache

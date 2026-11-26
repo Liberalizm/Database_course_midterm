@@ -286,6 +286,14 @@ ExecPtr Planner::PlanSelect(const SelectStmt& stmt) {
         if (!stmt.items[i].star) item_exprs[i] = Canonicalize(stmt.items[i].expr, srcs);
 
     // ---------- 4. classify WHERE conjuncts by the tables they touch ----------
+    // A table on the right of a LEFT JOIN is "nullable": its columns are NULL in
+    // padded rows, so WHERE conditions on it must run after that join, never be
+    // pushed into its scan (that would turn the LEFT JOIN into an inner join).
+    bool has_left_join = false;
+    std::vector<bool> nullable(srcs.size(), false);
+    for (size_t i = 0; i < stmt.from.size(); ++i)
+        if (stmt.from[i].left_join) has_left_join = nullable[i] = true;
+
     struct Pending {
         ExprPtr e;
         std::set<int> tabs;
@@ -296,10 +304,29 @@ ExecPtr Planner::PlanSelect(const SelectStmt& stmt) {
     for (auto& c : SplitConjuncts(where)) {
         std::set<int> tabs;
         ReferencedTables(*c, srcs, &tabs);
-        if (tabs.size() == 1)
+        if (tabs.size() == 1 && !nullable[static_cast<size_t>(*tabs.begin())])
             per_table[static_cast<size_t>(*tabs.begin())].push_back(c);  // pushdown
         else
             pending.push_back({c, tabs});
+    }
+
+    // LEFT JOIN ... ON: conditions on the joined table alone only decide which of
+    // its rows can match, so they may filter its scan; the rest stay join conditions.
+    // An ON clause may only refer to tables up to and including its own.
+    std::vector<std::vector<ExprPtr>> on_conds(srcs.size());
+    for (size_t i = 0; i < stmt.from.size(); ++i) {
+        if (!stmt.from[i].left_join) continue;
+        std::vector<Source> visible(srcs.begin(), srcs.begin() + static_cast<std::ptrdiff_t>(i) + 1);
+        ExprPtr on = Canonicalize(stmt.from[i].on, visible);
+        if (ContainsAggregate(*on)) throw DbError("aggregate functions are not allowed in JOIN conditions");
+        for (auto& c : SplitConjuncts(on)) {
+            std::set<int> tabs;
+            ReferencedTables(*c, srcs, &tabs);
+            if (tabs == std::set<int>{static_cast<int>(i)})
+                per_table[i].push_back(c);
+            else
+                on_conds[i].push_back(c);
+        }
     }
 
     // ---------- 5. access paths ----------
@@ -326,9 +353,110 @@ ExecPtr Planner::PlanSelect(const SelectStmt& stmt) {
         return ExecPtr(std::move(f));
     };
 
+    // Joins `left` (the tables in `joined`) with `right` (table `next`) on `conds`:
+    // a hash join if there are equi-join keys, a nested loop join otherwise.
+    auto make_join = [&](ExecPtr left, ExecPtr right, int next, const std::vector<ExprPtr>& conds,
+                         bool left_outer) -> ExecPtr {
+        // Split into equi-join keys (left_expr = right_expr) and residual predicates.
+        std::vector<ExprPtr> lkeys, rkeys, residual;
+        std::vector<std::string> cond_text;
+        for (auto& e : conds) {
+            bool is_key = false;
+            if (e->kind == ExprKind::BINARY && e->op == BinOp::EQ) {
+                std::set<int> lt, rt;
+                ReferencedTables(*e->left, srcs, &lt);
+                ReferencedTables(*e->right, srcs, &rt);
+                std::set<int> only_next{next};
+                if (!lt.empty() && !rt.empty()) {
+                    if (IsSubset(lt, joined) && rt == only_next) {
+                        lkeys.push_back(e->left);
+                        rkeys.push_back(e->right);
+                        is_key = true;
+                    } else if (IsSubset(rt, joined) && lt == only_next) {
+                        lkeys.push_back(e->right);
+                        rkeys.push_back(e->left);
+                        is_key = true;
+                    }
+                }
+            }
+            if (is_key)
+                cond_text.push_back(e->ToString());
+            else
+                residual.push_back(e);
+        }
+
+        double l_rows = left->est_rows, r_rows = right->est_rows;
+        double l_cost = left->est_cost, r_cost = right->est_cost;
+        ExecPtr join;
+        double out_rows, cost;
+        if (!lkeys.empty()) {
+            // Hash join; the smaller input becomes the build (hashed) side. For a
+            // LEFT JOIN the preserved left side must be the probe side.
+            out_rows = l_rows * r_rows / std::max(l_rows, r_rows) * SelectivityOf(residual);
+            cost = l_cost + r_cost + (l_rows + r_rows) * HASH_TUPLE_COST;
+            std::string text;
+            for (size_t i = 0; i < cond_text.size(); ++i) text += (i ? " AND " : "") + cond_text[i];
+            bool build_left = !left_outer && l_rows < r_rows;
+            ExecPtr probe = build_left ? std::move(right) : std::move(left);
+            ExecPtr build = build_left ? std::move(left) : std::move(right);
+            std::vector<ExprPtr> pk, bk;
+            for (size_t i = 0; i < lkeys.size(); ++i) {
+                const ExprPtr& pe = build_left ? rkeys[i] : lkeys[i];
+                const ExprPtr& be = build_left ? lkeys[i] : rkeys[i];
+                pk.push_back(BindExpr(pe, probe->OutSchema()));
+                bk.push_back(BindExpr(be, build->OutSchema()));
+            }
+            Schema combined = Schema::Concat(probe->OutSchema(), build->OutSchema());
+            ExprPtr res = residual.empty() ? nullptr : BindExpr(MakeConjunction(residual), combined);
+            join = std::make_unique<HashJoinExecutor>(std::move(probe), std::move(build), pk, bk, res, text,
+                                                      left_outer);
+        } else {
+            out_rows = l_rows * r_rows * SelectivityOf(residual);
+            cost = l_cost + l_rows * r_cost + l_rows * r_rows * CPU_TUPLE_COST;
+            Schema combined = Schema::Concat(left->OutSchema(), right->OutSchema());
+            ExprPtr pred = residual.empty() ? nullptr : BindExpr(MakeConjunction(residual), combined);
+            join = std::make_unique<NestedLoopJoinExecutor>(std::move(left), std::move(right), pred, left_outer);
+        }
+        if (left_outer) out_rows = std::max(out_rows, l_rows);  // every left row survives
+        join->est_rows = std::max(1.0, out_rows);
+        join->est_cost = cost;
+        return join;
+    };
+
+    // Predicates from WHERE / inner ON that can become join conditions once `next`
+    // is joined. Conditions on a nullable table never do: they must filter after
+    // the LEFT JOIN that pads it (apply_ready_filters takes care of them).
+    auto take_applicable = [&](int next) {
+        std::set<int> with = joined;
+        with.insert(next);
+        std::vector<ExprPtr> applicable;
+        for (auto& p : pending) {
+            if (p.used || !IsSubset(p.tabs, with)) continue;
+            bool touches_nullable = false;
+            for (int t : p.tabs) touches_nullable = touches_nullable || nullable[static_cast<size_t>(t)];
+            if (touches_nullable) continue;
+            applicable.push_back(p.e);
+            p.used = true;
+        }
+        return applicable;
+    };
+
     if (srcs.empty()) {
         root = std::make_unique<ValuesExecutor>();
         root = apply_ready_filters(std::move(root));
+    } else if (has_left_join) {
+        // Outer joins are not freely reorderable: join in the order written.
+        root = std::move(base[0]);
+        joined.insert(0);
+        root = apply_ready_filters(std::move(root));
+        for (size_t i = 1; i < srcs.size(); ++i) {
+            int next = static_cast<int>(i);
+            bool left_outer = stmt.from[i].left_join;
+            std::vector<ExprPtr> conds = left_outer ? on_conds[i] : take_applicable(next);
+            root = make_join(std::move(root), std::move(base[i]), next, conds, left_outer);
+            joined.insert(next);
+            root = apply_ready_filters(std::move(root));
+        }
     } else {
         int start = 0;
         for (size_t i = 1; i < srcs.size(); ++i)
@@ -355,79 +483,8 @@ ExecPtr Planner::PlanSelect(const SelectStmt& stmt) {
                     next_connected = connected;
                 }
             }
-            ExecPtr right = std::move(base[static_cast<size_t>(next)]);
-            std::set<int> with = joined;
-            with.insert(next);
-
-            // Join predicates that become applicable now.
-            std::vector<ExprPtr> applicable;
-            for (auto& p : pending) {
-                if (!p.used && IsSubset(p.tabs, with)) {
-                    applicable.push_back(p.e);
-                    p.used = true;
-                }
-            }
-            // Split into equi-join keys (left_expr = right_expr) and residual predicates.
-            std::vector<ExprPtr> lkeys, rkeys, residual;
-            std::vector<std::string> cond_text;
-            for (auto& e : applicable) {
-                bool is_key = false;
-                if (e->kind == ExprKind::BINARY && e->op == BinOp::EQ) {
-                    std::set<int> lt, rt;
-                    ReferencedTables(*e->left, srcs, &lt);
-                    ReferencedTables(*e->right, srcs, &rt);
-                    std::set<int> only_next{next};
-                    if (!lt.empty() && !rt.empty()) {
-                        if (IsSubset(lt, joined) && rt == only_next) {
-                            lkeys.push_back(e->left);
-                            rkeys.push_back(e->right);
-                            is_key = true;
-                        } else if (IsSubset(rt, joined) && lt == only_next) {
-                            lkeys.push_back(e->right);
-                            rkeys.push_back(e->left);
-                            is_key = true;
-                        }
-                    }
-                }
-                if (is_key)
-                    cond_text.push_back(e->ToString());
-                else
-                    residual.push_back(e);
-            }
-
-            double l_rows = root->est_rows, r_rows = right->est_rows;
-            double l_cost = root->est_cost, r_cost = right->est_cost;
-            ExecPtr join;
-            double out_rows, cost;
-            if (!lkeys.empty()) {
-                // Hash join; the smaller input becomes the build (hashed) side.
-                out_rows = l_rows * r_rows / std::max(l_rows, r_rows) * SelectivityOf(residual);
-                cost = l_cost + r_cost + (l_rows + r_rows) * HASH_TUPLE_COST;
-                std::string text;
-                for (size_t i = 0; i < cond_text.size(); ++i) text += (i ? " AND " : "") + cond_text[i];
-                bool build_left = l_rows < r_rows;
-                ExecPtr probe = build_left ? std::move(right) : std::move(root);
-                ExecPtr build = build_left ? std::move(root) : std::move(right);
-                std::vector<ExprPtr> pk, bk;
-                for (size_t i = 0; i < lkeys.size(); ++i) {
-                    const ExprPtr& pe = build_left ? rkeys[i] : lkeys[i];
-                    const ExprPtr& be = build_left ? lkeys[i] : rkeys[i];
-                    pk.push_back(BindExpr(pe, probe->OutSchema()));
-                    bk.push_back(BindExpr(be, build->OutSchema()));
-                }
-                Schema combined = Schema::Concat(probe->OutSchema(), build->OutSchema());
-                ExprPtr res = residual.empty() ? nullptr : BindExpr(MakeConjunction(residual), combined);
-                join = std::make_unique<HashJoinExecutor>(std::move(probe), std::move(build), pk, bk, res, text);
-            } else {
-                out_rows = l_rows * r_rows * SelectivityOf(residual);
-                cost = l_cost + l_rows * r_cost + l_rows * r_rows * CPU_TUPLE_COST;
-                Schema combined = Schema::Concat(root->OutSchema(), right->OutSchema());
-                ExprPtr pred = residual.empty() ? nullptr : BindExpr(MakeConjunction(residual), combined);
-                join = std::make_unique<NestedLoopJoinExecutor>(std::move(root), std::move(right), pred);
-            }
-            join->est_rows = std::max(1.0, out_rows);
-            join->est_cost = cost;
-            root = std::move(join);
+            std::vector<ExprPtr> applicable = take_applicable(next);
+            root = make_join(std::move(root), std::move(base[static_cast<size_t>(next)]), next, applicable, false);
             joined.insert(next);
             root = apply_ready_filters(std::move(root));
         }

@@ -13,6 +13,7 @@ enum class TokenType { IDENT, INTEGER, FLOAT, STRING, SYMBOL, END };
 struct Token {
     TokenType type = TokenType::END;
     std::string text;  // identifiers / keywords are lower-cased
+    bool quoted = false;  // "quoted identifier": never a keyword, keeps its case
     size_t pos = 0;
 };
 

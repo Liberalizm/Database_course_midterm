@@ -156,7 +156,9 @@ private:
 // For every outer row, re-scan the inner child completely.
 class NestedLoopJoinExecutor : public Executor {
 public:
-    NestedLoopJoinExecutor(ExecPtr left, ExecPtr right, ExprPtr pred);
+    // left_outer: a left row without any matching right row is still emitted once,
+    // padded with NULLs (LEFT JOIN).
+    NestedLoopJoinExecutor(ExecPtr left, ExecPtr right, ExprPtr pred, bool left_outer = false);
     std::string Describe() const override;
     std::vector<const Executor*> Children() const override { return {left_.get(), right_.get()}; }
 
@@ -169,14 +171,17 @@ private:
     ExprPtr pred_;
     Row left_row_;
     bool have_left_ = false;
+    bool left_outer_;
+    bool matched_ = false;  // current left row produced at least one output row
 };
 
 // Classic in-memory hash join: build a hash table on the `build` input, then
 // stream the `probe` input through it. Output = probe columns ++ build columns.
+// With left_outer the probe side is the preserved (left) side of a LEFT JOIN.
 class HashJoinExecutor : public Executor {
 public:
     HashJoinExecutor(ExecPtr probe, ExecPtr build, std::vector<ExprPtr> probe_keys, std::vector<ExprPtr> build_keys,
-                     ExprPtr residual, std::string cond_text);
+                     ExprPtr residual, std::string cond_text, bool left_outer = false);
     std::string Describe() const override;
     std::vector<const Executor*> Children() const override { return {probe_.get(), build_.get()}; }
 
@@ -194,6 +199,9 @@ private:
     const std::vector<Row>* matches_ = nullptr;
     size_t match_idx_ = 0;
     Row probe_row_;
+    bool have_probe_ = false;
+    bool left_outer_;
+    bool matched_ = false;
 };
 
 struct AggSpec {
