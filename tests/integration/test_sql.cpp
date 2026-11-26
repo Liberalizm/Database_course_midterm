@@ -468,6 +468,97 @@ TEST_F(SqlTest, SubqueriesInDml) {
     ExpectIndexesConsistent("dept");
 }
 
+TEST_F(SqlTest, CorrelatedSubqueriesInUpdateSetAndInsertValues) {
+    SeedCompany();  // eng: ann 100, bob 80 | sales: cid 50, dan 70 | eve: no dept, 60 | dept 3 "empty"
+    db->Execute("ALTER TABLE dept ADD COLUMN headcount INT");
+    db->Execute("CREATE INDEX dept_headcount ON dept (headcount)");  // must follow the correlated updates
+    auto col = [&](const std::string& sql) {
+        std::vector<Value> out;
+        for (auto& r : Q(sql)) out.push_back(r[0]);
+        return out;
+    };
+
+    // UPDATE ... SET: the subquery refers to the row being updated, qualified or not.
+    EXPECT_EQ(Msg("UPDATE dept SET headcount = (SELECT COUNT(*) FROM emp e WHERE e.dept_id = dept.id)"), "UPDATE 3");
+    auto hc = col("SELECT headcount FROM dept ORDER BY id");
+    EXPECT_EQ(hc[0].AsInt(), 2);
+    EXPECT_EQ(hc[1].AsInt(), 2);
+    EXPECT_EQ(hc[2].AsInt(), 0);
+    EXPECT_EQ(Msg("UPDATE dept SET headcount = (SELECT COUNT(*) FROM emp WHERE dept_id = dept.id AND salary > 75) "
+                  "+ dept.headcount * 10"),
+              "UPDATE 3");
+    hc = col("SELECT headcount FROM dept ORDER BY id");
+    EXPECT_EQ(hc[0].AsInt(), 22);
+    EXPECT_EQ(hc[1].AsInt(), 20);
+    EXPECT_EQ(hc[2].AsInt(), 0);
+
+    // Every row sees the table as it was before the statement: raise everyone to
+    // their department's maximum (eve has no department: the subquery gives NULL).
+    EXPECT_EQ(Msg("UPDATE emp SET salary = (SELECT MAX(x.salary) FROM emp x WHERE x.dept_id = emp.dept_id)"),
+              "UPDATE 5");
+    auto sal = col("SELECT salary FROM emp ORDER BY id");
+    EXPECT_EQ(sal[0].AsDouble(), 100);
+    EXPECT_EQ(sal[1].AsDouble(), 100);
+    EXPECT_EQ(sal[2].AsDouble(), 70);
+    EXPECT_EQ(sal[3].AsDouble(), 70);
+    EXPECT_TRUE(sal[4].IsNull());
+    ExpectIndexesConsistent("emp");
+
+    // EXISTS / IN, a reference two levels up, and correlation in SET and WHERE together.
+    db->Execute("UPDATE emp SET salary = id * 10");
+    EXPECT_EQ(Msg("UPDATE dept SET name = name || '*' WHERE EXISTS (SELECT 1 FROM emp WHERE dept_id = dept.id)"),
+              "UPDATE 2");
+    EXPECT_EQ(Msg("UPDATE dept SET headcount = CASE WHEN dept.id IN (SELECT dept_id FROM emp e WHERE "
+                  "EXISTS (SELECT 1 FROM emp f WHERE f.dept_id = dept.id AND f.salary > e.salary)) "
+                  "THEN 1 ELSE 0 END"),
+              "UPDATE 3");
+    hc = col("SELECT headcount FROM dept ORDER BY id");
+    EXPECT_EQ(hc[0].AsInt(), 1);
+    EXPECT_EQ(hc[2].AsInt(), 0);
+    EXPECT_EQ(Msg("UPDATE emp SET salary = (SELECT COUNT(*) FROM emp x WHERE x.dept_id = emp.dept_id) "
+                  "WHERE EXISTS (SELECT 1 FROM dept d WHERE d.id = emp.dept_id AND d.name = 'sales*')"),
+              "UPDATE 2");
+    EXPECT_EQ(Scalar("SELECT COUNT(*) FROM emp WHERE dept_id = 2 AND salary = 2"), 2);
+    EXPECT_EQ(Scalar("SELECT COUNT(*) FROM emp WHERE dept_id = 1 AND salary IN (10, 20)"), 2) << "untouched";
+    ExpectIndexesConsistent("emp");
+
+    // Errors: the whole statement is rejected and nothing changes.
+    EXPECT_THROW(db->Execute("UPDATE dept SET headcount = (SELECT id FROM emp WHERE emp.dept_id = dept.id)"), DbError)
+        << "more than one row for eng";
+    EXPECT_EQ(Scalar("SELECT headcount FROM dept WHERE id = 1"), 1);
+    EXPECT_THROW(db->Execute("UPDATE dept SET headcount = (SELECT COUNT(*) FROM emp WHERE emp.dept_id = dept.nope)"),
+                 DbError);
+    EXPECT_THROW(db->Execute("UPDATE dept SET headcount = (SELECT COUNT(*) FROM emp WHERE emp.dept_id = d.id)"),
+                 DbError);
+
+    // INSERT ... VALUES: a subquery may be correlated within itself...
+    EXPECT_EQ(Msg("INSERT INTO dept VALUES (10, 'x', (SELECT COUNT(*) FROM dept d WHERE EXISTS "
+                  "(SELECT 1 FROM emp e WHERE e.dept_id = d.id))), "
+                  "(11, 'y', (SELECT MAX((SELECT COUNT(*) FROM emp e WHERE e.dept_id = d.id)) FROM dept d))"),
+              "INSERT 2");
+    hc = col("SELECT headcount FROM dept WHERE id >= 10 ORDER BY id");
+    EXPECT_EQ(hc[0].AsInt(), 2);
+    EXPECT_EQ(hc[1].AsInt(), 2);
+    // ...but there is no current row in VALUES, so the target table cannot be referred to.
+    try {
+        db->Execute("INSERT INTO dept VALUES (12, 'z', (SELECT COUNT(*) FROM emp WHERE emp.dept_id = dept.id))");
+        ADD_FAILURE() << "expected an error";
+    } catch (const DbError& e) {
+        EXPECT_NE(std::string(e.what()).find("INSERT ... VALUES has no current row"), std::string::npos) << e.what();
+    }
+    try {
+        db->Execute("INSERT INTO dept VALUES (12, 'z', (SELECT COUNT(*) FROM emp e WHERE e.dept_id = headcount))");
+        ADD_FAILURE() << "expected an error";
+    } catch (const DbError& e) {
+        EXPECT_NE(std::string(e.what()).find("INSERT ... VALUES cannot refer to it"), std::string::npos) << e.what();
+    }
+    EXPECT_EQ(Scalar("SELECT COUNT(*) FROM dept WHERE id = 12"), 0);
+    // A name the subquery's own FROM provides still wins over the target table.
+    EXPECT_EQ(Msg("INSERT INTO dept VALUES (12, 'z', (SELECT COUNT(*) FROM dept WHERE dept.id < 10))"), "INSERT 1");
+    EXPECT_EQ(Scalar("SELECT headcount FROM dept WHERE id = 12"), 3);
+    ExpectIndexesConsistent("dept");
+}
+
 TEST_F(SqlTest, UnionIntersectExcept) {
     SeedCompany();
     // Departments that have employees, and those that don't.

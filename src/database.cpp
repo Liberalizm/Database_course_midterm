@@ -280,7 +280,7 @@ QueryResult Database::RunInsert(const InsertStmt& s) {
         Schema empty;
         for (const auto& exprs : s.rows) {
             Row r;
-            for (const auto& e : exprs) r.push_back(Evaluate(*BindExpr(planner_->ResolveSubqueries(e), empty), {}));
+            for (const auto& e : exprs) r.push_back(Evaluate(*BindExpr(planner_->ResolveSubqueries(e, t), empty), {}));
             source.push_back(std::move(r));
         }
     }
@@ -363,7 +363,7 @@ QueryResult Database::RunUpdate(const UpdateStmt& s) {
             if (prev.first == static_cast<size_t>(idx))
                 throw DbError("multiple assignments to same column \"" + col + "\"");
         if (ContainsAggregate(*e)) throw DbError("aggregate functions are not allowed in UPDATE");
-        sets.emplace_back(static_cast<size_t>(idx), BindExpr(planner_->ResolveSubqueries(e), schema));
+        sets.emplace_back(static_cast<size_t>(idx), planner_->PlanRowExpr(t, e));  // may be correlated
     }
 
     auto scan = planner_->PlanTableScan(t, s.where);

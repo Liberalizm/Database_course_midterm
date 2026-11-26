@@ -181,14 +181,31 @@ ExprPtr Planner::RunSubquery(const Expr& node, ExprPtr left, const std::vector<S
     throw DbError("internal: bad subquery kind");
 }
 
-ExprPtr Planner::ResolveSubqueries(const ExprPtr& e) {
+ExprPtr Planner::ResolveSubqueries(const ExprPtr& e, const TableInfo* insert_target) {
+    struct Restore {
+        const TableInfo** slot;
+        const TableInfo* saved;
+        ~Restore() { *slot = saved; }
+    } restore{&insert_target_, insert_target_};
+    insert_target_ = insert_target;
+    return ResolveSubqueriesRec(e);
+}
+
+ExprPtr Planner::ResolveSubqueriesRec(const ExprPtr& e) {
     if (!e) return nullptr;
-    if (e->kind == ExprKind::SUBQUERY) return RunSubquery(*e, ResolveSubqueries(e->left), nullptr);
+    if (e->kind == ExprKind::SUBQUERY) return RunSubquery(*e, ResolveSubqueriesRec(e->left), nullptr);
     auto c = std::make_shared<Expr>(*e);
-    c->left = ResolveSubqueries(e->left);
-    c->right = ResolveSubqueries(e->right);
-    for (auto& a : c->args) a = ResolveSubqueries(a);
+    c->left = ResolveSubqueriesRec(e->left);
+    c->right = ResolveSubqueriesRec(e->right);
+    for (auto& a : c->args) a = ResolveSubqueriesRec(a);
     return c;
+}
+
+ExprPtr Planner::PlanRowExpr(TableInfo* table, const ExprPtr& e) {
+    // The same scope as the statement's WHERE (PlanTableScan): the target table,
+    // under its own name, so a subquery's reference to it becomes a PARAM.
+    std::vector<Source> srcs{{table, table->name, table->schema.WithQualifier(table->name)}};
+    return BindExpr(Canonicalize(e, srcs), srcs[0].schema);
 }
 
 ExprPtr Planner::Canonicalize(const ExprPtr& e, const std::vector<Source>& srcs) {
@@ -233,6 +250,14 @@ ExprPtr Planner::Canonicalize(const ExprPtr& e, const std::vector<Source>& srcs)
         if (found < 0) {
             for (const Scope* s : scopes_)  // e.g. "emp.nope" where emp is an outer table
                 for (const auto& src : *s->srcs) alias_exists = alias_exists || src.alias == e->table;
+            if (const TableInfo* t = insert_target_) {  // in a subquery of INSERT ... VALUES
+                if (!alias_exists && e->table == t->name)
+                    throw DbError("invalid reference to table \"" + t->name +
+                                  "\": INSERT ... VALUES has no current row to refer to");
+                if (e->table.empty() && t->schema.Find("", e->column) >= 0)
+                    throw DbError("column \"" + e->column + "\" does not exist (table \"" + t->name +
+                                  "\" has one, but INSERT ... VALUES cannot refer to it)");
+            }
             if (!e->table.empty() && !alias_exists)
                 throw DbError("missing FROM-clause entry for table \"" + e->table + "\"");
             throw DbError("column \"" + e->ToString() + "\" does not exist");
