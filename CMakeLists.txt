@@ -42,6 +42,7 @@ add_library(minidb_core STATIC
         src/table_heap.cpp
         src/bplus_tree.cpp
         src/catalog.cpp
+        src/statistics.cpp
         src/parser.cpp
         src/expression.cpp
         src/executors.cpp

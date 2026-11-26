@@ -9,6 +9,7 @@
 
 #include "bplus_tree.h"
 #include "foreign_key.h"
+#include "statistics.h"
 #include "table_heap.h"
 #include "value.h"
 
@@ -20,6 +21,9 @@ struct TableInfo {
     page_id_t first_page = INVALID_PAGE_ID;
     int64_t row_count = 0;  // statistics used by the planner
     std::unique_ptr<TableHeap> heap;
+    // Column statistics from the last ANALYZE, one per column; empty if never
+    // analyzed (or the columns changed since).
+    std::vector<ColumnStats> stats;
 };
 
 // 64-bit FNV-1a hash of a TEXT value: the B+ tree key of a TEXT index.
@@ -122,6 +126,8 @@ public:
     // Refused for the last unique index of a column that a foreign key references.
     void DropIndex(const std::string& name);
     std::vector<IndexInfo*> IndexesOf(const std::string& table);
+    // ANALYZE: gathers the column statistics of a table (see statistics.h).
+    void Analyze(TableInfo* t);
     // The PRIMARY KEY index of a table (named "<table>_pkey"), or null.
     IndexInfo* PrimaryKeyIndex(const std::string& table);
     // A unique index on exactly table(column) (the primary key preferred), or null.

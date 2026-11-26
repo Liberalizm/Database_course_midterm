@@ -250,6 +250,29 @@ std::string Catalog::Serialize() const {
         w.U8(static_cast<uint8_t>(fk->on_delete));
         w.U8(static_cast<uint8_t>(fk->on_update));
     }
+    // Column statistics (ANALYZE): [count u32] then (table, rows i64, [ncols u32],
+    // per column: nulls i64, distinct i64, [nmcv u32] (value, count i64) each,
+    // [nhist u32] values). Appended last as well.
+    uint32_t nstats = 0;
+    for (auto& [name, t] : tables_) nstats += t->stats.empty() ? 0 : 1;
+    w.U32(nstats);
+    for (auto& [name, t] : tables_) {
+        if (t->stats.empty()) continue;
+        w.Str(t->name);
+        w.I64(t->stats[0].rows);
+        w.U32(static_cast<uint32_t>(t->stats.size()));
+        for (const ColumnStats& s : t->stats) {
+            w.I64(s.nulls);
+            w.I64(s.distinct);
+            w.U32(static_cast<uint32_t>(s.mcv.size()));
+            for (size_t i = 0; i < s.mcv.size(); ++i) {
+                WriteValue(w, s.mcv[i]);
+                w.I64(s.mcv_counts[i]);
+            }
+            w.U32(static_cast<uint32_t>(s.histogram.size()));
+            for (const Value& v : s.histogram) WriteValue(w, v);
+        }
+    }
     return std::move(w.buf);
 }
 
@@ -386,9 +409,35 @@ void Catalog::Load() {
             foreign_keys_[name] = std::move(fk);
         }
     }
+    if (r.pos < data.size()) {  // absent in files from before ANALYZE existed
+        uint32_t ns = r.U32();
+        for (uint32_t i = 0; i < ns; ++i) {
+            TableInfo* t = RequireTable(r.Str());
+            const int64_t rows = r.I64();
+            const uint32_t nc = r.U32();
+            if (nc != t->schema.Size() || rows < 0) throw DbError("catalog is corrupt (bad statistics)");
+            std::vector<ColumnStats> stats(nc);
+            for (ColumnStats& s : stats) {
+                s.rows = rows;
+                s.nulls = r.I64();
+                s.distinct = r.I64();
+                uint32_t nm = r.U32();
+                if (nm > ColumnStats::kMaxMcv) throw DbError("catalog is corrupt (bad statistics)");
+                for (uint32_t j = 0; j < nm; ++j) {
+                    s.mcv.push_back(ReadValue(r));
+                    s.mcv_counts.push_back(r.I64());
+                }
+                uint32_t nh = r.U32();
+                if (nh > ColumnStats::kBuckets + 1) throw DbError("catalog is corrupt (bad statistics)");
+                for (uint32_t j = 0; j < nh; ++j) s.histogram.push_back(ReadValue(r));
+            }
+            t->stats = std::move(stats);
+        }
+    }
     for (auto& [name, idx] : indexes_) {
         try {
-            ResolveIndexColumns(idx.get(), RequireTable(idx->table)->schema);
+            ResolveIndexColumns(
+idx.get(), RequireTable(idx->table)->schema);
         } catch (const DbError&) {
             throw DbError("catalog is corrupt (index \"" + name + "\" on unknown or unindexable columns)");
         }
@@ -604,6 +653,7 @@ void Catalog::RewriteTable(TableInfo* t, std::vector<Column> cols, const std::fu
     t->first_page = first;
     t->heap = std::move(heap);
     FreePages(old_pages);
+    t->stats.clear();  // the columns changed
     for (const auto& d : keep) CreateIndex(d.name, t->name, d.columns, d.unique);
 }
 
@@ -879,6 +929,18 @@ std::string Catalog::NewForeignKeyName(const std::string& table, const std::stri
     std::string name = base;
     for (int i = 1; foreign_keys_.count(name); ++i) name = base + std::to_string(i);
     return name;
+}
+
+void Catalog::Analyze(TableInfo* t) {
+    auto it = t->heap->Begin();
+    RID rid;
+    std::string buf;
+    t->stats = ComputeStats(t->schema, [&](Row* row) {
+        if (!it.Next(&rid, &buf)) return false;
+        *row = DeserializeTuple(t->schema, buf.data(), buf.size());
+        return true;
+    });
+    t->row_count = t->stats.empty() ? t->row_count : t->stats[0].rows;  // exact again
 }
 
 }  // namespace minidb
