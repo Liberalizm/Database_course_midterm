@@ -15,7 +15,7 @@ const std::set<std::string>& Reserved() {
         "desc",   "insert", "into",   "values",  "create", "table",   "index",  "drop",    "delete",
         "update", "set",    "explain", "analyze", "null",  "is",      "true",   "false",   "distinct",
         "primary", "key",   "unique", "between", "in",     "like",    "left",   "right",   "full",
-        "outer",  "case",   "when",    "then",   "else",    "end"};
+        "outer",  "case",   "when",    "then",   "else",    "end",     "exists"};
     return kw;
 }
 
@@ -503,6 +503,11 @@ ExprPtr Parser::ParseComparison() {
     }
     if (AcceptKw("in")) {  // x IN (a, b, c)  ==>  x = a OR x = b OR x = c
         ExpectSym("(");
+        if (CheckKw("select")) {  // x [NOT] IN (SELECT ...)
+            auto sub = std::make_shared<SelectStmt>(ParseSelect());
+            ExpectSym(")");
+            return Expr::Subquery(SubqueryKind::IN, std::move(sub), l, neg);
+        }
         std::vector<ExprPtr> terms;
         do {
             terms.push_back(Expr::Binary(BinOp::EQ, l, ParseExpr()));
@@ -671,6 +676,12 @@ ExprPtr Parser::ParsePrimary() {
         case TokenType::STRING: return Expr::Const(Value::Text(Advance().text));
         case TokenType::SYMBOL:
             if (AcceptSym("(")) {
+                if (CheckKw("select")) {  // scalar subquery
+                    NestingGuard guard(this);
+                    auto sub = std::make_shared<SelectStmt>(ParseSelect());
+                    ExpectSym(")");
+                    return Expr::Subquery(SubqueryKind::SCALAR, std::move(sub));
+                }
                 ExprPtr e = ParseExpr();
                 ExpectSym(")");
                 return e;
@@ -681,6 +692,13 @@ ExprPtr Parser::ParsePrimary() {
             if (AcceptKw("true")) return Expr::Const(Value::Bool(true));
             if (AcceptKw("false")) return Expr::Const(Value::Bool(false));
             if (AcceptKw("case")) return ParseCase();
+            if (AcceptKw("exists")) {
+                NestingGuard guard(this);
+                ExpectSym("(");
+                auto sub = std::make_shared<SelectStmt>(ParseSelect());
+                ExpectSym(")");
+                return Expr::Subquery(SubqueryKind::EXISTS, std::move(sub));
+            }
             if (!t.quoted && Peek(1).type == TokenType::SYMBOL && Peek(1).text == "(") return ParseFunctionCall();
             std::string first = ExpectIdent();
             if (AcceptSym(".")) return Expr::Col(first, ExpectIdent());

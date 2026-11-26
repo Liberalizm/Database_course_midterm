@@ -105,8 +105,67 @@ ExprPtr PreboundColumn(int idx, const std::string& name) {
 
 }  // namespace
 
+ExprPtr Planner::RunSubquery(const Expr& node, ExprPtr left) {
+    // Uncorrelated subqueries only: the subquery is planned on its own, so a
+    // reference to an outer column fails like any unknown column would.
+    ExecPtr plan;
+    try {
+        plan = PlanSelect(*node.subquery);
+    } catch (const DbError& err) {
+        std::string msg = err.what();
+        bool unresolved = msg.find("missing FROM-clause entry") != std::string::npos ||
+                          (msg.rfind("column \"", 0) == 0 && msg.find("does not exist") != std::string::npos);
+        if (!unresolved) throw;
+        throw DbError(msg + " (correlated subqueries, which refer to the outer query, are not supported)");
+    }
+    if (node.sub_kind != SubqueryKind::EXISTS && plan->OutSchema().Size() != 1)
+        throw DbError("subquery must return only one column");
+    plan->Init();
+    Row r;
+    switch (node.sub_kind) {
+        case SubqueryKind::EXISTS: return Expr::Const(Value::Bool(plan->Next(&r) != node.negated));
+        case SubqueryKind::SCALAR: {
+            if (!plan->Next(&r)) return Expr::Const(Value::Null());
+            Value v = r[0];
+            if (plan->Next(&r)) throw DbError("more than one row returned by a subquery used as an expression");
+            return Expr::Const(std::move(v));
+        }
+        case SubqueryKind::IN: {
+            auto set = std::make_shared<std::unordered_set<std::string>>();
+            auto e = std::make_shared<Expr>();
+            e->kind = ExprKind::IN_SET;
+            e->negated = node.negated;
+            e->left = std::move(left);
+            while (plan->Next(&r)) {
+                if (r[0].IsNull()) {
+                    e->in_set_has_null = true;
+                    continue;
+                }
+                std::string k;
+                r[0].AppendKey(&k);  // the same equality as "=" (1 = 1.0)
+                set->insert(std::move(k));
+            }
+            e->in_set = std::move(set);
+            e->FixHeight();
+            return e;
+        }
+    }
+    throw DbError("internal: bad subquery kind");
+}
+
+ExprPtr Planner::ResolveSubqueries(const ExprPtr& e) {
+    if (!e) return nullptr;
+    if (e->kind == ExprKind::SUBQUERY) return RunSubquery(*e, ResolveSubqueries(e->left));
+    auto c = std::make_shared<Expr>(*e);
+    c->left = ResolveSubqueries(e->left);
+    c->right = ResolveSubqueries(e->right);
+    for (auto& a : c->args) a = ResolveSubqueries(a);
+    return c;
+}
+
 ExprPtr Planner::Canonicalize(const ExprPtr& e, const std::vector<Source>& srcs) {
     if (!e) return nullptr;
+    if (e->kind == ExprKind::SUBQUERY) return RunSubquery(*e, Canonicalize(e->left, srcs));
     auto c = std::make_shared<Expr>(*e);
     if (e->kind == ExprKind::COLUMN) {
         if (e->prebound) return c;

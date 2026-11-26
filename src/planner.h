@@ -28,6 +28,10 @@ public:
     // Access path for single-table DML (DELETE / UPDATE ... WHERE ...).
     std::unique_ptr<ScanExecutor> PlanTableScan(TableInfo* table, const ExprPtr& where);
 
+    // Replaces every subquery in an expression that is evaluated outside of a
+    // SELECT (INSERT ... VALUES, UPDATE ... SET) by its result.
+    ExprPtr ResolveSubqueries(const ExprPtr& e);
+
     // Renders a plan tree (EXPLAIN). `analyze` adds actual row counts.
     static std::vector<std::string> Explain(const Executor& root, bool analyze);
 
@@ -39,7 +43,12 @@ private:
     };
 
     std::unique_ptr<ScanExecutor> BuildAccessPath(const Source& src, const std::vector<ExprPtr>& conjuncts);
-    static ExprPtr Canonicalize(const ExprPtr& e, const std::vector<Source>& srcs);
+    // Qualifies every column with its source alias; runs (uncorrelated) subqueries.
+    ExprPtr Canonicalize(const ExprPtr& e, const std::vector<Source>& srcs);
+    // Plans and executes the subquery of a SUBQUERY node once and returns its
+    // replacement: a constant (scalar, EXISTS) or an IN_SET node. `left` is the
+    // already processed left operand of IN.
+    ExprPtr RunSubquery(const Expr& node, ExprPtr left);
     static void ReferencedTables(const Expr& e, const std::vector<Source>& srcs, std::set<int>* out);
 
     Catalog* catalog_;

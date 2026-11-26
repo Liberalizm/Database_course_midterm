@@ -3,6 +3,7 @@
 
 #include <memory>
 #include <string>
+#include <unordered_set>
 #include <variant>
 #include <vector>
 
@@ -10,12 +11,14 @@
 
 namespace minidb {
 
-enum class ExprKind { CONST, COLUMN, BINARY, UNARY, IS_NULL, AGG, FUNC };
+enum class ExprKind { CONST, COLUMN, BINARY, UNARY, IS_NULL, AGG, FUNC, SUBQUERY, IN_SET };
+enum class SubqueryKind { SCALAR, EXISTS, IN };
 enum class BinOp { EQ, NE, LT, LE, GT, GE, AND, OR, ADD, SUB, MUL, DIV, MOD, LIKE, CONCAT };
 enum class UnaryOp { NOT, NEG };
 enum class AggFunc { COUNT, SUM, AVG, MIN, MAX };
 
 struct Expr;
+struct SelectStmt;
 
 // Every pass over an expression (binding, evaluation, printing, even the
 // destructor) is recursive, so a tree that is too tall would overflow the
@@ -39,6 +42,15 @@ struct Expr {
     // [cond1, val1, cond2, val2, ...] plus a trailing ELSE value if args.size() is odd.
     std::string func;
     std::vector<ExprPtr> args;
+    // SUBQUERY (parser output): (SELECT ...), EXISTS (SELECT ...) or
+    // `left` [NOT] IN (SELECT ...); `negated` for NOT EXISTS / NOT IN. The planner
+    // runs the (uncorrelated) subquery once and replaces the node with a CONST,
+    // or for IN with an IN_SET node: `left` IN in_set, where in_set holds the
+    // Value::AppendKey encodings of the non-NULL results.
+    SubqueryKind sub_kind = SubqueryKind::SCALAR;
+    std::shared_ptr<const SelectStmt> subquery;
+    std::shared_ptr<const std::unordered_set<std::string>> in_set;
+    bool in_set_has_null = false;
     ExprPtr left, right;         // children (UNARY / IS_NULL / AGG use `left`)
     int height = 1;              // 1 for leaves, 1 + tallest child otherwise
 
@@ -101,6 +113,17 @@ struct Expr {
         e->agg_star = star;
         e->agg_distinct = distinct;
         e->left = std::move(arg);
+        e->FixHeight();
+        return e;
+    }
+    static ExprPtr Subquery(SubqueryKind k, std::shared_ptr<const SelectStmt> stmt, ExprPtr left = nullptr,
+                            bool negated = false) {
+        auto e = std::make_shared<Expr>();
+        e->kind = ExprKind::SUBQUERY;
+        e->sub_kind = k;
+        e->subquery = std::move(stmt);
+        e->left = std::move(left);
+        e->negated = negated;
         e->FixHeight();
         return e;
     }

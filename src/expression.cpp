@@ -44,6 +44,14 @@ std::string Expr::ToString() const {
             std::string n = names[static_cast<int>(agg)];
             return n + "(" + (agg_star ? std::string("*") : (agg_distinct ? "DISTINCT " : "") + left->ToString()) + ")";
         }
+        case ExprKind::SUBQUERY: {
+            static const char* kinds[] = {"", "EXISTS ", ""};
+            std::string s = std::string(negated ? "NOT " : "") + kinds[static_cast<int>(sub_kind)] + "(SELECT ...)";
+            if (sub_kind == SubqueryKind::IN) s = wrap(left) + (negated ? " NOT IN " : " IN ") + "(SELECT ...)";
+            return s;
+        }
+        case ExprKind::IN_SET:
+            return wrap(left) + (negated ? " NOT IN " : " IN ") + "(" + std::to_string(in_set->size() + (in_set_has_null ? 1 : 0)) + " values)";
         case ExprKind::FUNC: {
             std::string s;
             if (func == "case") {
@@ -73,6 +81,7 @@ ExprPtr BindExpr(const ExprPtr& e, const Schema& schema) {
             return c;
         }
         case ExprKind::AGG: throw DbError("aggregate functions are not allowed here");
+        case ExprKind::SUBQUERY: throw DbError("subqueries are not allowed here");
         default:
             c->left = BindExpr(e->left, schema);
             c->right = BindExpr(e->right, schema);
@@ -284,6 +293,19 @@ Value Evaluate(const Expr& e, const Row& row) {
         case ExprKind::IS_NULL: return Value::Bool(Evaluate(*e.left, row).IsNull() != e.negated);
         case ExprKind::AGG: throw DbError("internal: aggregate evaluated as scalar");
         case ExprKind::FUNC: return EvaluateFunction(e, row);
+        case ExprKind::SUBQUERY: throw DbError("internal: subquery was not resolved by the planner");
+        case ExprKind::IN_SET: {
+            // x IN (subquery results), three-valued: TRUE on a match; otherwise NULL if x
+            // or any result is NULL (the answer is unknown); otherwise FALSE.
+            if (e.in_set->empty() && !e.in_set_has_null) return Value::Bool(e.negated);
+            Value x = Evaluate(*e.left, row);
+            if (x.IsNull()) return Value::Null();
+            std::string k;
+            x.AppendKey(&k);
+            if (e.in_set->count(k)) return Value::Bool(!e.negated);
+            if (e.in_set_has_null) return Value::Null();
+            return Value::Bool(e.negated);
+        }
         case ExprKind::BINARY: break;
     }
 

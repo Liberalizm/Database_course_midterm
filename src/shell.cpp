@@ -26,6 +26,7 @@ SQL (end every statement with ';'):
   Operators: = <> < <= > >= AND OR NOT + - * / % || LIKE BETWEEN IN IS [NOT] NULL
   CASE [x] WHEN ... THEN ... [ELSE ...] END
   Functions: ABS ROUND LENGTH UPPER LOWER SUBSTR COALESCE NULLIF
+  Subqueries (uncorrelated): (SELECT ...)  x [NOT] IN (SELECT ...)  [NOT] EXISTS (SELECT ...)
   Aggregates: COUNT(*) COUNT(x) SUM AVG MIN MAX, each also with DISTINCT: COUNT(DISTINCT x)
 
 Meta commands:

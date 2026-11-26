@@ -145,6 +145,31 @@ TEST(Parser, FunctionArityAndUnknownFunctions) {
     EXPECT_THROW(ParseExpr("FROBNICATE(1)"), DbError);
 }
 
+TEST(Parser, Subqueries) {
+    auto scalar = ParseExpr("(SELECT MAX(x) FROM t) + 1");
+    ASSERT_EQ(scalar->kind, ExprKind::BINARY);
+    EXPECT_EQ(scalar->left->kind, ExprKind::SUBQUERY);
+    EXPECT_EQ(scalar->left->sub_kind, SubqueryKind::SCALAR);
+    EXPECT_EQ(scalar->left->subquery->from.at(0).name, "t");
+
+    auto in = ParseExpr("a NOT IN (SELECT b FROM u WHERE c > 1)");
+    ASSERT_EQ(in->kind, ExprKind::SUBQUERY);
+    EXPECT_EQ(in->sub_kind, SubqueryKind::IN);
+    EXPECT_TRUE(in->negated);
+    EXPECT_EQ(in->left->ToString(), "a");
+    EXPECT_TRUE(in->subquery->where);
+
+    auto ex = ParseExpr("NOT EXISTS (SELECT 1 FROM u)");
+    ASSERT_EQ(ex->kind, ExprKind::UNARY);
+    EXPECT_EQ(ex->left->sub_kind, SubqueryKind::EXISTS);
+    EXPECT_EQ(ParseExpr("a IN (1, 2)")->kind, ExprKind::BINARY) << "a value list is still desugared";
+
+    auto nested = ParseExpr("a IN (SELECT b FROM u WHERE b IN (SELECT c FROM v))");
+    EXPECT_EQ(nested->subquery->where->kind, ExprKind::SUBQUERY);
+    EXPECT_THROW(ParseExpr("EXISTS SELECT 1"), DbError);
+    EXPECT_THROW(ParseExpr("(SELECT 1"), DbError);
+}
+
 TEST(Parser, DistinctAggregates) {
     auto e = ParseExpr("COUNT(DISTINCT x)");
     ASSERT_EQ(e->kind, ExprKind::AGG);

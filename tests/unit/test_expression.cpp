@@ -1,5 +1,6 @@
 // Unit tests: expression binding and evaluation (built directly from AST nodes, no parser).
 #include <optional>
+#include <unordered_set>
 
 #include "expression.h"
 #include "test_util.h"
@@ -152,6 +153,48 @@ TEST(Expression, FunctionArgumentsAreBoundAndCountTowardsHeight) {
     EXPECT_THROW(BindExpr(F("abs", {Expr::Col("", "nope")}), s), DbError);
     EXPECT_TRUE(ContainsAggregate(*F("coalesce", {Expr::Agg(AggFunc::MAX, Expr::Col("", "x"), false)})));
     EXPECT_EQ(F("case", {C(B(true)), C(I(1)), C(I(2))})->ToString(), "CASE WHEN true THEN 1 ELSE 2 END");
+}
+
+// The planner turns `x [NOT] IN (SELECT ...)` into an IN_SET node; build one by hand.
+ExprPtr InSet(ExprPtr x, std::vector<Value> values, bool negated) {
+    auto set = std::make_shared<std::unordered_set<std::string>>();
+    auto e = std::make_shared<Expr>();
+    e->kind = ExprKind::IN_SET;
+    e->negated = negated;
+    e->left = std::move(x);
+    for (const auto& v : values) {
+        if (v.IsNull()) {
+            e->in_set_has_null = true;
+            continue;
+        }
+        std::string k;
+        v.AppendKey(&k);
+        set->insert(k);
+    }
+    e->in_set = set;
+    e->FixHeight();
+    return e;
+}
+
+TEST(Expression, InSetUsesThreeValuedLogic) {
+    EXPECT_TRUE(Eval(InSet(C(I(2)), {I(1), I(2)}, false)).AsBool());
+    EXPECT_FALSE(Eval(InSet(C(I(3)), {I(1), I(2)}, false)).AsBool());
+    EXPECT_TRUE(Eval(InSet(C(D(2.0)), {I(1), I(2)}, false)).AsBool()) << "2.0 = 2";
+    EXPECT_TRUE(Eval(InSet(C(I(3)), {I(1), N()}, false)).IsNull()) << "no match, but a NULL: unknown";
+    EXPECT_TRUE(Eval(InSet(C(I(1)), {I(1), N()}, false)).AsBool()) << "a match beats the NULL";
+    EXPECT_TRUE(Eval(InSet(C(N()), {I(1)}, false)).IsNull());
+    EXPECT_FALSE(Eval(InSet(C(N()), {}, false)).AsBool()) << "nothing is IN an empty set, not even NULL";
+    // NOT IN
+    EXPECT_TRUE(Eval(InSet(C(I(3)), {I(1), I(2)}, true)).AsBool());
+    EXPECT_FALSE(Eval(InSet(C(I(1)), {I(1), I(2)}, true)).AsBool());
+    EXPECT_TRUE(Eval(InSet(C(I(3)), {I(1), N()}, true)).IsNull()) << "the classic NOT IN + NULL trap";
+    EXPECT_TRUE(Eval(InSet(C(N()), {}, true)).AsBool());
+}
+
+TEST(Expression, UnresolvedSubqueriesAreRejected) {
+    auto sub = Expr::Subquery(SubqueryKind::SCALAR, nullptr);
+    EXPECT_THROW(BindExpr(sub, Schema{}), DbError);
+    EXPECT_EQ(Expr::Subquery(SubqueryKind::IN, nullptr, C(I(1)), true)->ToString(), "1 NOT IN (SELECT ...)");
 }
 
 TEST(Expression, FilterResultMustBeBoolean) {

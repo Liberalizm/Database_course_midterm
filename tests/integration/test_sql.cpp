@@ -365,6 +365,51 @@ TEST_F(SqlTest, PopulateFillsUniqueTextColumns) {
     ExpectIndexesConsistent("u");
 }
 
+TEST_F(SqlTest, UncorrelatedSubqueries) {
+    SeedCompany();
+    // Scalar subquery: above-average earners (avg = 72).
+    auto above = Q("SELECT name FROM emp WHERE salary > (SELECT AVG(salary) FROM emp) ORDER BY name");
+    ASSERT_EQ(above.size(), 2u);
+    EXPECT_EQ(above[0][0].AsText(), "ann");
+    EXPECT_EQ(Scalar("SELECT (SELECT MAX(id) FROM emp) + 1"), 6);
+    EXPECT_TRUE(Q("SELECT (SELECT name FROM emp WHERE id = 99)")[0][0].IsNull()) << "no row -> NULL";
+    // IN / NOT IN, including the NULL trap (eve's dept_id is NULL).
+    EXPECT_EQ(Scalar("SELECT COUNT(*) FROM dept WHERE id IN (SELECT dept_id FROM emp)"), 2);
+    EXPECT_EQ(Scalar("SELECT COUNT(*) FROM dept WHERE id NOT IN (SELECT dept_id FROM emp)"), 0)
+        << "NOT IN against a set containing NULL is never true";
+    EXPECT_EQ(Scalar("SELECT COUNT(*) FROM dept WHERE id NOT IN (SELECT dept_id FROM emp WHERE dept_id IS NOT NULL)"), 1);
+    // EXISTS, nesting, use in joins and aggregates.
+    EXPECT_EQ(Scalar("SELECT COUNT(*) FROM dept WHERE EXISTS (SELECT 1 FROM emp WHERE salary > 90)"), 3);
+    EXPECT_EQ(Scalar("SELECT COUNT(*) FROM dept WHERE NOT EXISTS (SELECT 1 FROM emp WHERE salary > 900)"), 3);
+    EXPECT_EQ(Scalar("SELECT COUNT(*) FROM emp WHERE dept_id IN "
+                     "(SELECT id FROM dept WHERE name IN (SELECT 'eng'))"),
+              2);
+    EXPECT_EQ(Scalar("SELECT COUNT(*) FROM emp e JOIN dept d ON e.dept_id = d.id "
+                     "WHERE d.id = (SELECT MIN(id) FROM dept)"),
+              2);
+    // Errors.
+    EXPECT_THROW(db->Execute("SELECT (SELECT name FROM emp)"), DbError) << "more than one row";
+    EXPECT_THROW(db->Execute("SELECT * FROM emp WHERE id IN (SELECT id, name FROM emp)"), DbError);
+    EXPECT_THROW(db->Execute("SELECT name FROM emp e WHERE salary = (SELECT MAX(salary) FROM emp x "
+                             "WHERE x.dept_id = e.dept_id)"),
+                 DbError)
+        << "correlated subqueries are not supported";
+}
+
+TEST_F(SqlTest, SubqueriesInDml) {
+    SeedCompany();
+    // The subquery sees the table as it was before the statement.
+    EXPECT_EQ(Msg("DELETE FROM emp WHERE id IN (SELECT id FROM emp WHERE salary < 60)"), "DELETE 1");
+    EXPECT_EQ(Msg("UPDATE emp SET salary = (SELECT MAX(salary) FROM emp) WHERE name = 'eve'"), "UPDATE 1");
+    EXPECT_EQ(Scalar("SELECT salary FROM emp WHERE name = 'eve'"), 100);
+    EXPECT_EQ(Msg("INSERT INTO dept VALUES ((SELECT MAX(id) + 1 FROM dept), 'new')"), "INSERT 1");
+    EXPECT_EQ(Q("SELECT name FROM dept WHERE id = 4")[0][0].AsText(), "new");
+    EXPECT_EQ(Msg("INSERT INTO dept SELECT id + 10, name FROM dept WHERE id IN (SELECT dept_id FROM emp)"),
+              "INSERT 2");
+    ExpectIndexesConsistent("emp");
+    ExpectIndexesConsistent("dept");
+}
+
 TEST_F(SqlTest, QuotedIdentifiersAreNeverKeywords) {
     db->Execute("CREATE TABLE \"select\" (\"left\" INT, \"right\" TEXT, \"null\" INT)");
     db->Execute("INSERT INTO \"select\" (\"left\", \"right\", \"null\") VALUES (1, 'r', 7)");
