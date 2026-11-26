@@ -15,7 +15,8 @@ const std::set<std::string>& Reserved() {
         "desc",   "insert", "into",   "values",  "create", "table",   "index",  "drop",    "delete",
         "update", "set",    "explain", "analyze", "null",  "is",      "true",   "false",   "distinct",
         "primary", "key",   "unique", "between", "in",     "like",    "left",   "right",   "full",
-        "outer",  "case",   "when",    "then",   "else",    "end",     "exists"};
+        "outer",  "case",   "when",    "then",   "else",    "end",     "exists", "union",
+        "intersect", "except", "all"};
     return kw;
 }
 
@@ -334,7 +335,7 @@ InsertStmt Parser::ParseInsert() {
     return s;
 }
 
-SelectStmt Parser::ParseSelect() {
+SelectStmt Parser::ParseSelectCore() {
     SelectStmt s;
     ExpectKw("select");
     s.distinct = AcceptKw("distinct");
@@ -406,6 +407,40 @@ SelectStmt Parser::ParseSelect() {
         } while (AcceptSym(","));
     }
     if (AcceptKw("having")) s.having = ParseExpr();
+    return s;
+}
+
+// A query expression: SELECT cores combined with UNION / EXCEPT (left to right)
+// and INTERSECT (binds tighter, as in standard SQL), then ORDER BY / LIMIT /
+// OFFSET for the whole result.
+SelectStmt Parser::ParseSelect() {
+    NestingGuard guard(this);
+    auto compound = [](SetOp op, bool all, SelectStmt l, SelectStmt r) {
+        SelectStmt c;
+        c.set_op = op;
+        c.set_all = all;
+        c.set_lhs = std::make_shared<SelectStmt>(std::move(l));
+        c.set_rhs = std::make_shared<SelectStmt>(std::move(r));
+        return c;
+    };
+    auto parse_intersect = [&]() {
+        SelectStmt l = ParseSelectCore();
+        while (AcceptKw("intersect")) {
+            bool all = AcceptKw("all");
+            if (!all) AcceptKw("distinct");
+            l = compound(SetOp::INTERSECT, all, std::move(l), ParseSelectCore());
+        }
+        return l;
+    };
+    SelectStmt s = parse_intersect();
+    while (CheckKw("union") || CheckKw("except")) {
+        SetOp op = AcceptKw("union") ? SetOp::UNION : SetOp::EXCEPT;
+        if (op == SetOp::EXCEPT) ExpectKw("except");
+        bool all = AcceptKw("all");
+        if (!all) AcceptKw("distinct");
+        s = compound(op, all, std::move(s), parse_intersect());
+    }
+
     if (AcceptKw("order")) {
         ExpectKw("by");
         do {

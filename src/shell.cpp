@@ -21,6 +21,7 @@ SQL (end every statement with ';'):
   INSERT INTO t (id, name) SELECT ...;
   SELECT [DISTINCT] cols | * FROM a [[LEFT] JOIN b ON ...] [, c] WHERE ...
          GROUP BY ... HAVING ... ORDER BY ... [DESC] LIMIT n OFFSET m;
+  SELECT ... UNION [ALL] | INTERSECT [ALL] | EXCEPT [ALL] SELECT ... [ORDER BY col|n] [LIMIT n];
   UPDATE t SET col = expr WHERE ...;           DELETE FROM t WHERE ...;
   EXPLAIN [ANALYZE] SELECT ...;
   Operators: = <> < <= > >= AND OR NOT + - * / % || LIKE BETWEEN IN IS [NOT] NULL

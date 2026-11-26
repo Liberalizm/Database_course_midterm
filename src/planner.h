@@ -43,6 +43,7 @@ private:
     };
 
     std::unique_ptr<ScanExecutor> BuildAccessPath(const Source& src, const std::vector<ExprPtr>& conjuncts);
+    ExecPtr PlanSetOp(const SelectStmt& stmt);  // UNION / INTERSECT / EXCEPT
     // Qualifies every column with its source alias; runs (uncorrelated) subqueries.
     ExprPtr Canonicalize(const ExprPtr& e, const std::vector<Source>& srcs);
     // Plans and executes the subquery of a SUBQUERY node once and returns its

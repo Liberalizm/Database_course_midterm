@@ -279,4 +279,29 @@ private:
     std::unordered_set<std::string> seen_;
 };
 
+// UNION / INTERSECT / EXCEPT [ALL] of two inputs with the same number of
+// columns. Whole rows are compared, and two NULLs count as equal (SQL set
+// semantics, unlike "="). Without ALL the result has no duplicates; with ALL,
+// INTERSECT keeps min(m, n) and EXCEPT max(m - n, 0) copies of a row that
+// occurs m times on the left and n times on the right.
+class SetOpExecutor : public Executor {
+public:
+    SetOpExecutor(ExecPtr left, ExecPtr right, SetOp op, bool all);
+    std::string Describe() const override;
+    std::vector<const Executor*> Children() const override { return {left_.get(), right_.get()}; }
+
+protected:
+    void InitImpl() override;
+    bool NextImpl(Row* out) override;
+
+private:
+    static std::string KeyOf(const Row& r);
+    ExecPtr left_, right_;
+    SetOp op_;
+    bool all_;
+    bool left_done_ = false;                                // UNION: now streaming the right input
+    std::unordered_map<std::string, int64_t> right_counts_;  // INTERSECT / EXCEPT: right rows
+    std::unordered_set<std::string> emitted_;                // without ALL: rows already returned
+};
+
 }  // namespace minidb

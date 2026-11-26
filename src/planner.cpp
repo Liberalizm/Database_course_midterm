@@ -319,7 +319,58 @@ std::unique_ptr<ScanExecutor> Planner::PlanTableScan(TableInfo* table, const Exp
     return BuildAccessPath(srcs[0], SplitConjuncts(canon));
 }
 
+ExecPtr Planner::PlanSetOp(const SelectStmt& stmt) {
+    ExecPtr l = PlanSelect(*stmt.set_lhs);
+    ExecPtr r = PlanSelect(*stmt.set_rhs);
+    static const char* names[] = {"UNION", "INTERSECT", "EXCEPT"};
+    const char* name = names[static_cast<int>(stmt.set_op)];
+    if (l->OutSchema().Size() != r->OutSchema().Size())
+        throw DbError(std::string("each ") + name + " query must have the same number of columns");
+    double lr = l->est_rows, rr = r->est_rows;
+    double cost = l->est_cost + r->est_cost + (lr + rr) * HASH_TUPLE_COST;
+    ExecPtr root = std::make_unique<SetOpExecutor>(std::move(l), std::move(r), stmt.set_op, stmt.set_all);
+    root->est_rows = stmt.set_op == SetOp::UNION ? lr + rr : stmt.set_op == SetOp::INTERSECT ? std::min(lr, rr) : lr;
+    root->est_cost = cost;
+
+    // ORDER BY over the combined result: output column names (of the first
+    // query) or positions, as in PostgreSQL.
+    if (!stmt.order_by.empty()) {
+        const Schema& out = root->OutSchema();
+        std::vector<std::pair<ExprPtr, bool>> keys;
+        for (const auto& o : stmt.order_by) {
+            int idx = -1;
+            const Expr& e = *o.expr;
+            if (e.kind == ExprKind::CONST && e.value.Type() == TypeId::INT) {
+                int64_t k = e.value.AsInt();
+                if (k >= 1 && k <= static_cast<int64_t>(out.Size())) idx = static_cast<int>(k - 1);
+            } else if (e.kind == ExprKind::COLUMN && e.table.empty()) {
+                for (size_t i = 0; i < out.Size(); ++i) {
+                    if (out.At(i).name != e.column) continue;
+                    if (idx >= 0) throw DbError("ORDER BY \"" + e.column + "\" is ambiguous");
+                    idx = static_cast<int>(i);
+                }
+            }
+            if (idx < 0)
+                throw DbError(std::string("ORDER BY on a ") + name +
+                              " result must name an output column or position, not " + e.ToString());
+            keys.emplace_back(PreboundColumn(idx, out.At(static_cast<size_t>(idx)).name), o.desc);
+        }
+        double est = root->est_rows, c = root->est_cost;
+        root = std::make_unique<SortExecutor>(std::move(root), keys);
+        root->est_rows = est;
+        root->est_cost = c + est * CPU_TUPLE_COST * 2;
+    }
+    if (stmt.limit >= 0 || stmt.offset > 0) {
+        double est = root->est_rows, c = root->est_cost;
+        root = std::make_unique<LimitExecutor>(std::move(root), stmt.limit, stmt.offset);
+        root->est_rows = stmt.limit >= 0 ? std::min(est, static_cast<double>(stmt.limit)) : est;
+        root->est_cost = c;
+    }
+    return root;
+}
+
 ExecPtr Planner::PlanSelect(const SelectStmt& stmt) {
+    if (stmt.set_lhs) return PlanSetOp(stmt);
     // ---------- 1. resolve FROM ----------
     std::vector<Source> srcs;
     for (const auto& ref : stmt.from) {

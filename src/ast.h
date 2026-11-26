@@ -190,7 +190,16 @@ struct OrderItem {
     bool desc = false;
 };
 
+enum class SetOp { UNION, INTERSECT, EXCEPT };
+
 struct SelectStmt {
+    // Compound query `set_lhs <set_op> [ALL] set_rhs` (UNION / INTERSECT / EXCEPT)
+    // when set_lhs is set: then only order_by / limit / offset below are used,
+    // and they apply to the combined result.
+    std::shared_ptr<SelectStmt> set_lhs, set_rhs;
+    SetOp set_op = SetOp::UNION;
+    bool set_all = false;
+
     bool distinct = false;
     std::vector<SelectItem> items;
     std::vector<TableRef> from;

@@ -285,6 +285,42 @@ TEST(Executors, DistinctAggregatesIgnoreDuplicatesPerGroup) {
     EXPECT_EQ(g2[2].AsInt(), 5);
 }
 
+// ---- UNION / INTERSECT / EXCEPT ----
+
+std::vector<std::string> SetOpResult(SetOp op, bool all, std::vector<Row> l, std::vector<Row> r) {
+    Schema s({Col("x", TypeId::INT)});
+    SetOpExecutor e(Vec(s, std::move(l)), Vec(s, std::move(r)), op, all);
+    return Canon(Drain(e));
+}
+
+TEST(Executors, SetOperationsFollowMultisetSemantics) {
+    // left = {1, 1, 2, 3, NULL}, right = {1, 3, 3, 4, NULL}
+    std::vector<Row> l = {{I(1)}, {I(1)}, {I(2)}, {I(3)}, {N()}};
+    std::vector<Row> r = {{I(1)}, {I(3)}, {I(3)}, {I(4)}, {N()}};
+    using V = std::vector<std::string>;
+    EXPECT_EQ(SetOpResult(SetOp::UNION, false, l, r), (V{"1|", "2|", "3|", "4|", "NULL|"}))
+        << "duplicates removed; the two NULLs count as one row";
+    EXPECT_EQ(SetOpResult(SetOp::UNION, true, l, r).size(), 10u);
+    EXPECT_EQ(SetOpResult(SetOp::INTERSECT, false, l, r), (V{"1|", "3|", "NULL|"}));
+    EXPECT_EQ(SetOpResult(SetOp::INTERSECT, true, l, r), (V{"1|", "3|", "NULL|"})) << "min(m, n) copies";
+    EXPECT_EQ(SetOpResult(SetOp::EXCEPT, false, l, r), (V{"2|"}));
+    EXPECT_EQ(SetOpResult(SetOp::EXCEPT, true, l, r), (V{"1|", "2|"})) << "max(m - n, 0) copies";
+    std::vector<Row> twice = {{I(5)}, {I(5)}, {I(5)}};
+    EXPECT_EQ(SetOpResult(SetOp::INTERSECT, true, twice, {{I(5)}, {I(5)}}).size(), 2u);
+    EXPECT_EQ(SetOpResult(SetOp::EXCEPT, true, twice, {{I(5)}}).size(), 2u);
+    EXPECT_TRUE(SetOpResult(SetOp::INTERSECT, false, l, {}).empty());
+    EXPECT_EQ(SetOpResult(SetOp::EXCEPT, false, {}, r).size(), 0u);
+}
+
+TEST(Executors, SetOperationCanBeReinitializedAndNamesColumnsFromTheLeft) {
+    Schema l({Col("a", TypeId::INT)}), r({Col("b", TypeId::TEXT)});
+    SetOpExecutor e(Vec(l, {{I(1)}, {I(1)}}), Vec(r, {{T("x")}}), SetOp::UNION, false);
+    EXPECT_EQ(e.OutSchema().At(0).name, "a");
+    EXPECT_EQ(e.OutSchema().At(0).type, TypeId::NULL_T) << "mixed column types";
+    EXPECT_EQ(Drain(e).size(), 2u);
+    EXPECT_EQ(Drain(e).size(), 2u) << "a second run starts from scratch";
+}
+
 TEST(Executors, SortMultiKeyNullsLastAndStable) {
     Schema s({Col("a", TypeId::INT), Col("b", TypeId::INT), Col("tag", TypeId::TEXT)});
     std::vector<Row> rows = {{I(2), I(1), T("p")}, {N(), I(0), T("q")}, {I(1), I(5), T("r")},

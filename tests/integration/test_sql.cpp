@@ -410,6 +410,32 @@ TEST_F(SqlTest, SubqueriesInDml) {
     ExpectIndexesConsistent("dept");
 }
 
+TEST_F(SqlTest, UnionIntersectExcept) {
+    SeedCompany();
+    // Departments that have employees, and those that don't.
+    auto staffed = Q("SELECT id FROM dept INTERSECT SELECT dept_id FROM emp ORDER BY id");
+    ASSERT_EQ(staffed.size(), 2u);
+    EXPECT_EQ(staffed[0][0].AsInt(), 1);
+    auto empty = Q("SELECT id FROM dept EXCEPT SELECT dept_id FROM emp");
+    ASSERT_EQ(empty.size(), 1u);
+    EXPECT_EQ(empty[0][0].AsInt(), 3);
+    // UNION removes duplicates, UNION ALL keeps them; names come from the first query.
+    auto names = db->Execute("SELECT name AS who FROM dept UNION SELECT name FROM emp ORDER BY who DESC LIMIT 2").back();
+    ASSERT_EQ(names.columns.at(0), "who");
+    ASSERT_EQ(names.rows.size(), 2u);
+    EXPECT_EQ(names.rows[0][0].AsText(), "sales");
+    EXPECT_EQ(Scalar("SELECT COUNT(*) FROM emp WHERE dept_id IN (SELECT dept_id FROM emp UNION SELECT 3)"), 4);
+    EXPECT_EQ(Q("SELECT dept_id FROM emp UNION ALL SELECT dept_id FROM emp").size(), 10u);
+    EXPECT_EQ(Q("SELECT dept_id FROM emp UNION SELECT dept_id FROM emp").size(), 3u) << "1, 2, NULL";
+    // As the source of INSERT ... SELECT.
+    db->Execute("CREATE TABLE ids (v INT)");
+    EXPECT_EQ(Msg("INSERT INTO ids SELECT id FROM emp UNION SELECT id FROM dept"), "INSERT 5");
+    // Errors.
+    EXPECT_THROW(db->Execute("SELECT id, name FROM emp UNION SELECT id FROM dept"), DbError);
+    EXPECT_THROW(db->Execute("SELECT id FROM emp UNION SELECT id FROM dept ORDER BY emp.id"), DbError);
+    EXPECT_THROW(db->Execute("SELECT id FROM emp UNION SELECT id FROM dept ORDER BY 2"), DbError);
+}
+
 TEST_F(SqlTest, QuotedIdentifiersAreNeverKeywords) {
     db->Execute("CREATE TABLE \"select\" (\"left\" INT, \"right\" TEXT, \"null\" INT)");
     db->Execute("INSERT INTO \"select\" (\"left\", \"right\", \"null\") VALUES (1, 'r', 7)");

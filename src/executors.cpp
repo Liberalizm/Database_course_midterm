@@ -500,4 +500,83 @@ bool DistinctExecutor::NextImpl(Row* out) {
     return false;
 }
 
+
+// ---------------- Set operations ----------------
+
+SetOpExecutor::SetOpExecutor(ExecPtr left, ExecPtr right, SetOp op, bool all)
+    : left_(std::move(left)), right_(std::move(right)), op_(op), all_(all) {
+    const Schema& l = left_->OutSchema();
+    const Schema& r = right_->OutSchema();
+    std::vector<Column> cols;
+    for (size_t i = 0; i < l.Size(); ++i) {
+        Column c;
+        c.name = l.At(i).name;  // the first query names the result columns
+        c.type = l.At(i).type == r.At(i).type ? l.At(i).type : TypeId::NULL_T;
+        cols.push_back(c);
+    }
+    schema_ = Schema(std::move(cols));
+}
+
+std::string SetOpExecutor::KeyOf(const Row& r) {
+    std::string key;
+    for (const auto& v : r) v.AppendKey(&key);  // NULL encodes like NULL: equal for set ops
+    return key;
+}
+
+void SetOpExecutor::InitImpl() {
+    left_done_ = false;
+    emitted_.clear();
+    right_counts_.clear();
+    left_->Init();
+    if (op_ != SetOp::UNION) {
+        right_->Init();
+        Row r;
+        while (right_->Next(&r)) ++right_counts_[KeyOf(r)];
+    }
+}
+
+bool SetOpExecutor::NextImpl(Row* out) {
+    if (op_ == SetOp::UNION) {
+        while (!left_done_) {
+            if (left_->Next(out)) {
+                if (all_ || emitted_.insert(KeyOf(*out)).second) return true;
+                continue;
+            }
+            left_done_ = true;
+            right_->Init();
+        }
+        while (right_->Next(out))
+            if (all_ || emitted_.insert(KeyOf(*out)).second) return true;
+        return false;
+    }
+    while (left_->Next(out)) {
+        std::string key = KeyOf(*out);
+        auto it = right_counts_.find(key);
+        bool on_right = it != right_counts_.end() && it->second > 0;
+        if (op_ == SetOp::INTERSECT) {
+            if (!on_right) continue;
+            if (all_) {
+                --it->second;
+                return true;
+            }
+            if (emitted_.insert(std::move(key)).second) return true;
+        } else {  // EXCEPT
+            if (all_) {
+                if (on_right) {
+                    --it->second;
+                    continue;
+                }
+                return true;
+            }
+            if (!on_right && emitted_.insert(std::move(key)).second) return true;
+        }
+    }
+    return false;
+}
+
+std::string SetOpExecutor::Describe() const {
+    static const char* names[] = {"Union", "Intersect", "Except"};
+    return std::string(names[static_cast<int>(op_)]) + (all_ ? " All" : "") + (all_ && op_ == SetOp::UNION ? "" : "  (hashed)");
+}
+
 }  // namespace minidb

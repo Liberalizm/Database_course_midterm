@@ -170,6 +170,33 @@ TEST(Parser, Subqueries) {
     EXPECT_THROW(ParseExpr("(SELECT 1"), DbError);
 }
 
+TEST(Parser, SetOperationsAndPrecedence) {
+    auto s = ParseOne<SelectStmt>("SELECT a FROM t UNION ALL SELECT b FROM u ORDER BY 1 LIMIT 5");
+    ASSERT_TRUE(s.set_lhs && s.set_rhs);
+    EXPECT_EQ(s.set_op, SetOp::UNION);
+    EXPECT_TRUE(s.set_all);
+    EXPECT_EQ(s.order_by.size(), 1u) << "ORDER BY / LIMIT belong to the whole result";
+    EXPECT_EQ(s.limit, 5);
+    EXPECT_TRUE(s.set_rhs->order_by.empty());
+    EXPECT_EQ(s.set_lhs->from.at(0).name, "t");
+
+    // INTERSECT binds tighter: A UNION (B INTERSECT C).
+    auto p = ParseOne<SelectStmt>("SELECT 1 UNION SELECT 2 INTERSECT SELECT 3");
+    EXPECT_EQ(p.set_op, SetOp::UNION);
+    ASSERT_TRUE(p.set_rhs->set_lhs);
+    EXPECT_EQ(p.set_rhs->set_op, SetOp::INTERSECT);
+    // UNION and EXCEPT are left-associative: (A EXCEPT B) UNION C.
+    auto q = ParseOne<SelectStmt>("SELECT 1 EXCEPT SELECT 2 UNION DISTINCT SELECT 3");
+    EXPECT_EQ(q.set_op, SetOp::UNION);
+    EXPECT_FALSE(q.set_all);
+    ASSERT_TRUE(q.set_lhs->set_lhs);
+    EXPECT_EQ(q.set_lhs->set_op, SetOp::EXCEPT);
+
+    EXPECT_THROW(Parser("SELECT 1 UNION").ParseAll(), DbError);
+    EXPECT_THROW(Parser("SELECT 1 ORDER BY 1 UNION SELECT 2").ParseAll(), DbError)
+        << "ORDER BY must come after the last query";
+}
+
 TEST(Parser, DistinctAggregates) {
     auto e = ParseExpr("COUNT(DISTINCT x)");
     ASSERT_EQ(e->kind, ExprKind::AGG);

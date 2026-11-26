@@ -29,7 +29,8 @@ private:
     CreateTableStmt ParseCreateTable();
     CreateIndexStmt ParseCreateIndex(bool unique);
     InsertStmt ParseInsert();
-    SelectStmt ParseSelect();
+    SelectStmt ParseSelect();      // full query: cores + UNION/INTERSECT/EXCEPT + ORDER BY/LIMIT
+    SelectStmt ParseSelectCore();  // SELECT ... FROM ... WHERE ... GROUP BY ... HAVING ...
     DeleteStmt ParseDelete();
     UpdateStmt ParseUpdate();
     TypeId ParseType();
