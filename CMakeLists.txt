@@ -44,7 +44,8 @@ add_library(minidb_core STATIC
         src/expression.cpp
         src/executors.cpp
         src/planner.cpp
-        src/database.cpp)
+        src/database.cpp
+        src/shell.cpp)
 target_include_directories(minidb_core PUBLIC src)
 minidb_set_warnings(minidb_core)
 

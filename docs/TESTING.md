@@ -19,7 +19,8 @@ tests/
 │   ├── test_parser          query:   SQL -> AST
 │   ├── test_expression      query:   binding, evaluation, 3-valued logic, LIKE
 │   ├── test_executors       query:   every operator, fed by an in-memory source
-│   └── test_planner         query:   access paths, join order/algorithm, errors
+│   ├── test_planner         query:   access paths, join order/algorithm, errors
+│   └── test_shell           query:   statement splitting, scripts, meta commands, .read
 ├── integration/             whole engine via the Database API (SQL in, rows out)
 │   ├── test_sql.cpp         DDL/DML, constraints, index consistency, index-vs-scan
 │   └── test_persistence.cpp data survives restarts and simulated crashes
@@ -47,7 +48,7 @@ Isolation techniques:
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build --parallel
-ctest --test-dir build -j 8 --output-on-failure    # everything (256 tests)
+ctest --test-dir build -j 8 --output-on-failure    # everything (269 tests)
 
 ctest --test-dir build -L storage                  # one layer
 ctest --test-dir build -L query

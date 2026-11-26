@@ -49,7 +49,8 @@ set(MINIDB_QUERY_COMPONENTS
         parser
         expression
         executors
-        planner)
+        planner
+        shell)
 foreach (component IN LISTS MINIDB_STORAGE_COMPONENTS)
     minidb_add_test(test_${component} "unit;storage;${component}" unit/test_${component}.cpp)
 endforeach ()
