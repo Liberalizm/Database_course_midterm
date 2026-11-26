@@ -153,12 +153,14 @@ private:
     std::vector<ExprPtr> exprs_;
 };
 
-// For every outer row, re-scan the inner child completely.
+// For every outer (left) row, re-scan the inner (right) child completely.
+// type LEFT: a left row without any matching right row is still emitted once,
+// padded with NULLs. RIGHT: likewise for right rows, emitted after all matches;
+// the right input is then read once into memory to remember which rows matched.
+// FULL: both.
 class NestedLoopJoinExecutor : public Executor {
 public:
-    // left_outer: a left row without any matching right row is still emitted once,
-    // padded with NULLs (LEFT JOIN).
-    NestedLoopJoinExecutor(ExecPtr left, ExecPtr right, ExprPtr pred, bool left_outer = false);
+    NestedLoopJoinExecutor(ExecPtr left, ExecPtr right, ExprPtr pred, JoinType type = JoinType::INNER);
     std::string Describe() const override;
     std::vector<const Executor*> Children() const override { return {left_.get(), right_.get()}; }
 
@@ -167,21 +169,30 @@ protected:
     bool NextImpl(Row* out) override;
 
 private:
+    bool NextRight(Row* out, size_t* idx);  // next row of the inner loop
     ExecPtr left_, right_;
     ExprPtr pred_;
+    JoinType type_;
+    bool keep_left_, keep_right_;
     Row left_row_;
     bool have_left_ = false;
-    bool left_outer_;
+    bool left_done_ = false;
     bool matched_ = false;  // current left row produced at least one output row
+    // keep_right_ only: the right input, whether each row matched, and the positions
+    // of the inner loop and of the final pass over unmatched rows.
+    std::vector<Row> right_rows_;
+    std::vector<char> right_matched_;
+    size_t right_pos_ = 0, unmatched_pos_ = 0;
 };
 
 // Classic in-memory hash join: build a hash table on the `build` input, then
 // stream the `probe` input through it. Output = probe columns ++ build columns.
-// With left_outer the probe side is the preserved (left) side of a LEFT JOIN.
+// type is relative to (probe, build): LEFT keeps unmatched probe rows, RIGHT
+// unmatched build rows (emitted after the probe input is exhausted), FULL both.
 class HashJoinExecutor : public Executor {
 public:
     HashJoinExecutor(ExecPtr probe, ExecPtr build, std::vector<ExprPtr> probe_keys, std::vector<ExprPtr> build_keys,
-                     ExprPtr residual, std::string cond_text, bool left_outer = false);
+                     ExprPtr residual, std::string cond_text, JoinType type = JoinType::INNER);
     std::string Describe() const override;
     std::vector<const Executor*> Children() const override { return {probe_.get(), build_.get()}; }
 
@@ -195,14 +206,22 @@ private:
     std::vector<ExprPtr> probe_keys_, build_keys_;
     ExprPtr residual_;
     std::string cond_text_;
-    std::unordered_map<std::string, std::vector<Row>> table_;
-    const std::vector<Row>* matches_ = nullptr;
+    JoinType type_;
+    bool keep_probe_, keep_build_;
+    std::vector<Row> build_rows_;
+    std::vector<char> build_matched_;  // keep_build_ only
+    std::unordered_map<std::string, std::vector<size_t>> table_;  // key -> indexes into build_rows_
+    const std::vector<size_t>* matches_ = nullptr;
     size_t match_idx_ = 0;
     Row probe_row_;
     bool have_probe_ = false;
-    bool left_outer_;
+    bool probe_done_ = false;
     bool matched_ = false;
+    size_t unmatched_pos_ = 0;
 };
+
+// "Left Join", "Right Join", "Full Join" or "Join", for EXPLAIN.
+std::string JoinTypeName(JoinType type);
 
 struct AggSpec {
     AggFunc func;

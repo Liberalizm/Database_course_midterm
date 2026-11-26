@@ -533,17 +533,32 @@ ExecPtr Planner::PlanSelect(const SelectStmt& stmt) {
         if (!stmt.items[i].star) item_exprs[i] = Canonicalize(stmt.items[i].expr, srcs);
 
     // ---------- 4. classify WHERE conjuncts by the tables they touch ----------
-    // A table on the right of a LEFT JOIN is "nullable": its columns are NULL in
-    // padded rows, so WHERE conditions on it must run after that join, never be
-    // pushed into its scan (that would turn the LEFT JOIN into an inner join).
-    bool has_left_join = false;
-    std::vector<bool> nullable(srcs.size(), false);
-    for (size_t i = 0; i < stmt.from.size(); ++i)
-        if (stmt.from[i].left_join) has_left_join = nullable[i] = true;
+    // Outer joins pad rows with NULLs: a LEFT JOIN pads the table it adds, a RIGHT
+    // JOIN every table before it, a FULL JOIN both. pad_step[t] is the last join
+    // (FROM position) that pads table t, -1 if none. A WHERE condition on a padded
+    // table must run after that join, never below it: pushed into the table's scan
+    // it would turn the outer join into an inner one. A condition on no table at
+    // all (WHERE FALSE) must run after the last RIGHT / FULL JOIN, which would
+    // otherwise bring back the rows it removed.
+    bool has_outer_join = false;
+    int last_keep_left = -1;  // last RIGHT / FULL JOIN
+    std::vector<int> pad_step(srcs.size(), -1);
+    for (size_t i = 1; i < stmt.from.size(); ++i) {
+        JoinType jt = stmt.from[i].join;
+        if (jt == JoinType::INNER) continue;
+        has_outer_join = true;
+        int step = static_cast<int>(i);
+        if (jt == JoinType::LEFT || jt == JoinType::FULL) pad_step[i] = step;
+        if (jt == JoinType::RIGHT || jt == JoinType::FULL) {
+            for (size_t t = 0; t < i; ++t) pad_step[t] = step;
+            last_keep_left = step;
+        }
+    }
 
     struct Pending {
         ExprPtr e;
         std::set<int> tabs;
+        int ready;  // may only run once the join at this FROM position is done
         bool used = false;
     };
     std::vector<Pending> pending;
@@ -551,26 +566,37 @@ ExecPtr Planner::PlanSelect(const SelectStmt& stmt) {
     for (auto& c : SplitConjuncts(where)) {
         std::set<int> tabs;
         ReferencedTables(*c, srcs, &tabs);
-        if (tabs.size() == 1 && !nullable[static_cast<size_t>(*tabs.begin())])
+        int ready = tabs.empty() ? last_keep_left : -1;
+        for (int t : tabs) ready = std::max(ready, pad_step[static_cast<size_t>(t)]);
+        if (tabs.size() == 1 && ready < 0)
             per_table[static_cast<size_t>(*tabs.begin())].push_back(c);  // pushdown
         else
-            pending.push_back({c, tabs});
+            pending.push_back({c, tabs, ready});
     }
 
-    // LEFT JOIN ... ON: conditions on the joined table alone only decide which of
-    // its rows can match, so they may filter its scan; the rest stay join conditions.
+    // ON conditions kept with their join (outer joins, and inner joins before a
+    // RIGHT / FULL JOIN). Conditions that only limit which rows of one input can
+    // match may filter that input instead:
+    //   INNER / LEFT JOIN: conditions on the joined table alone filter its scan;
+    //   RIGHT JOIN: conditions on the left input alone filter it (left_filters).
+    // A FULL JOIN keeps every row of both inputs, so its ON stays whole.
     // An ON clause may only refer to tables up to and including its own.
-    std::vector<std::vector<ExprPtr>> on_conds(srcs.size());
-    for (size_t i = 0; i < stmt.from.size(); ++i) {
-        if (!stmt.from[i].left_join) continue;
+    std::vector<std::vector<ExprPtr>> on_conds(srcs.size()), left_filters(srcs.size());
+    for (size_t i = 1; i < stmt.from.size(); ++i) {
+        if (!stmt.from[i].on) continue;
+        JoinType jt = stmt.from[i].join;
         std::vector<Source> visible(srcs.begin(), srcs.begin() + static_cast<std::ptrdiff_t>(i) + 1);
         ExprPtr on = Canonicalize(stmt.from[i].on, visible);
         if (ContainsAggregate(*on)) throw DbError("aggregate functions are not allowed in JOIN conditions");
         for (auto& c : SplitConjuncts(on)) {
             std::set<int> tabs;
             ReferencedTables(*c, srcs, &tabs);
-            if (tabs == std::set<int>{static_cast<int>(i)})
+            if ((jt == JoinType::INNER || jt == JoinType::LEFT) && tabs == std::set<int>{static_cast<int>(i)})
                 per_table[i].push_back(c);
+            else if (jt == JoinType::RIGHT && i == 1 && tabs == std::set<int>{0})
+                per_table[0].push_back(c);  // the left input is just that table
+            else if (jt == JoinType::RIGHT && !tabs.count(static_cast<int>(i)))
+                left_filters[i].push_back(c);
             else
                 on_conds[i].push_back(c);
         }
@@ -599,27 +625,32 @@ ExecPtr Planner::PlanSelect(const SelectStmt& stmt) {
     // ---------- 6. join ordering + join algorithm ----------
     ExecPtr root;
     std::set<int> joined;
-    auto apply_ready_filters = [&](ExecPtr node) {
-        std::vector<ExprPtr> ready;
-        for (auto& p : pending) {
-            if (!p.used && IsSubset(p.tabs, joined)) {
-                ready.push_back(p.e);
-                p.used = true;
-            }
-        }
-        if (ready.empty()) return node;
-        double est = node->est_rows * SelectivityOf(ready), cost = node->est_cost;
-        ExprPtr pred = BindExpr(MakeConjunction(ready), node->OutSchema());
+    auto add_filter = [&](ExecPtr node, const std::vector<ExprPtr>& conds) {
+        if (conds.empty()) return node;
+        double est = node->est_rows * SelectivityOf(conds), cost = node->est_cost;
+        ExprPtr pred = BindExpr(MakeConjunction(conds), node->OutSchema());
         auto f = std::make_unique<FilterExecutor>(std::move(node), pred);
         f->est_rows = std::max(1.0, est);
         f->est_cost = cost;
         return ExecPtr(std::move(f));
     };
+    // Filters `node` (the tables in `joined`, after the join at FROM position
+    // `step`) by the pending WHERE conditions that can run there.
+    auto apply_ready_filters = [&](ExecPtr node, int step) {
+        std::vector<ExprPtr> ready;
+        for (auto& p : pending) {
+            if (!p.used && IsSubset(p.tabs, joined) && p.ready <= step) {
+                ready.push_back(p.e);
+                p.used = true;
+            }
+        }
+        return add_filter(std::move(node), ready);
+    };
 
     // Joins `left` (the tables in `joined`) with `right` (table `next`) on `conds`:
     // a hash join if there are equi-join keys, a nested loop join otherwise.
     auto make_join = [&](ExecPtr left, ExecPtr right, int next, const std::vector<ExprPtr>& conds,
-                         bool left_outer) -> ExecPtr {
+                         JoinType type) -> ExecPtr {
         // Split into equi-join keys (left_expr = right_expr) and residual predicates.
         std::vector<ExprPtr> lkeys, rkeys, residual;
         std::vector<std::string> cond_text;
@@ -653,13 +684,17 @@ ExecPtr Planner::PlanSelect(const SelectStmt& stmt) {
         ExecPtr join;
         double out_rows, cost;
         if (!lkeys.empty()) {
-            // Hash join; the smaller input becomes the build (hashed) side. For a
-            // LEFT JOIN the preserved left side must be the probe side.
+            // Hash join; the smaller input becomes the build (hashed) side. Either
+            // side of an outer join can be the preserved one: the executor's join
+            // type is relative to (probe, build), so it flips when `left` is built.
             out_rows = l_rows * r_rows / std::max(l_rows, r_rows) * SelectivityOf(residual);
             cost = l_cost + r_cost + (l_rows + r_rows) * HASH_TUPLE_COST;
             std::string text;
             for (size_t i = 0; i < cond_text.size(); ++i) text += (i ? " AND " : "") + cond_text[i];
-            bool build_left = !left_outer && l_rows < r_rows;
+            bool build_left = l_rows < r_rows;
+            JoinType hash_type = type;
+            if (build_left && type == JoinType::LEFT) hash_type = JoinType::RIGHT;
+            if (build_left && type == JoinType::RIGHT) hash_type = JoinType::LEFT;
             ExecPtr probe = build_left ? std::move(right) : std::move(left);
             ExecPtr build = build_left ? std::move(left) : std::move(right);
             std::vector<ExprPtr> pk, bk;
@@ -672,32 +707,31 @@ ExecPtr Planner::PlanSelect(const SelectStmt& stmt) {
             Schema combined = Schema::Concat(probe->OutSchema(), build->OutSchema());
             ExprPtr res = residual.empty() ? nullptr : BindExpr(MakeConjunction(residual), combined);
             join = std::make_unique<HashJoinExecutor>(std::move(probe), std::move(build), pk, bk, res, text,
-                                                      left_outer);
+                                                      hash_type);
         } else {
             out_rows = l_rows * r_rows * SelectivityOf(residual);
             cost = l_cost + l_rows * r_cost + l_rows * r_rows * CPU_TUPLE_COST;
             Schema combined = Schema::Concat(left->OutSchema(), right->OutSchema());
             ExprPtr pred = residual.empty() ? nullptr : BindExpr(MakeConjunction(residual), combined);
-            join = std::make_unique<NestedLoopJoinExecutor>(std::move(left), std::move(right), pred, left_outer);
+            join = std::make_unique<NestedLoopJoinExecutor>(std::move(left), std::move(right), pred, type);
         }
-        if (left_outer) out_rows = std::max(out_rows, l_rows);  // every left row survives
+        // Every row of a preserved side survives.
+        if (type == JoinType::LEFT || type == JoinType::FULL) out_rows = std::max(out_rows, l_rows);
+        if (type == JoinType::RIGHT || type == JoinType::FULL) out_rows = std::max(out_rows, r_rows);
         join->est_rows = std::max(1.0, out_rows);
         join->est_cost = cost;
         return join;
     };
 
-    // Predicates from WHERE / inner ON that can become join conditions once `next`
-    // is joined. Conditions on a nullable table never do: they must filter after
-    // the LEFT JOIN that pads it (apply_ready_filters takes care of them).
+    // WHERE conditions that can become conditions of the inner join adding `next`.
+    // Never those on a table an outer join pads at or after `next`: they must
+    // filter after that join (apply_ready_filters takes care of them).
     auto take_applicable = [&](int next) {
         std::set<int> with = joined;
         with.insert(next);
         std::vector<ExprPtr> applicable;
         for (auto& p : pending) {
-            if (p.used || !IsSubset(p.tabs, with)) continue;
-            bool touches_nullable = false;
-            for (int t : p.tabs) touches_nullable = touches_nullable || nullable[static_cast<size_t>(t)];
-            if (touches_nullable) continue;
+            if (p.used || !IsSubset(p.tabs, with) || p.ready >= next) continue;
             applicable.push_back(p.e);
             p.used = true;
         }
@@ -706,19 +740,24 @@ ExecPtr Planner::PlanSelect(const SelectStmt& stmt) {
 
     if (srcs.empty()) {
         root = std::make_unique<ValuesExecutor>();
-        root = apply_ready_filters(std::move(root));
-    } else if (has_left_join) {
+        root = apply_ready_filters(std::move(root), 0);
+    } else if (has_outer_join) {
         // Outer joins are not freely reorderable: join in the order written.
         root = std::move(base[0]);
         joined.insert(0);
-        root = apply_ready_filters(std::move(root));
+        root = apply_ready_filters(std::move(root), 0);
         for (size_t i = 1; i < srcs.size(); ++i) {
             int next = static_cast<int>(i);
-            bool left_outer = stmt.from[i].left_join;
-            std::vector<ExprPtr> conds = left_outer ? on_conds[i] : take_applicable(next);
-            root = make_join(std::move(root), std::move(base[i]), next, conds, left_outer);
+            JoinType jt = stmt.from[i].join;
+            std::vector<ExprPtr> conds = on_conds[i];
+            if (jt == JoinType::INNER) {
+                auto more = take_applicable(next);
+                conds.insert(conds.end(), more.begin(), more.end());
+            }
+            root = add_filter(std::move(root), left_filters[i]);
+            root = make_join(std::move(root), std::move(base[i]), next, conds, jt);
             joined.insert(next);
-            root = apply_ready_filters(std::move(root));
+            root = apply_ready_filters(std::move(root), next);
         }
     } else {
         int start = 0;
@@ -726,7 +765,7 @@ ExecPtr Planner::PlanSelect(const SelectStmt& stmt) {
             if (base[i]->est_rows < base[static_cast<size_t>(start)]->est_rows) start = static_cast<int>(i);
         root = std::move(base[static_cast<size_t>(start)]);
         joined.insert(start);
-        root = apply_ready_filters(std::move(root));
+        root = apply_ready_filters(std::move(root), 0);
 
         while (joined.size() < srcs.size()) {
             // Prefer a table connected to the current set by a join predicate.
@@ -747,9 +786,10 @@ ExecPtr Planner::PlanSelect(const SelectStmt& stmt) {
                 }
             }
             std::vector<ExprPtr> applicable = take_applicable(next);
-            root = make_join(std::move(root), std::move(base[static_cast<size_t>(next)]), next, applicable, false);
+            root = make_join(std::move(root), std::move(base[static_cast<size_t>(next)]), next, applicable,
+                             JoinType::INNER);
             joined.insert(next);
-            root = apply_ready_filters(std::move(root));
+            root = apply_ready_filters(std::move(root), next);
         }
     }
 

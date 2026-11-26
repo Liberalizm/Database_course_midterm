@@ -131,7 +131,7 @@ TEST(Executors, HashJoinIntAndDoubleKeysMatch) {
     EXPECT_EQ(Drain(j).size(), 1u);
 }
 
-// ---- LEFT JOIN (left_outer) ----
+// ---- LEFT JOIN (JoinType::LEFT) ----
 
 // Rows rendered as text and sorted, so join outputs can be compared as multisets.
 std::vector<std::string> Canon(std::vector<Row> rows) {
@@ -148,7 +148,7 @@ std::vector<std::string> Canon(std::vector<Row> rows) {
 TEST(Executors, NestedLoopLeftJoinPadsUnmatchedRowsWithNulls) {
     Schema both = Schema::Concat(People(), Depts());
     NestedLoopJoinExecutor j(Vec(People(), PeopleRows()), Vec(Depts(), DeptRows()),
-                             Bin(BinOp::EQ, ColRef(both, "p", "dept"), ColRef(both, "d", "id")), true);
+                             Bin(BinOp::EQ, ColRef(both, "p", "dept"), ColRef(both, "d", "id")), JoinType::LEFT);
     auto rows = Drain(j);
     ASSERT_EQ(rows.size(), 4u) << "every person exactly once (one dept each at most)";
     EXPECT_EQ(rows[3][1].AsText(), "dan");
@@ -159,7 +159,7 @@ TEST(Executors, NestedLoopLeftJoinPadsUnmatchedRowsWithNulls) {
 }
 
 TEST(Executors, NestedLoopLeftJoinWithEmptyRightSide) {
-    NestedLoopJoinExecutor j(Vec(People(), PeopleRows()), Vec(Depts(), {}), nullptr, true);
+    NestedLoopJoinExecutor j(Vec(People(), PeopleRows()), Vec(Depts(), {}), nullptr, JoinType::LEFT);
     auto rows = Drain(j);
     ASSERT_EQ(rows.size(), 4u);
     for (const auto& r : rows) EXPECT_TRUE(r[3].IsNull() && r[4].IsNull());
@@ -176,7 +176,7 @@ TEST(Executors, HashLeftJoinDuplicatesNullKeysAndResidual) {
     // l.k = r.k AND l.v < r.w: (1,1) matches (1,5); (1,9) matches nothing -> padded;
     // (2,3) has no key partner -> padded; (NULL,4) never joins -> padded.
     HashJoinExecutor j(Vec(l, lrows), Vec(r, rrows), {ColRef(l, "", "k")}, {ColRef(r, "", "k")},
-                       Bin(BinOp::LT, ColRef(both, "l", "v"), ColRef(both, "r", "w")), "", true);
+                       Bin(BinOp::LT, ColRef(both, "l", "v"), ColRef(both, "r", "w")), "", JoinType::LEFT);
     auto rows = Canon(Drain(j));
     std::vector<std::string> expected = {"1|1|1|5|", "1|9|NULL|NULL|", "2|3|NULL|NULL|", "NULL|4|NULL|NULL|"};
     std::sort(expected.begin(), expected.end());
@@ -195,13 +195,125 @@ TEST(Executors, HashLeftJoinAgreesWithNestedLoopLeftJoinOnRandomData) {
         Schema both = Schema::Concat(l, r);
         ExprPtr residual = Bin(BinOp::LE, ColRef(both, "", "x"), ColRef(both, "", "y"));
         HashJoinExecutor hj(Vec(l, lrows), Vec(r, rrows), {ColRef(l, "", "a")}, {ColRef(r, "", "b")}, residual, "",
-                            true);
+                            JoinType::LEFT);
         NestedLoopJoinExecutor nl(Vec(l, lrows), Vec(r, rrows),
                                   Bin(BinOp::AND, Bin(BinOp::EQ, ColRef(both, "", "a"), ColRef(both, "", "b")), residual),
-                                  true);
+                                  JoinType::LEFT);
         auto h = Canon(Drain(hj));
         EXPECT_EQ(h, Canon(Drain(nl))) << "seed " << seed;
         EXPECT_GE(h.size(), lrows.size()) << "a LEFT JOIN never loses left rows";
+    }
+}
+
+// ---- RIGHT / FULL JOIN ----
+
+TEST(Executors, NestedLoopRightAndFullJoinPadUnmatchedRows) {
+    Schema both = Schema::Concat(People(), Depts());
+    auto on = [&] { return Bin(BinOp::EQ, ColRef(both, "p", "dept"), ColRef(both, "d", "id")); };
+    // hr (30) has nobody; dan has no dept.
+    NestedLoopJoinExecutor right(Vec(People(), PeopleRows()), Vec(Depts(), DeptRows()), on(), JoinType::RIGHT);
+    std::vector<std::string> expected = {"1|ann|10|10|eng|", "3|cid|10|10|eng|", "2|bob|20|20|ops|",
+                                         "NULL|NULL|NULL|30|hr|"};
+    std::sort(expected.begin(), expected.end());
+    EXPECT_EQ(Canon(Drain(right)), expected);
+    EXPECT_EQ(Canon(Drain(right)), expected) << "re-initialization starts over";
+    EXPECT_NE(right.Describe().find("Nested Loop Right Join"), std::string::npos);
+
+    NestedLoopJoinExecutor full(Vec(People(), PeopleRows()), Vec(Depts(), DeptRows()), on(), JoinType::FULL);
+    expected.push_back("4|dan|NULL|NULL|NULL|");
+    std::sort(expected.begin(), expected.end());
+    EXPECT_EQ(Canon(Drain(full)), expected);
+    EXPECT_NE(full.Describe().find("Nested Loop Full Join"), std::string::npos);
+}
+
+TEST(Executors, OuterJoinsWithAnEmptySide) {
+    NestedLoopJoinExecutor right(Vec(People(), {}), Vec(Depts(), DeptRows()), nullptr, JoinType::RIGHT);
+    auto rows = Drain(right);
+    ASSERT_EQ(rows.size(), 3u);
+    for (const auto& r : rows) EXPECT_TRUE(r[0].IsNull() && r[1].IsNull() && r[2].IsNull() && !r[3].IsNull());
+    NestedLoopJoinExecutor full(Vec(People(), PeopleRows()), Vec(Depts(), {}), nullptr, JoinType::FULL);
+    EXPECT_EQ(Drain(full).size(), 4u);
+    HashJoinExecutor hash(Vec(People(), {}), Vec(Depts(), DeptRows()), {ColRef(People(), "", "dept")},
+                          {ColRef(Depts(), "", "id")}, nullptr, "", JoinType::RIGHT);
+    EXPECT_EQ(Drain(hash).size(), 3u);
+}
+
+TEST(Executors, HashRightJoinKeepsUnmatchedAndNullKeyBuildRows) {
+    Schema l({Col("k", TypeId::INT, "l"), Col("v", TypeId::INT, "l")});
+    Schema r({Col("k", TypeId::INT, "r"), Col("w", TypeId::INT, "r")});
+    std::vector<Row> lrows = {{I(1), I(1)}, {I(1), I(9)}, {I(2), I(3)}};
+    std::vector<Row> rrows = {{I(1), I(5)}, {I(1), I(0)}, {I(3), I(9)}, {N(), I(7)}};
+    Schema both = Schema::Concat(l, r);
+    // l.k = r.k AND l.v < r.w: (1,5) matches (1,1); (1,0) only fails the residual,
+    // (3,9) has no key partner and (NULL,7) never joins -> all three padded.
+    HashJoinExecutor j(Vec(l, lrows), Vec(r, rrows), {ColRef(l, "", "k")}, {ColRef(r, "", "k")},
+                       Bin(BinOp::LT, ColRef(both, "l", "v"), ColRef(both, "r", "w")), "", JoinType::RIGHT);
+    std::vector<std::string> expected = {"1|1|1|5|", "NULL|NULL|1|0|", "NULL|NULL|3|9|", "NULL|NULL|NULL|7|"};
+    std::sort(expected.begin(), expected.end());
+    EXPECT_EQ(Canon(Drain(j)), expected);
+    EXPECT_EQ(Canon(Drain(j)), expected) << "re-initialization forgets earlier matches";
+    EXPECT_NE(j.Describe().find("Hash Right Join"), std::string::npos);
+}
+
+// Moves the first `n` columns of every row to the end: the output of a join
+// with its inputs swapped, in the column order of the original join.
+std::vector<Row> RotateColumns(std::vector<Row> rows, size_t n) {
+    for (auto& r : rows) std::rotate(r.begin(), r.begin() + static_cast<std::ptrdiff_t>(n), r.end());
+    return rows;
+}
+
+// Every join type, every algorithm, both input orders: all must give the same rows.
+TEST(Executors, OuterJoinAlgorithmsAgreeOnRandomData) {
+    auto flip = [](JoinType t) {
+        return t == JoinType::LEFT ? JoinType::RIGHT : t == JoinType::RIGHT ? JoinType::LEFT : t;
+    };
+    for (JoinType type : {JoinType::INNER, JoinType::LEFT, JoinType::RIGHT, JoinType::FULL}) {
+        for (uint32_t seed = 1; seed <= 4; ++seed) {
+            std::mt19937 rng(seed);
+            Schema l({Col("a", TypeId::INT, "l"), Col("x", TypeId::INT, "l")});
+            Schema r({Col("b", TypeId::INT, "r"), Col("y", TypeId::INT, "r")});
+            std::vector<Row> lrows, rrows;
+            for (int i = 0; i < 120; ++i) lrows.push_back({rng() % 10 == 0 ? N() : I(rng() % 40), I(rng() % 5)});
+            for (int i = 0; i < 90; ++i) rrows.push_back({rng() % 10 == 0 ? N() : I(rng() % 60), I(rng() % 5)});
+            Schema lr = Schema::Concat(l, r), rl = Schema::Concat(r, l);
+            auto pred = [](const Schema& s) {
+                return Bin(BinOp::AND, Bin(BinOp::EQ, ColRef(s, "", "a"), ColRef(s, "", "b")),
+                           Bin(BinOp::LE, ColRef(s, "", "x"), ColRef(s, "", "y")));
+            };
+            auto residual = [](const Schema& s) { return Bin(BinOp::LE, ColRef(s, "", "x"), ColRef(s, "", "y")); };
+
+            // Reference: the definition, row by row.
+            std::vector<Row> ref;
+            std::vector<bool> rmatched(rrows.size(), false);
+            ExprPtr p = pred(lr);
+            for (const auto& a : lrows) {
+                bool any = false;
+                for (size_t j = 0; j < rrows.size(); ++j) {
+                    Row c = a;
+                    c.insert(c.end(), rrows[j].begin(), rrows[j].end());
+                    if (!IsTrue(Evaluate(*p, c))) continue;
+                    any = rmatched[j] = true;
+                    ref.push_back(c);
+                }
+                if (!any && (type == JoinType::LEFT || type == JoinType::FULL)) ref.push_back({a[0], a[1], N(), N()});
+            }
+            if (type == JoinType::RIGHT || type == JoinType::FULL)
+                for (size_t j = 0; j < rrows.size(); ++j)
+                    if (!rmatched[j]) ref.push_back({N(), N(), rrows[j][0], rrows[j][1]});
+            auto expected = Canon(ref);
+
+            NestedLoopJoinExecutor nl(Vec(l, lrows), Vec(r, rrows), pred(lr), type);
+            HashJoinExecutor hj(Vec(l, lrows), Vec(r, rrows), {ColRef(l, "", "a")}, {ColRef(r, "", "b")},
+                                residual(lr), "", type);
+            NestedLoopJoinExecutor nl_swapped(Vec(r, rrows), Vec(l, lrows), pred(rl), flip(type));
+            HashJoinExecutor hj_swapped(Vec(r, rrows), Vec(l, lrows), {ColRef(r, "", "b")}, {ColRef(l, "", "a")},
+                                        residual(rl), "", flip(type));
+            std::string what = JoinTypeName(type) + ", seed " + std::to_string(seed);
+            EXPECT_EQ(Canon(Drain(nl)), expected) << what;
+            EXPECT_EQ(Canon(Drain(hj)), expected) << what;
+            EXPECT_EQ(Canon(RotateColumns(Drain(nl_swapped), 2)), expected) << what << " (inputs swapped)";
+            EXPECT_EQ(Canon(RotateColumns(Drain(hj_swapped), 2)), expected) << what << " (inputs swapped)";
+        }
     }
 }
 

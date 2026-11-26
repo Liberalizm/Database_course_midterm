@@ -462,18 +462,30 @@ SelectStmt Parser::ParseSelectCore() {
             s.from.push_back(r);
         };
         parse_ref();
+        bool saw_comma = false;
+        std::vector<std::pair<size_t, ExprPtr>> inner_ons;  // (FROM index, ON) of inner joins
         while (true) {
             if (AcceptSym(",")) {
+                saw_comma = true;
                 parse_ref();
-            } else if (AcceptKw("left")) {
+            } else if (CheckKw("left") || CheckKw("right") || CheckKw("full")) {
+                JoinType jt = JoinType::FULL;
+                if (AcceptKw("left"))
+                    jt = JoinType::LEFT;
+                else if (AcceptKw("right"))
+                    jt = JoinType::RIGHT;
+                else
+                    ExpectKw("full");
+                // "a, b RIGHT JOIN c" means a × (b RIGHT JOIN c): the join binds
+                // tighter than the comma, which a left-deep join list cannot express.
+                if (jt != JoinType::LEFT && saw_comma)
+                    Error("RIGHT / FULL JOIN cannot follow a comma-separated FROM list (use CROSS JOIN instead of the comma)");
                 AcceptKw("outer");
                 ExpectKw("join");
                 parse_ref();
                 ExpectKw("on");
-                s.from.back().left_join = true;
+                s.from.back().join = jt;
                 s.from.back().on = ParseExpr();
-            } else if (CheckKw("right") || CheckKw("full")) {
-                Error("only INNER, CROSS and LEFT joins are supported (rewrite RIGHT JOIN as LEFT JOIN)");
             } else if (CheckKw("join") || CheckKw("inner") || CheckKw("cross")) {
                 bool cross = AcceptKw("cross");
                 if (!cross) AcceptKw("inner");
@@ -481,11 +493,22 @@ SelectStmt Parser::ParseSelectCore() {
                 parse_ref();
                 if (!cross) {
                     ExpectKw("on");
-                    join_conds.push_back(ParseExpr());
+                    inner_ons.emplace_back(s.from.size() - 1, ParseExpr());
                 }
             } else {
                 break;
             }
+        }
+        // Inner ON conditions become WHERE conditions, except those before a
+        // RIGHT / FULL JOIN, which stay with their join (see TableRef::join).
+        size_t keep_before = 0;
+        for (size_t i = 0; i < s.from.size(); ++i)
+            if (s.from[i].join == JoinType::RIGHT || s.from[i].join == JoinType::FULL) keep_before = i;
+        for (auto& [idx, on] : inner_ons) {
+            if (idx < keep_before)
+                s.from[idx].on = std::move(on);
+            else
+                join_conds.push_back(std::move(on));
         }
     }
     if (AcceptKw("where")) join_conds.push_back(ParseExpr());

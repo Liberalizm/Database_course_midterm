@@ -104,21 +104,57 @@ TEST(Parser, CrossJoinHasNoCondition) {
 TEST(Parser, LeftJoinKeepsItsOnConditionSeparate) {
     auto s = ParseOne<SelectStmt>("SELECT * FROM a x LEFT OUTER JOIN b ON x.k = b.k JOIN c ON c.k = b.k WHERE x.v > 1");
     ASSERT_EQ(s.from.size(), 3u);
-    EXPECT_FALSE(s.from[0].left_join);
-    EXPECT_TRUE(s.from[1].left_join);
+    EXPECT_EQ(s.from[0].join, JoinType::INNER);
+    EXPECT_EQ(s.from[1].join, JoinType::LEFT);
     ASSERT_TRUE(s.from[1].on);
     EXPECT_EQ(s.from[1].on->ToString(), "x.k = b.k");
-    EXPECT_FALSE(s.from[2].left_join);
+    EXPECT_EQ(s.from[2].join, JoinType::INNER);
+    EXPECT_FALSE(s.from[2].on);
     EXPECT_EQ(s.where->ToString(), "(c.k = b.k) AND (x.v > 1)") << "inner ON joins WHERE, LEFT ON does not";
-    EXPECT_TRUE(ParseOne<SelectStmt>("SELECT * FROM a LEFT JOIN b ON TRUE").from[1].left_join);
+    EXPECT_EQ(ParseOne<SelectStmt>("SELECT * FROM a LEFT JOIN b ON TRUE").from[1].join, JoinType::LEFT);
+}
+
+TEST(Parser, RightAndFullJoins) {
+    auto s = ParseOne<SelectStmt>("SELECT * FROM a RIGHT OUTER JOIN b ON a.k = b.k FULL JOIN c ON c.k = b.k");
+    ASSERT_EQ(s.from.size(), 3u);
+    EXPECT_EQ(s.from[1].join, JoinType::RIGHT);
+    EXPECT_EQ(s.from[1].on->ToString(), "a.k = b.k");
+    EXPECT_EQ(s.from[2].join, JoinType::FULL);
+    EXPECT_EQ(s.from[2].on->ToString(), "c.k = b.k");
+    EXPECT_EQ(s.where, nullptr);
+    EXPECT_EQ(ParseOne<SelectStmt>("SELECT * FROM a FULL OUTER JOIN b ON TRUE").from[1].join, JoinType::FULL);
+    EXPECT_THROW(Parser("SELECT * FROM a RIGHT JOIN b").ParseAll(), DbError) << "ON is required";
+    EXPECT_THROW(Parser("SELECT * FROM a FULL b ON TRUE").ParseAll(), DbError) << "JOIN is required";
+}
+
+TEST(Parser, InnerOnBeforeRightOrFullJoinStaysWithItsJoin) {
+    // (a JOIN b ON ab) RIGHT JOIN c: ab must filter before the RIGHT JOIN keeps
+    // every c row, so it cannot become a WHERE condition. Inner ONs after the
+    // last RIGHT / FULL JOIN still go to WHERE.
+    auto s = ParseOne<SelectStmt>(
+        "SELECT * FROM a JOIN b ON a.k = b.k RIGHT JOIN c ON c.k = b.k JOIN d ON d.k = c.k WHERE a.v > 1");
+    ASSERT_EQ(s.from.size(), 4u);
+    ASSERT_TRUE(s.from[1].on);
+    EXPECT_EQ(s.from[1].join, JoinType::INNER);
+    EXPECT_EQ(s.from[1].on->ToString(), "a.k = b.k");
+    EXPECT_FALSE(s.from[3].on);
+    EXPECT_EQ(s.where->ToString(), "(d.k = c.k) AND (a.v > 1)");
+}
+
+TEST(Parser, RightOrFullJoinAfterACommaIsRejected) {
+    // "a, b RIGHT JOIN c" is a × (b RIGHT JOIN c), not (a × b) RIGHT JOIN c.
+    EXPECT_THROW(Parser("SELECT * FROM a, b RIGHT JOIN c ON b.k = c.k").ParseAll(), DbError);
+    EXPECT_THROW(Parser("SELECT * FROM a, b FULL JOIN c ON b.k = c.k").ParseAll(), DbError);
+    EXPECT_NO_THROW(Parser("SELECT * FROM a CROSS JOIN b RIGHT JOIN c ON b.k = c.k").ParseAll());
+    EXPECT_NO_THROW(Parser("SELECT * FROM a RIGHT JOIN b ON a.k = b.k, c").ParseAll());
 }
 
 TEST(Parser, JoinKeywordsAreNotTableAliases) {
     // "FROM a left join b" used to read "left" as an alias of a.
     EXPECT_EQ(ParseOne<SelectStmt>("SELECT * FROM a LEFT JOIN b ON a.k = b.k").from[0].alias, "");
     EXPECT_THROW(Parser("SELECT * FROM a LEFT JOIN b").ParseAll(), DbError) << "ON is required";
-    EXPECT_THROW(Parser("SELECT * FROM a RIGHT JOIN b ON a.k = b.k").ParseAll(), DbError);
-    EXPECT_THROW(Parser("SELECT * FROM a FULL JOIN b ON a.k = b.k").ParseAll(), DbError);
+    EXPECT_EQ(ParseOne<SelectStmt>("SELECT * FROM a RIGHT JOIN b ON a.k = b.k").from[0].alias, "");
+    EXPECT_EQ(ParseOne<SelectStmt>("SELECT * FROM a FULL JOIN b ON a.k = b.k").from[0].alias, "");
     EXPECT_EQ(ParseExpr("\"left\"")->column, "left") << "quoted, the word is still a valid name";
 }
 

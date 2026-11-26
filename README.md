@@ -37,7 +37,7 @@ SQL summary and the meta commands (`.tables`, `.schema t`, `.indexes`,
 | Types | `INT` (64-bit), `DOUBLE`, `TEXT`, `BOOL`, `NULL` |
 | DDL | `CREATE TABLE` with `PRIMARY KEY`, `UNIQUE`, `NOT NULL`, `DEFAULT`; `CREATE [UNIQUE] INDEX`; `CREATE [OR REPLACE] VIEW v [(cols)] AS SELECT ...`; `DROP TABLE / INDEX / VIEW`; `ALTER TABLE ADD / DROP / RENAME [COLUMN]`, `RENAME TO` |
 | DML | `INSERT ... VALUES / SELECT`, `UPDATE`, `DELETE` — each statement is atomic |
-| Queries | `SELECT [DISTINCT]`, `WHERE`, `[INNER] JOIN`, `LEFT [OUTER] JOIN`, `CROSS JOIN` / comma joins, `GROUP BY`, `HAVING`, `ORDER BY` (names, aliases, positions), `LIMIT` / `OFFSET` |
+| Queries | `SELECT [DISTINCT]`, `WHERE`, `[INNER] JOIN`, `LEFT / RIGHT / FULL [OUTER] JOIN`, `CROSS JOIN` / comma joins, `GROUP BY`, `HAVING`, `ORDER BY` (names, aliases, positions), `LIMIT` / `OFFSET` |
 | Set operations | `UNION`, `INTERSECT`, `EXCEPT`, each with or without `ALL` |
 | Subqueries | scalar `(SELECT ...)`, `x [NOT] IN (SELECT ...)`, `[NOT] EXISTS (...)`, derived tables `FROM (SELECT ...) alias`; correlated subqueries (referring to the outer row) in `WHERE` (also of `UPDATE` / `DELETE`), `HAVING` and the select list |
 | Expressions | arithmetic (overflow-checked), comparisons, `AND / OR / NOT` with three-valued logic, `LIKE`, `BETWEEN`, `IN (list)`, `IS [NOT] NULL`, `||`, `CASE` |
@@ -117,8 +117,10 @@ each usable index (min/max statistics from the B+ tree, Cardenas' formula
 for heap pages touched), pushes single-table conditions below joins,
 orders inner joins greedily (smallest input first, avoiding cross
 products) and chooses a hash join for equi-joins (smaller side hashed) or
-a nested loop otherwise. Queries with a `LEFT JOIN` are joined in the order
-written. Uncorrelated subqueries are executed once during planning and
+a nested loop otherwise. Queries with an outer join are joined in the order
+written; either side of an outer hash join can be the hashed one, since the
+executor can emit unmatched rows of its build input as well as of its probe
+input. Uncorrelated subqueries are executed once during planning and
 replaced by their result; a correlated one keeps its plan and is re-run for
 every outer row, with the outer values passed in as parameters.
 
@@ -149,10 +151,12 @@ the middle of a statement can leave it partially written.
   cannot repair it.
 - Database files from before page checksums (pages of exactly 4096 bytes)
   cannot be opened.
-- No `RIGHT` / `FULL` joins or foreign keys; `DEFAULT` must be a constant.
+- No foreign keys; `DEFAULT` must be a constant.
 - Views are read-only (no `INSERT` / `UPDATE` / `DELETE` through a view) and
   are not flattened into the query that uses them, so conditions on a view's
   columns are applied after the view's rows are produced.
+- Joins are left-deep: no parenthesized joins, and a `RIGHT` / `FULL JOIN`
+  cannot follow a comma-separated `FROM` list (write `CROSS JOIN` instead).
 - Indexes on `INT` and `TEXT` columns only; one column per index.
 - B+ tree nodes are not merged after deletes.
 

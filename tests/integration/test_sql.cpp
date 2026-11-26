@@ -285,6 +285,74 @@ TEST_F(SqlTest, LeftJoin) {
               "INSERT 5");
 }
 
+TEST_F(SqlTest, RightAndFullJoin) {
+    SeedCompany();
+    // RIGHT JOIN keeps the department without employees, not eve.
+    auto r = Q("SELECT e.name, d.name FROM emp e RIGHT JOIN dept d ON e.dept_id = d.id ORDER BY d.id, e.id");
+    ASSERT_EQ(r.size(), 5u);
+    EXPECT_TRUE(r[4][0].IsNull());
+    EXPECT_EQ(r[4][1].AsText(), "empty");
+    EXPECT_EQ(Scalar("SELECT COUNT(*) FROM emp e RIGHT OUTER JOIN dept d ON e.dept_id = d.id WHERE e.id IS NULL"), 1);
+    // FULL JOIN keeps both: 4 matched employees + eve + the empty department.
+    auto f = Q("SELECT e.name, d.name FROM emp e FULL OUTER JOIN dept d ON e.dept_id = d.id ORDER BY e.id, d.id");
+    ASSERT_EQ(f.size(), 6u);
+    EXPECT_EQ(f[4][0].AsText(), "eve");
+    EXPECT_TRUE(f[4][1].IsNull());
+    EXPECT_TRUE(f[5][0].IsNull()) << "NULLs sort last";
+    EXPECT_EQ(f[5][1].AsText(), "empty");
+    EXPECT_EQ(Scalar("SELECT COUNT(*) FROM emp e FULL JOIN dept d ON e.dept_id = d.id WHERE e.id IS NULL OR d.id IS NULL"),
+              2);
+    // SELECT * keeps the FROM order of the columns whichever side was hashed.
+    auto star = Q("SELECT * FROM emp e RIGHT JOIN dept d ON e.dept_id = d.id WHERE d.id = 3");
+    ASSERT_EQ(star.size(), 1u);
+    ASSERT_EQ(star[0].size(), 6u);
+    EXPECT_TRUE(star[0][0].IsNull());
+    EXPECT_EQ(star[0][5].AsText(), "empty");
+    // Aggregates over a FULL JOIN; a chain of outer joins.
+    auto counts = Q("SELECT COALESCE(d.name, '-') AS dn, COUNT(e.id) FROM emp e FULL JOIN dept d ON e.dept_id = d.id "
+                    "GROUP BY COALESCE(d.name, '-') ORDER BY dn");
+    ASSERT_EQ(counts.size(), 4u);
+    EXPECT_EQ(counts[0][0].AsText(), "-");
+    EXPECT_EQ(counts[0][1].AsInt(), 1);  // eve
+    EXPECT_EQ(counts[1][1].AsInt(), 0);  // empty
+    EXPECT_EQ(Scalar("SELECT COUNT(*) FROM emp e LEFT JOIN dept d ON e.dept_id = d.id "
+                     "RIGHT JOIN emp m ON m.id = e.id + 4"),
+              5)
+        << "m1..m4 have no e with id m.id - 4; m5 pairs with ann";
+    EXPECT_THROW(db->Execute("SELECT * FROM emp e, dept d RIGHT JOIN emp m ON m.id = d.id"), DbError);
+}
+
+// Differential: RIGHT JOIN = LEFT JOIN with the tables swapped, and FULL JOIN =
+// LEFT JOIN + the right rows nobody matched, for hash and nested loop plans.
+TEST_F(SqlTest, OuterJoinsAgreeWithEachOtherOnRandomData) {
+    db->Execute("CREATE TABLE a (id INT PRIMARY KEY, k INT, v INT); CREATE TABLE b (id INT PRIMARY KEY, k INT, v INT);"
+                "CREATE INDEX b_k ON b (k)");
+    std::mt19937 rng(7);
+    auto fill = [&](const std::string& t, int n, int keys) {
+        std::string sql = "INSERT INTO " + t + " VALUES ";
+        for (int i = 0; i < n; ++i) {
+            std::string k = rng() % 8 == 0 ? "NULL" : std::to_string(rng() % keys);
+            sql += (i ? ", (" : "(") + std::to_string(i) + ", " + k + ", " + std::to_string(rng() % 5) + ")";
+        }
+        db->Execute(sql);
+    };
+    fill("a", 300, 80);
+    fill("b", 120, 120);
+    for (std::string on : {"a.k = b.k", "a.k = b.k AND a.v <= b.v", "a.k <= b.k AND a.k >= b.k AND a.v <= b.v"}) {
+        int64_t left = Scalar("SELECT COUNT(*) FROM a LEFT JOIN b ON " + on);
+        int64_t right = Scalar("SELECT COUNT(*) FROM a RIGHT JOIN b ON " + on);
+        int64_t full = Scalar("SELECT COUNT(*) FROM a FULL JOIN b ON " + on);
+        int64_t inner = Scalar("SELECT COUNT(*) FROM a JOIN b ON " + on);
+        EXPECT_EQ(right, Scalar("SELECT COUNT(*) FROM b LEFT JOIN a ON " + on)) << on;
+        EXPECT_EQ(full, left + right - inner) << on;
+        EXPECT_EQ(Scalar("SELECT COUNT(*) FROM a FULL JOIN b ON " + on + " WHERE a.id IS NULL"), right - inner) << on;
+        EXPECT_EQ(Scalar("SELECT COUNT(*) FROM a FULL JOIN b ON " + on + " WHERE b.id IS NULL"), left - inner) << on;
+        EXPECT_EQ(Scalar("SELECT SUM(b.id) FROM a RIGHT JOIN b ON " + on),
+                  Scalar("SELECT SUM(b.id) FROM b LEFT JOIN a ON " + on))
+            << on;
+    }
+}
+
 TEST_F(SqlTest, FunctionsCaseConcatAndDistinctAggregates) {
     SeedCompany();
     auto r = Q("SELECT UPPER(name) || ' (' || COALESCE(dept_id, 0) || ')' FROM emp ORDER BY id");
