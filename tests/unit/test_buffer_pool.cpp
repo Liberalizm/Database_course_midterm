@@ -246,5 +246,35 @@ TEST_F(BufferPoolTest, FreedFramesAreReusedWhenThePoolIsFull) {
     EXPECT_EQ(pid, victim);
 }
 
+TEST_F(BufferPoolTest, DiscardAllDropsDirtyPagesWithoutWritingThem) {
+    BufferPoolManager bpm(8, &disk);
+    auto ids = MakePages(bpm, 3);
+    bpm.FlushAll();
+    {
+        PageGuard g = PageGuard::Fetch(&bpm, ids[1]);
+        std::strcpy(g.Data(), "changed");
+        g.MarkDirty();
+    }
+    const uint64_t writes = disk.Writes();
+    bpm.DiscardAll();
+    EXPECT_EQ(disk.Writes(), writes) << "nothing is written back";
+    {
+        PageGuard g = PageGuard::Fetch(&bpm, ids[1]);
+        EXPECT_STREQ(g.Data(), "page-1") << "the cached change is gone; the page comes from disk again";
+    }
+    std::vector<PageGuard> held;  // and all 8 frames are usable again
+    for (int i = 0; i < 8; ++i) {
+        page_id_t pid;
+        held.push_back(PageGuard::New(&bpm, &pid));
+    }
+}
+
+TEST_F(BufferPoolTest, DiscardAllRefusesWhilePagesArePinned) {
+    BufferPoolManager bpm(8, &disk);
+    auto ids = MakePages(bpm, 2);
+    PageGuard g = PageGuard::Fetch(&bpm, ids[0]);
+    EXPECT_THROW(bpm.DiscardAll(), DbError);
+}
+
 }  // namespace
 }  // namespace minidb

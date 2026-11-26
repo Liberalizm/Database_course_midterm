@@ -8,24 +8,183 @@
 
 namespace minidb {
 
-Database::Database(const std::string& path, size_t pool_frames) {
-    disk_ = std::make_unique<DiskManager>(path);
+Database::Database(const std::string& path, size_t pool_frames, DiskOptions disk_options) {
+    disk_ = std::make_unique<DiskManager>(path, disk_options);  // recovers the write-ahead log
     bpm_ = std::make_unique<BufferPoolManager>(pool_frames, disk_.get());
     catalog_ = std::make_unique<Catalog>(bpm_.get());
     planner_ = std::make_unique<Planner>(catalog_.get());
+    Commit();  // a newly created database is durable before its first statement
 }
 
 Database::~Database() {
     try {
-        Checkpoint();
+        if (in_txn_ && broken_.empty()) {
+            Undo([this] { disk_->Rollback(); });  // never commit implicitly
+            EndTransaction();
+        }
+        if (broken_.empty()) {
+            Checkpoint();  // clean shutdown
+            return;
+        }
+    } catch (...) {
+    }
+    // Something failed: keep only what was committed. The buffer pool may still
+    // write dirty pages into the log when it goes, so it goes first, and then
+    // the log forgets everything uncommitted before the DiskManager shuts down.
+    try {
+        planner_.reset();
+        catalog_.reset();
+        bpm_.reset();
+        disk_->Rollback();
     } catch (...) {
     }
 }
 
-void Database::Checkpoint() {
+// ---- transactions ----
+
+void Database::FlushToLog() {
     catalog_->Save();
-    bpm_->FlushAll();
+    bpm_->FlushAll();  // into the log, not the database file
 }
+
+void Database::Commit() {
+    FlushToLog();
+    disk_->Commit();  // COMMIT record + fsync: from here on the changes survive a crash
+}
+
+void Database::Undo(const std::function<void()>& rollback_log) {
+    try {
+        bpm_->DiscardAll();  // any cached page, dirty or not, may hold undone changes
+        rollback_log();
+        catalog_->Reload();
+    } catch (const std::exception& e) {
+        broken_ = e.what();
+    }
+}
+
+void Database::CheckUsable() const {
+    if (!broken_.empty())
+        throw DbError("the database cannot be used after a failed rollback (" + broken_ +
+                      "); reopen it to recover from the write-ahead log");
+}
+
+void Database::Checkpoint() {
+    CheckUsable();
+    // A checkpoint copies committed pages only; inside a transaction it would
+    // have to commit first.
+    if (in_txn_) throw DbError("cannot checkpoint inside a transaction (COMMIT or ROLLBACK first)");
+    Commit();
+    disk_->Checkpoint();
+}
+
+QueryResult Database::Modify(const std::function<QueryResult()>& body) {
+    QueryResult r;
+    if (!in_txn_) {
+        // Autocommit: the statement is a transaction of its own.
+        try {
+            r = body();
+            Commit();
+        } catch (...) {
+            // Checks run before writes, so most failing statements wrote nothing:
+            // then there is nothing to undo (and the catalog objects stay valid).
+            if (bpm_->HasDirtyPages() || disk_->HasUncommittedChanges()) Undo([this] { disk_->Rollback(); });
+            throw;
+        }
+        return r;
+    }
+    // Inside a transaction: the statement runs under a savepoint of its own, so
+    // a failure undoes just this statement and the transaction goes on. The
+    // savepoint must see every change made so far, so they all go to the log.
+    FlushToLog();
+    disk_->Savepoint();
+    try {
+        r = body();
+    } catch (...) {
+        Undo([this] {
+            disk_->RollbackToSavepoint();
+            disk_->ReleaseSavepoint();
+        });
+        throw;
+    }
+    disk_->ReleaseSavepoint();
+    return r;
+}
+
+void Database::EndTransaction() {
+    in_txn_ = false;
+    savepoints_.clear();
+}
+
+size_t Database::FindSavepoint(const std::string& name) const {
+    // The most recent savepoint of that name wins (names may be reused).
+    for (size_t i = savepoints_.size(); i-- > 0;)
+        if (savepoints_[i] == name) return i;
+    throw DbError("savepoint \"" + name + "\" does not exist");
+}
+
+QueryResult Database::RunTransaction(const TransactionStmt& s) {
+    using K = TransactionStmt::Kind;
+    auto require_txn = [this](const char* what) {
+        if (!in_txn_) throw DbError(std::string(what) + ": there is no transaction in progress");
+    };
+    switch (s.kind) {
+        case K::BEGIN:
+            if (in_txn_) throw DbError("there is already a transaction in progress");
+            // Every statement before this one is committed, so the log's current
+            // group is empty: from here on it collects this transaction.
+            in_txn_ = true;
+            return {{}, {}, "BEGIN"};
+        case K::COMMIT:
+            require_txn("COMMIT");
+            try {
+                Commit();  // one COMMIT record for the whole transaction
+            } catch (const std::exception& e) {
+                Undo([this] { disk_->Rollback(); });
+                EndTransaction();
+                CheckUsable();  // if even the rollback failed, say so instead
+                throw DbError(std::string("COMMIT failed, the transaction was rolled back: ") + e.what());
+            }
+            EndTransaction();
+            return {{}, {}, "COMMIT"};
+        case K::ROLLBACK:
+            require_txn("ROLLBACK");
+            Undo([this] { disk_->Rollback(); });  // the log forgets the whole group
+            EndTransaction();
+            CheckUsable();
+            return {{}, {}, "ROLLBACK"};
+        case K::SAVEPOINT:
+            require_txn("SAVEPOINT");
+            FlushToLog();  // the savepoint must see every change made so far
+            disk_->Savepoint();
+            savepoints_.push_back(s.savepoint);
+            return {{}, {}, "SAVEPOINT"};
+        case K::RELEASE: {
+            require_txn("RELEASE SAVEPOINT");
+            // Releases the savepoint and every one created after it.
+            const size_t i = FindSavepoint(s.savepoint);
+            while (savepoints_.size() > i) {
+                disk_->ReleaseSavepoint();
+                savepoints_.pop_back();
+            }
+            return {{}, {}, "RELEASE"};
+        }
+        case K::ROLLBACK_TO: {
+            require_txn("ROLLBACK TO SAVEPOINT");
+            // Savepoints created after this one are gone; this one stays.
+            const size_t i = FindSavepoint(s.savepoint);
+            while (savepoints_.size() > i + 1) {
+                disk_->ReleaseSavepoint();
+                savepoints_.pop_back();
+            }
+            Undo([this] { disk_->RollbackToSavepoint(); });
+            CheckUsable();
+            return {{}, {}, "ROLLBACK"};
+        }
+    }
+    throw DbError("internal: unknown transaction statement");
+}
+
+// ---- statements ----
 
 std::vector<QueryResult> Database::Execute(const std::string& sql) {
     Parser parser(sql);
@@ -36,35 +195,23 @@ std::vector<QueryResult> Database::Execute(const std::string& sql) {
 }
 
 QueryResult Database::Run(const Statement& stmt) {
-    // Read-only statements need no checkpoint.
+    CheckUsable();
+    if (auto* s = std::get_if<TransactionStmt>(&stmt)) return RunTransaction(*s);
+    // Read-only statements need neither a commit nor a savepoint.
     if (auto* s = std::get_if<SelectStmt>(&stmt)) return RunSelect(*s);
     if (auto* s = std::get_if<ExplainStmt>(&stmt)) return RunExplain(*s);
 
-    QueryResult r;
-    try {
-        if (auto* s = std::get_if<CreateTableStmt>(&stmt))
-            r = RunCreateTable(*s);
-        else if (auto* s2 = std::get_if<CreateIndexStmt>(&stmt))
-            r = RunCreateIndex(*s2);
-        else if (auto* s3 = std::get_if<DropStmt>(&stmt))
-            r = RunDrop(*s3);
-        else if (auto* s4 = std::get_if<InsertStmt>(&stmt))
-            r = RunInsert(*s4);
-        else if (auto* s5 = std::get_if<DeleteStmt>(&stmt))
-            r = RunDelete(*s5);
-        else if (auto* s6 = std::get_if<UpdateStmt>(&stmt))
-            r = RunUpdate(*s6);
-        else if (auto* s7 = std::get_if<AlterTableStmt>(&stmt))
-            r = RunAlterTable(*s7);
-        else if (auto* s8 = std::get_if<CreateViewStmt>(&stmt))
-            r = RunCreateView(*s8);
-    } catch (...) {
-        Checkpoint();  // keep catalog statistics consistent with whatever was written
-        throw;
-    }
-    // No WAL: we simply force everything to disk at the end of each modifying statement.
-    Checkpoint();
-    return r;
+    return Modify([&]() -> QueryResult {
+        if (auto* s = std::get_if<CreateTableStmt>(&stmt)) return RunCreateTable(*s);
+        if (auto* s = std::get_if<CreateIndexStmt>(&stmt)) return RunCreateIndex(*s);
+        if (auto* s = std::get_if<DropStmt>(&stmt)) return RunDrop(*s);
+        if (auto* s = std::get_if<InsertStmt>(&stmt)) return RunInsert(*s);
+        if (auto* s = std::get_if<DeleteStmt>(&stmt)) return RunDelete(*s);
+        if (auto* s = std::get_if<UpdateStmt>(&stmt)) return RunUpdate(*s);
+        if (auto* s = std::get_if<AlterTableStmt>(&stmt)) return RunAlterTable(*s);
+        if (auto* s = std::get_if<CreateViewStmt>(&stmt)) return RunCreateView(*s);
+        throw DbError("internal: unknown statement");
+    });
 }
 
 // Evaluates a column's DEFAULT once, when the column is defined: it must be a
@@ -418,6 +565,14 @@ QueryResult Database::RunUpdate(const UpdateStmt& s) {
 }
 
 QueryResult Database::Populate(const std::string& table, int64_t n, uint32_t seed) {
+    CheckUsable();
+    return Modify([&]() -> QueryResult {
+        PopulateRows(table, n, seed);
+        return {{}, {}, "INSERT " + std::to_string(n)};
+    });
+}
+
+void Database::PopulateRows(const std::string& table, int64_t n, uint32_t seed) {
     TableInfo* t = catalog_->RequireTable(table);
     const Schema& schema = t->schema;
     std::mt19937 rng(seed + static_cast<uint32_t>(t->row_count));
@@ -514,8 +669,6 @@ QueryResult Database::Populate(const std::string& table, int64_t n, uint32_t see
             batch.clear();
         }
     }
-    Checkpoint();
-    return {{}, {}, "INSERT " + std::to_string(n)};
 }
 
 }  // namespace minidb

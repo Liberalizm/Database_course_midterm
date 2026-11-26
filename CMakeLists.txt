@@ -33,6 +33,8 @@ endfunction()
 
 # The database engine as a library, shared by the shell and the tests.
 add_library(minidb_core STATIC
+        src/file_io.cpp
+        src/wal.cpp
         src/disk_manager.cpp
         src/buffer_pool.cpp
         src/value.cpp

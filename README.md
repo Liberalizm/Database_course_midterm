@@ -24,11 +24,14 @@ cmake --build build --parallel
 ./build/Database_course_midterm mydata.db          # interactive shell
 ./build/Database_course_midterm mydata.db < script.sql
 ./build/Database_course_midterm mydata.db --pool 1024   # buffer pool frames (4 KB each)
+./build/Database_course_midterm mydata.db --nosync      # no fsync (see "Transactions and durability")
 ```
 
-The whole database lives in one file. Type `.help` in the shell for the
-SQL summary and the meta commands (`.tables`, `.schema t`, `.indexes`,
-`.stats`, `.populate t n`, `.read file.sql`, `.timer on`, `.exit`).
+The whole database lives in one file, plus its write-ahead log `mydata.db.wal`
+while it is open (a clean exit folds the log into the file and deletes it).
+Type `.help` in the shell for the SQL summary and the meta commands
+(`.tables`, `.schema t`, `.indexes`, `.stats`, `.populate t n`, `.read file.sql`,
+`.timer on`, `.checkpoint`, `.exit`). Inside a transaction the prompt changes to `minidb*>`.
 
 ## SQL supported
 
@@ -39,6 +42,7 @@ SQL summary and the meta commands (`.tables`, `.schema t`, `.indexes`,
 | Foreign keys | single-column, to a `PRIMARY KEY` or `UNIQUE` column (the primary key if none is named); `ON DELETE` / `ON UPDATE` `NO ACTION` (default), `RESTRICT`, `CASCADE`, `SET NULL`, `SET DEFAULT`; self-references; checked at the end of each statement |
 | DML | `INSERT ... VALUES / SELECT`, `UPDATE`, `DELETE` — each statement is atomic |
 | Queries | `SELECT [DISTINCT]`, `WHERE`, `[INNER] JOIN`, `LEFT / RIGHT / FULL [OUTER] JOIN`, `CROSS JOIN` / comma joins, `GROUP BY`, `HAVING`, `ORDER BY` (names, aliases, positions), `LIMIT` / `OFFSET` |
+| Transactions | `BEGIN` / `COMMIT` / `ROLLBACK` (also `START TRANSACTION`, `END`, `ABORT`), `SAVEPOINT s`, `ROLLBACK TO [SAVEPOINT] s`, `RELEASE [SAVEPOINT] s`; DDL is transactional too; durable and crash-safe through the write-ahead log |
 | Set operations | `UNION`, `INTERSECT`, `EXCEPT`, each with or without `ALL` |
 | Subqueries | scalar `(SELECT ...)`, `x [NOT] IN (SELECT ...)`, `[NOT] EXISTS (...)`, derived tables `FROM (SELECT ...) alias`; correlated subqueries (referring to the outer row) in `WHERE` (also of `UPDATE` / `DELETE`), `HAVING`, the select list and `UPDATE ... SET` (the row being updated); subqueries in `INSERT ... VALUES` may be correlated within themselves |
 | Expressions | arithmetic (overflow-checked), comparisons, `AND / OR / NOT` with three-valued logic, `LIKE`, `BETWEEN`, `IN (list)`, `IS [NOT] NULL`, `||`, `CASE` |
@@ -104,14 +108,16 @@ SELECT * FROM payroll WHERE total > 60;
  planner.cpp      AST -> operator tree                  cost-based
  executors.cpp    operators: scans, filter, joins, aggregate, sort, set ops ...
  expression.cpp   binding and evaluation of expressions
- database.cpp     statement execution, DDL
+ database.cpp     statement execution, DDL, transactions (BEGIN/COMMIT/SAVEPOINT)
  write_set.cpp    atomic write path: constraints, foreign key actions
  catalog.cpp      tables, indexes, foreign keys, free-page list (persisted from page 0)
  bplus_tree.cpp   B+ tree index on 64-bit keys
  table_heap.cpp   table = linked list of slotted pages
  table_page.cpp   slotted page with variable-length tuples
  buffer_pool.cpp  page cache: pinning, LRU replacement, write-back
- disk_manager.cpp the database file as an array of 4 KB pages + checksums
+ disk_manager.cpp the database file as an array of 4 KB pages + checksums, written via the log
+ wal.cpp          write-ahead log: page images, commits, recovery, checkpoints
+ file_io.cpp      positioned file I/O with fsync (Win32 / POSIX)
 ```
 
 **Storage.** Every page is 4 KB. Tables are heap files of slotted pages; a
@@ -168,23 +174,76 @@ as in SQLite; the view then reports the error when it is queried.
 so rows stream through the plan. `EXPLAIN ANALYZE` shows estimated vs.
 actual row counts per operator.
 
-**Writes and durability.** Every modifying statement first collects all
-its changes in a write set, runs the foreign key actions (`CASCADE`,
-`SET NULL`, `SET DEFAULT`, which may add changes to further tables,
-recursively), checks every affected row (types, `NOT NULL`, row size,
-uniqueness and foreign keys, all against the end-of-statement state) and
-only then writes, so a failing statement changes nothing, not even in the
-tables a cascade reached. Rows referencing a changed key are found through
-an index on the referencing column if there is one, else with one scan per
-statement. After each modifying statement the catalog and all dirty
-pages are flushed to the file. There is no write-ahead log, so a crash in
-the middle of a statement can leave it partially written.
+**Writes.** Every modifying statement first collects all its changes in a
+write set, runs the foreign key actions (`CASCADE`, `SET NULL`,
+`SET DEFAULT`, which may add changes to further tables, recursively), checks
+every affected row (types, `NOT NULL`, row size, uniqueness and foreign keys,
+all against the end-of-statement state) and only then writes, so the usual
+errors are caught before anything changes, not even in the tables a cascade
+reached. Rows referencing a changed key are found through an index on the
+referencing column if there is one, else with one scan per statement. Errors
+that can only happen while writing (an I/O error, say) are covered by the
+transaction machinery below.
+
+**Transactions and durability.** Pages are never written into the database
+file directly: every page write (including pages the buffer pool evicts in
+the middle of a statement) is appended as a full page image to the
+write-ahead log `<file>.wal`. A transaction is one *commit group* of the log:
+`COMMIT` sends the catalog and all dirty pages to the log, appends a `COMMIT`
+record and fsyncs the log. That record is the commit point; from then on the
+transaction survives a crash or power failure. `ROLLBACK` cuts the group off
+the log, discards the buffer pool and reloads the catalog from the last
+committed state. That is why schema changes (`CREATE` / `DROP` / `ALTER`)
+roll back too.
+
+- Without `BEGIN`, every statement is a transaction of its own (autocommit).
+- `SAVEPOINT` flushes every change made so far into the log and sets a mark
+  in the open group. A page written again after the mark is appended to the
+  log instead of overwriting its earlier image there, so `ROLLBACK TO` only
+  has to cut the log back to the mark. Savepoints nest and names can be reused.
+- Inside `BEGIN ... COMMIT`, every statement runs under an implicit
+  savepoint. A failing statement is undone completely, even if it fails
+  halfway through writing, and the transaction carries on (like SQLite and
+  MySQL; PostgreSQL would abort the whole transaction).
+- A transaction still open when the database is closed is rolled back. The
+  shell prints a warning in that case.
+- One connection at a time, so isolation is trivially serializable.
+
+A *checkpoint* copies the newest committed image of every logged page into
+the database file (with its checksum), fsyncs it and empties the log. It runs
+after a commit once the log holds 1024 pages (4 MB), on `.checkpoint` (not
+inside a transaction), and on a clean exit (which also deletes the log). On
+open, recovery replays every complete commit group and drops whatever follows
+the last `COMMIT` record: an unfinished transaction, or a record torn by the
+crash. Records carry a checksum, the log's salt (which changes whenever the
+log is emptied), and a transaction number; the `COMMIT` record also carries a
+digest of its group. So stale or torn records, including ones cut off by
+`ROLLBACK TO`, are never applied. Because records are whole pages, replay is
+idempotent and also repairs pages torn in the middle of a checkpoint. `.stats`
+shows the log's size, commits and checkpoints, and the open transaction.
+
+```
+ buffer pool ──page images──▶ <file>.wal ──checkpoint──▶ <file>
+                              [P][P][COMMIT][P][P][P][COMMIT][P][P]
+                              └──────── recovered ─────────┘ └ dropped after a crash
+```
+
+Every commit costs one fsync of the log, so grouping statements into one
+transaction is much faster than autocommit. Measured on the development
+machine (Windows): 1000 single-row `INSERT`s take ~2 s as autocommit vs
+~0.1 s inside one `BEGIN ... COMMIT`. `--nosync`
+(or `DiskOptions{.sync = false}`) skips the fsyncs: commits stay atomic if the
+process crashes, but not if the machine loses power.
 
 ## Limitations
 
-- No transactions or concurrency: one connection, autocommit only.
-- No write-ahead log (see above). Checksums detect a damaged page but
-  cannot repair it.
+- One connection at a time: no concurrency control, and no file locking to
+  stop two processes from opening the same database file.
+- A transaction's changes stay in the log until it commits, so a very large
+  transaction makes the log (not the database file) large until the next
+  checkpoint.
+- Checksums detect a damaged page in the database file but cannot repair it
+  (unless the log still holds a copy, which recovery writes back).
 - Database files from before page checksums (pages of exactly 4096 bytes)
   cannot be opened.
 - `DEFAULT` must be a constant.
@@ -202,7 +261,7 @@ the middle of a statement can leave it partially written.
 
 ## Tests
 
-About 400 tests in three layers — unit tests per component, integration
+About 500 tests in three layers — unit tests per component, integration
 tests through the `Database` API, and end-to-end tests that run the shell
 binary against golden output — plus randomized differential and
 file-corruption tests. See [docs/TESTING.md](docs/TESTING.md).

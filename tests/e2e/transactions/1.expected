@@ -1,0 +1,58 @@
+CREATE TABLE
+INSERT 2
+BEGIN
+UPDATE 2
+CREATE TABLE
+DROP TABLE
+ROLLBACK
+ id | owner | balance
+----+-------+---------
+ 1  | alice | 100
+ 2  | bob   | 50
+(2 rows)
+  account  (2 rows, 1 pages)
+BEGIN
+UPDATE 1
+UPDATE 1
+ERROR: duplicate key value violates unique constraint "account_pkey": id=2
+INSERT 1
+COMMIT
+ id | owner | balance
+----+-------+---------
+ 1  | alice | 70
+ 2  | bob   | 80
+ 3  | carol | 0
+(3 rows)
+BEGIN
+DELETE 1
+SAVEPOINT
+UPDATE 2
+ sum(balance)
+--------------
+ 1500
+(1 row)
+ROLLBACK
+ sum(balance)
+--------------
+ 150
+(1 row)
+RELEASE
+COMMIT
+ id | owner | balance
+----+-------+---------
+ 1  | alice | 70
+ 2  | bob   | 80
+(2 rows)
+ERROR: COMMIT: there is no transaction in progress
+ERROR: ROLLBACK TO SAVEPOINT: there is no transaction in progress
+BEGIN
+ERROR: there is already a transaction in progress
+ERROR: savepoint "nowhere" does not exist
+ROLLBACK
+BEGIN
+INSERT 1
+ count(*)
+----------
+ 3
+(1 row)
+WARNING: the transaction still open at exit was rolled back

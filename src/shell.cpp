@@ -30,6 +30,8 @@ SQL (end every statement with ';'):
   SELECT ... UNION [ALL] | INTERSECT [ALL] | EXCEPT [ALL] SELECT ... [ORDER BY col|n] [LIMIT n];
   UPDATE t SET col = expr WHERE ...;           DELETE FROM t WHERE ...;
   EXPLAIN [ANALYZE] SELECT ...;
+  BEGIN;  ...  COMMIT; | ROLLBACK;            (without BEGIN, every statement commits on its own)
+  SAVEPOINT s;  ROLLBACK TO [SAVEPOINT] s;  RELEASE [SAVEPOINT] s;
   Operators: = <> < <= > >= AND OR NOT + - * / % || LIKE BETWEEN IN IS [NOT] NULL
   CASE [x] WHEN ... THEN ... [ELSE ...] END
   Functions: ABS ROUND LENGTH UPPER LOWER SUBSTR COALESCE NULLIF
@@ -41,7 +43,7 @@ Meta commands:
   .tables               tables and views     .schema <name>     a table's columns and indexes, a view's query
   .indexes              list indexes         .stats             buffer pool / disk statistics
   .populate <t> <n>     insert n random rows .read <file>       run a script (SQL + meta commands)
-  .timer on|off         show query time      .checkpoint        flush everything to disk
+  .timer on|off         show query time      .checkpoint        write the log into the db
   .help                 this text            .exit / .quit      leave
 )";
 
@@ -130,7 +132,9 @@ void PrintResult(const QueryResult& r, std::ostream& os) {
 bool Shell::RunScript(std::istream& in, bool interactive) {
     std::string buffer, line;
     while (true) {
-        if (interactive) out_ << (HasSqlContent(buffer) ? "   ...> " : "minidb> ") << std::flush;
+        // Like psql, the prompt shows an open transaction: "minidb*> ".
+        if (interactive)
+            out_ << (HasSqlContent(buffer) ? "   ...> " : db_.InTransaction() ? "minidb*> " : "minidb> ") << std::flush;
         if (!std::getline(in, line)) break;
         if (!line.empty() && line.back() == '\r') line.pop_back();  // scripts with CRLF line endings
         // Meta commands are recognized at the start of a statement, even after comment lines.
@@ -224,6 +228,19 @@ bool Shell::RunMeta(const std::string& line) {
             out_ << buf;
             out_ << "  disk: file=" << d.Path() << " pages=" << d.NumPages() << " reads=" << d.Reads()
                  << " writes=" << d.Writes() << " free pages=" << b.FreePages().size() << "\n";
+            out_ << "  wal: file=" << d.Log().Path() << " size=" << d.Log().SizeBytes() / 1024
+                 << " KB pages=" << d.Log().PageRecords() << " commits=" << d.Commits()
+                 << " checkpoints=" << d.Checkpoints() << "\n";
+            if (db_.InTransaction()) {
+                out_ << "  transaction: open, " << d.Log().UncommittedPageRecords() << " uncommitted pages in the log";
+                if (!db_.Savepoints().empty()) {
+                    out_ << ", savepoints:";
+                    for (const auto& s : db_.Savepoints()) out_ << " " << s;
+                }
+                out_ << "\n";
+            } else {
+                out_ << "  transaction: none (autocommit)\n";
+            }
         } else if (cmd == ".populate") {
             std::string name;
             int64_t n = 0;

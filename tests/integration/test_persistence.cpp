@@ -3,7 +3,9 @@
 #include <algorithm>
 #include <fstream>
 #include <iterator>
+#include <map>
 #include <random>
+#include <set>
 
 #include "checksum.h"
 #include "database.h"
@@ -37,15 +39,164 @@ TEST(Persistence, StatementsAreDurableWithoutCleanShutdown) {
     TempFile f;
     auto* db = new Database(f.path(), 32);
     db->Execute("CREATE TABLE t (a INT); INSERT INTO t VALUES (1), (2), (3)");
-    // Simulate a crash: copy the file while the first instance is still open (no destructor ran).
+    // Simulate a crash: copy the file and its log while the first instance is
+    // still open (no destructor ran).
     std::string copy = f.path() + ".copy";
-    std::filesystem::copy_file(f.path(), copy, std::filesystem::copy_options::overwrite_existing);
+    testing::CopyCrashImage(f.path(), copy);
     {
         Database recovered(copy, 32);
+        EXPECT_EQ(recovered.Disk().RecoveredCommits(), 3u) << "opening, CREATE TABLE, INSERT";
         EXPECT_EQ(Scalar(recovered, "SELECT COUNT(*) FROM t"), 3);
     }
     std::remove(copy.c_str());
+    std::remove((copy + ".wal").c_str());
     delete db;
+}
+
+// ---- write-ahead log: crashes and rollbacks ---------------------------------
+
+// A summary of the whole contents of table t (or "-" if there is no such
+// table), checking on the way that every index agrees with the table.
+std::string Fingerprint(Database& db) {
+    TableInfo* t = db.GetCatalog().GetTable("t");
+    if (!t) return "-";
+    Row r = db.Execute("SELECT COUNT(*), SUM(id), SUM(g), SUM(LENGTH(s)) FROM t").back().rows.at(0);
+    std::string fp;
+    for (const Value& v : r) fp += v.ToString() + "|";
+    for (IndexInfo* idx : db.GetCatalog().IndexesOf("t")) {
+        size_t n = idx->tree->CheckAndCount();
+        EXPECT_EQ(static_cast<int64_t>(n), r[0].AsInt()) << "index " << idx->name << " disagrees with the table";
+        fp += idx->name + "|";
+    }
+    return fp;
+}
+
+// The log is cut at every record boundary (and at many points in between), as a
+// crash could leave it. Every such database must open, hold exactly the state
+// after its last complete commit, and have consistent indexes. With a tiny
+// buffer pool, the log also contains pages evicted in the middle of statements.
+TEST(Persistence, CrashAtAnyPointOfTheLogRecoversTheLastCommit) {
+    TempFile f;
+    const DiskOptions no_checkpoints{false, 0};  // everything stays in the log
+    std::map<uint64_t, std::string> state_after;  // number of commits -> fingerprint
+    std::vector<char> db_bytes, wal_bytes;
+    {
+        Database db(f.path(), 12, no_checkpoints);
+        state_after[0] = state_after[db.Disk().Commits()] = Fingerprint(db);
+        auto run = [&](const std::string& sql) {
+            db.Execute(sql);
+            state_after[db.Disk().Commits()] = Fingerprint(db);
+        };
+        run("CREATE TABLE t (id INT PRIMARY KEY, g INT, s TEXT)");
+        run("CREATE INDEX t_g ON t (g)");
+        run("INSERT INTO t VALUES (1, 10, 'one'), (2, 20, 'two'), (3, 30, 'three')");
+        db.Populate("t", 600);
+        state_after[db.Disk().Commits()] = Fingerprint(db);
+        run("UPDATE t SET s = s || '-updated', g = g + 1 WHERE id % 3 = 0");
+        run("DELETE FROM t WHERE id > 400");
+        run("INSERT INTO t SELECT id + 1000, g, s FROM t WHERE id < 200");
+        run("ALTER TABLE t ADD COLUMN extra INT DEFAULT 7");
+        run("UPDATE t SET s = 'short' WHERE g < 300");
+        EXPECT_EQ(std::filesystem::file_size(f.path()), 0u) << "no checkpoint has happened";
+        db_bytes = testing::ReadFileBytes(f.path());
+        wal_bytes = testing::ReadFileBytes(f.wal_path());
+    }
+    ASSERT_GT(state_after.size(), 8u);
+
+    // Record boundaries, found by walking the log.
+    std::set<size_t> cuts;
+    for (size_t off = WriteAheadLog::kHeaderSize; off <= wal_bytes.size();) {
+        cuts.insert(off);
+        cuts.insert(off - 1);
+        if (off + 4 > wal_bytes.size()) break;
+        off += ReadAs<uint32_t>(wal_bytes.data() + off) == 1 ? WriteAheadLog::kPageRecordSize
+                                                             : WriteAheadLog::kRecordHeaderSize;
+    }
+    for (size_t len = 0; len < wal_bytes.size(); len += 1531) cuts.insert(len);
+    cuts.insert(wal_bytes.size());
+
+    std::string copy = f.path() + ".crash";
+    uint64_t last_recovered = 0;
+    for (size_t len : cuts) {
+        testing::WriteFileBytes(copy, db_bytes);
+        testing::WriteFileBytes(copy + ".wal", wal_bytes.data(), len);
+        Database db(copy, 12, no_checkpoints);
+        uint64_t k = db.Disk().RecoveredCommits();
+        ASSERT_TRUE(state_after.count(k)) << "cut at " << len << ": recovered " << k << " commits";
+        EXPECT_EQ(Fingerprint(db), state_after[k]) << "cut at " << len << " (" << k << " commits)";
+        EXPECT_GE(k, last_recovered) << "a longer log can only recover more";
+        last_recovered = k;
+        if (len % 7 == 0 || len == wal_bytes.size()) {  // the recovered database is fully usable
+            db.Execute("CREATE TABLE probe (x INT); INSERT INTO probe VALUES (1)");
+            EXPECT_EQ(Scalar(db, "SELECT COUNT(*) FROM probe"), 1);
+        }
+    }
+    EXPECT_EQ(last_recovered, state_after.rbegin()->first) << "the full log recovers every commit";
+    std::remove(copy.c_str());
+    std::remove((copy + ".wal").c_str());
+}
+
+// A statement that fails half-way (here: the disk fails while pages are being
+// written, during the statement or its commit) is rolled back completely.
+TEST(Persistence, FailedStatementIsRolledBackCompletely) {
+    TempFile f;
+    std::string before;
+    {
+        Database db(f.path(), 8);
+        db.Execute("CREATE TABLE t (id INT PRIMARY KEY, g INT, s TEXT); CREATE INDEX t_g ON t (g)");
+        db.Populate("t", 2000);
+        before = Fingerprint(db);
+        for (int64_t after : {0, 1, 5, 20}) {
+            db.Disk().FailWritesAfter(after);
+            EXPECT_THROW(db.Execute("INSERT INTO t SELECT id + 5000, g, s || 'x' FROM t"), DbError)
+                << "failing after " << after << " writes";
+            db.Disk().FailWritesAfter(-1);
+            EXPECT_FALSE(db.Disk().HasUncommittedChanges());
+            EXPECT_EQ(Fingerprint(db), before) << "failing after " << after << " writes";
+        }
+        db.Disk().FailWritesAfter(3);
+        EXPECT_THROW(db.Populate("t", 1000), DbError);
+        db.Disk().FailWritesAfter(-1);
+        EXPECT_EQ(Fingerprint(db), before);
+
+        // The session goes on as if nothing had happened.
+        db.Execute("INSERT INTO t SELECT id + 5000, g, s || 'x' FROM t");
+        EXPECT_EQ(Scalar(db, "SELECT COUNT(*) FROM t"), 4000);
+        before = Fingerprint(db);
+    }
+    Database db(f.path(), 8);
+    EXPECT_EQ(Fingerprint(db), before);
+}
+
+TEST(Persistence, CleanShutdownLeavesNoLogBehind) {
+    TempFile f;
+    {
+        Database db(f.path(), 16);
+        db.Execute("CREATE TABLE t (a INT); INSERT INTO t VALUES (1)");
+        EXPECT_TRUE(std::filesystem::exists(f.wal_path()));
+    }
+    EXPECT_FALSE(std::filesystem::exists(f.wal_path()));
+    Database db(f.path(), 16);
+    EXPECT_EQ(db.Disk().RecoveredCommits(), 0u);
+    EXPECT_EQ(Scalar(db, "SELECT COUNT(*) FROM t"), 1);
+}
+
+TEST(Persistence, CheckpointMovesTheLogIntoTheDatabaseFile) {
+    TempFile f;
+    Database db(f.path(), 16, DiskOptions{true, 0});
+    db.Execute("CREATE TABLE t (a INT); INSERT INTO t VALUES (1), (2)");
+    EXPECT_GT(db.Disk().Log().PageRecords(), 0u);
+    db.Checkpoint();
+    EXPECT_EQ(db.Disk().Log().PageRecords(), 0u);
+    EXPECT_EQ(std::filesystem::file_size(f.path()), static_cast<uintmax_t>(db.Disk().NumPages()) * DISK_PAGE_SIZE);
+    // The database file alone (without the log) is now complete.
+    std::string copy = f.path() + ".alone";
+    std::filesystem::copy_file(f.path(), copy, std::filesystem::copy_options::overwrite_existing);
+    {
+        Database alone(copy, 16);
+        EXPECT_EQ(Scalar(alone, "SELECT SUM(a) FROM t"), 3);
+    }
+    std::remove(copy.c_str());
 }
 
 TEST(Persistence, DroppedObjectsStayDropped) {
@@ -143,8 +294,12 @@ TEST(Persistence, CorruptedFileNeverCrashesOrHangs) {
             std::ofstream out(f.path(), std::ios::binary | std::ios::trunc);
             out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
         }
+        // A log left by the previous round belongs to the file just replaced.
+        std::remove(f.wal_path().c_str());
         try {
-            Database db(f.path(), 16);
+            // No fsync: this test is about damaged pages, not durability (and
+            // opens the database 120 times).
+            Database db(f.path(), 16, DiskOptions{/*sync=*/false});
             for (const char* q : queries) {
                 try {
                     db.Execute(q);
