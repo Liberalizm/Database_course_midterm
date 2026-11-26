@@ -1,0 +1,21 @@
+# Build output
+cmake-build-*/
+build/
+out/
+
+# CLion / JetBrains (user-specific)
+.idea/workspace.xml
+.idea/tasks.xml
+.idea/usage.statistics.xml
+.idea/shelf/
+.idea/dictionaries/
+
+# Compiled artifacts
+*.o
+*.obj
+*.exe
+*.a
+*.lib
+*.so
+*.dll
+*.db
