@@ -178,6 +178,17 @@ TEST(Executors, AggregateSumPromotesAndRejectsText) {
     EXPECT_THROW(Drain(text), DbError);
 }
 
+TEST(Executors, AggregateIntegerSumOverflowIsAnError) {
+    Schema s({Col("x", TypeId::INT)});
+    ExprPtr x = ColRef(s, "", "x");
+    AggregateExecutor at_limit(Vec(s, {{I(INT64_MAX - 1)}, {I(1)}}), {}, {}, {{AggFunc::SUM, x, "s"}});
+    EXPECT_EQ(Drain(at_limit)[0][0].AsInt(), INT64_MAX);
+    AggregateExecutor over(Vec(s, {{I(INT64_MAX)}, {I(1)}}), {}, {}, {{AggFunc::SUM, x, "s"}});
+    EXPECT_THROW(Drain(over), DbError);
+    AggregateExecutor avg(Vec(s, {{I(INT64_MAX)}, {I(INT64_MAX)}}), {}, {}, {{AggFunc::AVG, x, "a"}});
+    EXPECT_DOUBLE_EQ(Drain(avg)[0][0].AsDouble(), static_cast<double>(INT64_MAX)) << "AVG sums in double";
+}
+
 TEST(Executors, SortMultiKeyNullsLastAndStable) {
     Schema s({Col("a", TypeId::INT), Col("b", TypeId::INT), Col("tag", TypeId::TEXT)});
     std::vector<Row> rows = {{I(2), I(1), T("p")}, {N(), I(0), T("q")}, {I(1), I(5), T("r")},

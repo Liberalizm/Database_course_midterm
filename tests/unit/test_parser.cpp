@@ -130,6 +130,18 @@ TEST(Parser, Literals) {
     EXPECT_TRUE(ParseExpr("NULL")->value.IsNull());
     EXPECT_DOUBLE_EQ(ParseExpr("2.5")->value.AsDouble(), 2.5);
     EXPECT_THROW(ParseExpr("99999999999999999999"), DbError);
+    EXPECT_THROW(ParseExpr("1e400"), DbError) << "must be a DbError, not std::out_of_range";
+}
+
+TEST(Parser, IntegerLiteralLimits) {
+    EXPECT_EQ(ParseExpr("9223372036854775807")->value.AsInt(), INT64_MAX);
+    EXPECT_EQ(ParseExpr("-9223372036854775807")->value.AsInt(), -INT64_MAX);
+    auto min = ParseExpr("-9223372036854775808");
+    ASSERT_EQ(min->kind, ExprKind::CONST);
+    EXPECT_EQ(min->value.AsInt(), INT64_MIN);
+    EXPECT_THROW(ParseExpr("9223372036854775808"), DbError) << "only valid with a minus sign";
+    EXPECT_THROW(ParseExpr("- -9223372036854775808"), DbError) << "negating INT64_MIN overflows";
+    EXPECT_EQ(ParseExpr("- -5")->value.AsInt(), 5);
 }
 
 TEST(Parser, Aggregates) {

@@ -520,8 +520,14 @@ ExprPtr Parser::ParseMultiplicative() {
 
 ExprPtr Parser::ParseUnary() {
     if (AcceptSym("-")) {
+        // INT64_MIN is the one integer whose magnitude does not fit as a positive literal.
+        if (Peek().type == TokenType::INTEGER && Peek().text == "9223372036854775808") {
+            Advance();
+            return Expr::Const(Value::Int(INT64_MIN));
+        }
         ExprPtr x = ParseUnary();
-        if (x->kind == ExprKind::CONST && x->value.Type() == TypeId::INT) return Expr::Const(Value::Int(-x->value.AsInt()));
+        if (x->kind == ExprKind::CONST && x->value.Type() == TypeId::INT)
+            return Expr::Const(Value::Int(checked::Neg(x->value.AsInt())));
         if (x->kind == ExprKind::CONST && x->value.Type() == TypeId::DOUBLE)
             return Expr::Const(Value::Double(-x->value.AsDouble()));
         return Expr::Unary(UnaryOp::NEG, x);
@@ -541,7 +547,14 @@ ExprPtr Parser::ParsePrimary() {
                 throw DbError("integer out of range: " + s);
             }
         }
-        case TokenType::FLOAT: return Expr::Const(Value::Double(std::stod(Advance().text)));
+        case TokenType::FLOAT: {
+            std::string s = Advance().text;
+            try {
+                return Expr::Const(Value::Double(std::stod(s)));
+            } catch (...) {
+                throw DbError("value out of range: " + s);
+            }
+        }
         case TokenType::STRING: return Expr::Const(Value::Text(Advance().text));
         case TokenType::SYMBOL:
             if (AcceptSym("(")) {

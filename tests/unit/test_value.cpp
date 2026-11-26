@@ -1,4 +1,6 @@
 // Unit tests: Value, Schema and tuple (de)serialization.
+#include <limits>
+
 #include "test_util.h"
 #include "value.h"
 
@@ -49,6 +51,17 @@ TEST(Value, CastTo) {
     EXPECT_THROW(T("3").CastTo(TypeId::INT), DbError);
     EXPECT_THROW(I(1).CastTo(TypeId::TEXT), DbError);
     EXPECT_THROW(B(true).CastTo(TypeId::INT), DbError);
+}
+
+TEST(Value, DoubleToIntCastIsRangeChecked) {
+    EXPECT_EQ(D(-3.7).CastTo(TypeId::INT).AsInt(), -3) << "truncates toward zero";
+    EXPECT_EQ(D(-9223372036854775808.0).CastTo(TypeId::INT).AsInt(), INT64_MIN) << "-2^63 fits exactly";
+    EXPECT_EQ(D(9223372036854774784.0).CastTo(TypeId::INT).AsInt(), 9223372036854774784) << "largest double < 2^63";
+    EXPECT_THROW(D(9223372036854775808.0).CastTo(TypeId::INT), DbError) << "2^63 does not fit";
+    EXPECT_THROW(D(-1e19).CastTo(TypeId::INT), DbError);
+    EXPECT_THROW(D(std::numeric_limits<double>::infinity()).CastTo(TypeId::INT), DbError);
+    EXPECT_THROW(D(std::numeric_limits<double>::quiet_NaN()).CastTo(TypeId::INT), DbError);
+    EXPECT_THROW(D(1e19).AsInt(), DbError);
 }
 
 TEST(Value, HashKeyTreatsIntegralDoublesAsInts) {

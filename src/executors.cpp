@@ -324,7 +324,7 @@ void AggregateExecutor::InitImpl() {
                     if (s.acc.IsNull())
                         s.acc = v;
                     else if (s.acc.Type() == TypeId::INT && v.Type() == TypeId::INT)
-                        s.acc = Value::Int(s.acc.AsInt() + v.AsInt());
+                        s.acc = Value::Int(checked::Add(s.acc.AsInt(), v.AsInt()));
                     else
                         s.acc = Value::Double(s.acc.AsDouble() + v.AsDouble());
                     break;

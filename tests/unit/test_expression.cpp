@@ -32,6 +32,42 @@ TEST(Expression, DivisionByZero) {
     EXPECT_THROW(Eval(Bin(BinOp::DIV, C(D(1)), C(D(0)))), DbError);
 }
 
+// Signed overflow is undefined behaviour in C++, and INT64_MIN / -1 even kills
+// the process on x86, so every overflow must surface as an SQL error instead.
+TEST(Expression, IntegerOverflowIsAnError) {
+    const int64_t max = INT64_MAX, min = INT64_MIN;
+    EXPECT_THROW(Eval(Bin(BinOp::ADD, C(I(max)), C(I(1)))), DbError);
+    EXPECT_THROW(Eval(Bin(BinOp::ADD, C(I(min)), C(I(-1)))), DbError);
+    EXPECT_THROW(Eval(Bin(BinOp::SUB, C(I(min)), C(I(1)))), DbError);
+    EXPECT_THROW(Eval(Bin(BinOp::SUB, C(I(0)), C(I(min)))), DbError);
+    EXPECT_THROW(Eval(Bin(BinOp::MUL, C(I(max)), C(I(2)))), DbError);
+    EXPECT_THROW(Eval(Bin(BinOp::MUL, C(I(min)), C(I(-1)))), DbError);
+    EXPECT_THROW(Eval(Bin(BinOp::MUL, C(I(-1)), C(I(min)))), DbError);
+    EXPECT_THROW(Eval(Bin(BinOp::MUL, C(I(4294967296)), C(I(4294967296)))), DbError);
+    EXPECT_THROW(Eval(Bin(BinOp::DIV, C(I(min)), C(I(-1)))), DbError);
+    EXPECT_THROW(Eval(Expr::Unary(UnaryOp::NEG, C(I(min)))), DbError);
+}
+
+TEST(Expression, IntegerArithmeticAtTheLimits) {
+    const int64_t max = INT64_MAX, min = INT64_MIN;
+    EXPECT_EQ(Eval(Bin(BinOp::ADD, C(I(max - 1)), C(I(1)))).AsInt(), max);
+    EXPECT_EQ(Eval(Bin(BinOp::ADD, C(I(min)), C(I(max)))).AsInt(), -1);
+    EXPECT_EQ(Eval(Bin(BinOp::SUB, C(I(-1)), C(I(max)))).AsInt(), min);
+    EXPECT_EQ(Eval(Bin(BinOp::MUL, C(I(min / 2)), C(I(2)))).AsInt(), min);
+    EXPECT_EQ(Eval(Bin(BinOp::MUL, C(I(-3037000499)), C(I(-3037000499)))).AsInt(), 9223372030926249001);
+    EXPECT_EQ(Eval(Bin(BinOp::MUL, C(I(max)), C(I(-1)))).AsInt(), -max);
+    EXPECT_EQ(Eval(Bin(BinOp::DIV, C(I(min)), C(I(1)))).AsInt(), min);
+    EXPECT_EQ(Eval(Bin(BinOp::MOD, C(I(min)), C(I(-1)))).AsInt(), 0) << "traps on x86 if done naively";
+    EXPECT_EQ(Eval(Bin(BinOp::MOD, C(I(-7)), C(I(3)))).AsInt(), -1) << "sign follows the dividend";
+    EXPECT_EQ(Eval(Expr::Unary(UnaryOp::NEG, C(I(max)))).AsInt(), min + 1);
+}
+
+TEST(Expression, DoubleOverflowIsAnError) {
+    EXPECT_THROW(Eval(Bin(BinOp::MUL, C(D(1e300)), C(D(1e300)))), DbError);
+    EXPECT_THROW(Eval(Bin(BinOp::SUB, C(D(-1e308)), C(D(1e308)))), DbError);
+    EXPECT_DOUBLE_EQ(Eval(Bin(BinOp::MUL, C(D(1e150)), C(D(1e150)))).AsDouble(), 1e300);
+}
+
 TEST(Expression, ArithmeticTypeErrors) {
     EXPECT_THROW(Eval(Bin(BinOp::ADD, C(T("a")), C(I(1)))), DbError);
     EXPECT_THROW(Eval(Expr::Unary(UnaryOp::NEG, C(T("a")))), DbError);

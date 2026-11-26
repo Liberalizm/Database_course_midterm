@@ -118,32 +118,37 @@ Value Arithmetic(BinOp op, const Value& l, const Value& r) {
     if (l.Type() == TypeId::INT && r.Type() == TypeId::INT) {
         int64_t a = l.AsInt(), b = r.AsInt();
         switch (op) {
-            case BinOp::ADD: return Value::Int(a + b);
-            case BinOp::SUB: return Value::Int(a - b);
-            case BinOp::MUL: return Value::Int(a * b);
+            case BinOp::ADD: return Value::Int(checked::Add(a, b));
+            case BinOp::SUB: return Value::Int(checked::Sub(a, b));
+            case BinOp::MUL: return Value::Int(checked::Mul(a, b));
             case BinOp::DIV:
                 if (b == 0) throw DbError("division by zero");
-                return Value::Int(a / b);
+                return Value::Int(checked::Div(a, b));
             case BinOp::MOD:
                 if (b == 0) throw DbError("division by zero");
-                return Value::Int(a % b);
+                return Value::Int(checked::Mod(a, b));
             default: break;
         }
     }
     double a = l.AsDouble(), b = r.AsDouble();
+    double res;
     switch (op) {
-        case BinOp::ADD: return Value::Double(a + b);
-        case BinOp::SUB: return Value::Double(a - b);
-        case BinOp::MUL: return Value::Double(a * b);
+        case BinOp::ADD: res = a + b; break;
+        case BinOp::SUB: res = a - b; break;
+        case BinOp::MUL: res = a * b; break;
         case BinOp::DIV:
             if (b == 0) throw DbError("division by zero");
-            return Value::Double(a / b);
+            res = a / b;
+            break;
         case BinOp::MOD:
             if (b == 0) throw DbError("division by zero");
-            return Value::Double(std::fmod(a, b));
-        default: break;
+            res = std::fmod(a, b);
+            break;
+        default: throw DbError("internal: bad arithmetic operator");
     }
-    throw DbError("internal: bad arithmetic operator");
+    // Like PostgreSQL: overflowing to infinity is an error, not a value.
+    if (!std::isfinite(res)) throw DbError("value out of range: overflow");
+    return Value::Double(res);
 }
 
 void CheckBool(const Value& v, const char* what) {
@@ -167,7 +172,7 @@ Value Evaluate(const Expr& e, const Row& row) {
                 CheckBool(v, "NOT");
                 return Value::Bool(!v.AsBool());
             }
-            if (v.Type() == TypeId::INT) return Value::Int(-v.AsInt());
+            if (v.Type() == TypeId::INT) return Value::Int(checked::Neg(v.AsInt()));
             if (v.Type() == TypeId::DOUBLE) return Value::Double(-v.AsDouble());
             throw DbError("unary minus requires a numeric operand");
         }

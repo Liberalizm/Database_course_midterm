@@ -293,6 +293,21 @@ TEST_F(SqlTest, ExplainAndExplainAnalyze) {
     EXPECT_NE(analyzed.back()[0].AsText().find("Execution Time"), std::string::npos);
 }
 
+TEST_F(SqlTest, IntegerOverflowNeverReachesTheTable) {
+    db->Execute("CREATE TABLE n (id INT PRIMARY KEY, v INT)");
+    db->Execute("INSERT INTO n VALUES (1, 9223372036854775807), (2, -9223372036854775808), (3, 0)");
+    EXPECT_THROW(db->Execute("UPDATE n SET v = v + 1"), DbError);
+    EXPECT_THROW(db->Execute("UPDATE n SET v = -v WHERE id = 2"), DbError);
+    EXPECT_THROW(db->Execute("INSERT INTO n VALUES (4, 1e19)"), DbError);
+    EXPECT_EQ(Q("SELECT SUM(v) FROM n WHERE id <> 2")[0][0].AsInt(), INT64_MAX) << "MAX + 0 fits";
+    EXPECT_THROW(db->Execute("SELECT SUM(n.v) FROM n, n m WHERE n.id = 1"), DbError) << "3 * MAX does not";
+    EXPECT_THROW(db->Execute("SELECT v / -1 FROM n WHERE id = 2"), DbError) << "used to crash the process";
+    EXPECT_EQ(Q("SELECT v % -1 FROM n WHERE id = 2")[0][0].AsInt(), 0);
+    EXPECT_EQ(Q("SELECT v FROM n WHERE id = 1")[0][0].AsInt(), INT64_MAX);
+    EXPECT_EQ(Q("SELECT v FROM n WHERE id = 2")[0][0].AsInt(), INT64_MIN);
+    EXPECT_EQ(Scalar("SELECT COUNT(*) FROM n WHERE v = -9223372036854775808"), 1);
+}
+
 TEST_F(SqlTest, ErrorsDoNotBreakTheSession) {
     SeedCompany();
     EXPECT_THROW(db->Execute("SELEC 1"), DbError);
