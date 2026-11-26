@@ -94,6 +94,18 @@ public:
     RID CurrentRid() const override { return cur_; }
     std::string Describe() const override;
 
+    // Bounds whose value is known only when the scan starts: the key column
+    // compared with an outer row's value in a correlated subquery
+    // (inner.col = outer.col), re-evaluated on every Init(). The caller keeps
+    // the conditions in the filter, so they are re-checked either way; a value
+    // the column cannot be compared with bounds nothing (the filter reports the
+    // error). A NULL value matches no row.
+    struct ParamBound {
+        BinOp op;       // column <op> value
+        ExprPtr value;  // bound to an empty schema: only PARAMs and constants
+    };
+    void SetParamBounds(std::vector<ParamBound> bounds, TypeId key_type);
+
 protected:
     void InitImpl() override;
     bool NextImpl(Row* out) override;
@@ -104,6 +116,9 @@ private:
     std::string alias_;
     std::optional<IndexBound> lo_, hi_;
     ExprPtr pred_;
+    std::optional<IndexBound> static_lo_, static_hi_;
+    std::vector<ParamBound> param_bounds_;
+    TypeId key_type_ = TypeId::INT;
     std::optional<BPlusTree::Iterator> it_;
     bool done_ = false;
     RID cur_;

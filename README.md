@@ -48,7 +48,7 @@ Type `.help` in the shell for the SQL summary and the meta commands
 | Expressions | arithmetic (overflow-checked), comparisons, `AND / OR / NOT` with three-valued logic, `LIKE`, `BETWEEN`, `IN (list)`, `IS [NOT] NULL`, `||`, `CASE` |
 | Functions | `ABS`, `ROUND`, `LENGTH`, `UPPER`, `LOWER`, `SUBSTR`, `COALESCE`, `NULLIF`, `CAST(x AS type)`, `DATE(x)`, `YEAR`, `MONTH`, `DAY`, `HOUR`, `MINUTE`, `SECOND`; date `+`/`-` days, timestamp `+`/`-` seconds, `d1 - d2` (days) |
 | Aggregates | `COUNT(*)`, `COUNT / SUM / AVG / MIN / MAX`, each also with `DISTINCT` |
-| Tools | `EXPLAIN` and `EXPLAIN ANALYZE` |
+| Tools | `EXPLAIN`, `EXPLAIN ANALYZE`, `ANALYZE [table]` (column statistics for the planner) |
 
 Examples (all of them run as an end-to-end test, see
 [`tests/e2e/advanced`](tests/e2e/advanced/1.sql)):
@@ -162,7 +162,21 @@ written; either side of an outer hash join can be the hashed one, since the
 executor can emit unmatched rows of its build input as well as of its probe
 input. Uncorrelated subqueries are executed once during planning and
 replaced by their result; a correlated one keeps its plan and is re-run for
-every outer row, with the outer values passed in as parameters.
+every outer row, with the outer values passed in as parameters. A condition
+such as `inner.col = outer.col` on an indexed column becomes an index scan
+whose bounds are filled in from the outer row on every run (and the
+condition is still re-checked), so `EXISTS` / scalar subqueries over a large
+indexed table stay cheap.
+
+**Statistics.** `ANALYZE [table]` records for every column the number of
+NULLs and of distinct values, the most common values with their counts, and
+an equi-depth histogram (32 buckets; tables over 30000 rows are sampled for
+these two). They are kept in the catalog and used for the selectivity of
+`=`, `<>`, ranges (`BETWEEN` and `a > x AND a < y` as one range), `IS NULL`
+and `IN`, for equi-join sizes (1 / the larger distinct count) and for the
+number of groups. Without `ANALYZE` the planner falls back to min/max from
+the index and fixed guesses. Changing a table's columns drops its statistics;
+row changes do not, so run `ANALYZE` again after large changes.
 
 **Views.** The catalog stores a view's query as text. Every statement that
 reads the view parses and plans that text again and uses the plan like a

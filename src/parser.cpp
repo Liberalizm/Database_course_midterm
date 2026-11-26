@@ -243,6 +243,12 @@ Statement Parser::ParseStatement() {
         e.select = std::make_shared<SelectStmt>(ParseSelect());
         return e;
     }
+    if (AcceptKw("analyze")) {
+        AnalyzeStmt a;
+        AcceptKw("table");
+        if (Peek().type == TokenType::IDENT) a.table = ExpectIdent();
+        return a;
+    }
     if (Statement t; ParseTransaction(&t)) return t;
     Error("unknown statement");
 }

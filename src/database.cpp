@@ -210,6 +210,14 @@ QueryResult Database::Run(const Statement& stmt) {
         if (auto* s = std::get_if<UpdateStmt>(&stmt)) return RunUpdate(*s);
         if (auto* s = std::get_if<AlterTableStmt>(&stmt)) return RunAlterTable(*s);
         if (auto* s = std::get_if<CreateViewStmt>(&stmt)) return RunCreateView(*s);
+        if (auto* s = std::get_if<AnalyzeStmt>(&stmt)) {
+            if (!s->table.empty()) {
+                catalog_->Analyze(catalog_->RequireTable(s->table));
+            } else {
+                for (TableInfo* t : catalog_->Tables()) catalog_->Analyze(t);
+            }
+            return QueryResult{{}, {}, "ANALYZE"};
+        }
         throw DbError("internal: unknown statement");
     });
 }

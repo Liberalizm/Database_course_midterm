@@ -290,7 +290,12 @@ struct TransactionStmt {
     std::string savepoint;  // SAVEPOINT, RELEASE, ROLLBACK_TO
 };
 
+// ANALYZE [table]: gathers column statistics for the planner (all tables if none named).
+struct AnalyzeStmt {
+    std::string table;
+};
+
 using Statement = std::variant<CreateTableStmt, CreateIndexStmt, DropStmt, InsertStmt, SelectStmt, DeleteStmt,
-                               UpdateStmt, ExplainStmt, AlterTableStmt, CreateViewStmt, TransactionStmt>;
+                               UpdateStmt, ExplainStmt, AlterTableStmt, CreateViewStmt, TransactionStmt, AnalyzeStmt>;
 
 }  // namespace minidb

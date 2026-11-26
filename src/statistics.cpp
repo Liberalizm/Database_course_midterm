@@ -57,8 +57,18 @@ std::optional<double> ColumnStats::EqFrac(const Value& v) const {
     return static_cast<double>(rest_rows) / static_cast<double>(rest_distinct) / static_cast<double>(rows);
 }
 
-std::optional<double> ColumnStats::LessFrac(const Value& v, bool inclusive) const {
+std::optional<double> ColumnStats::LessFrac(const Value& value, bool inclusive) const {
     if (rows <= 0 || histogram.empty()) return 0.0;
+    // Text compared with a date or timestamp column is read as one, so it can be
+    // interpolated like the column's values.
+    Value v = value;
+    if (v.Type() == TypeId::TEXT && IsTemporal(histogram.front().Type())) {
+        try {
+            v = v.CastTo(histogram.front().Type());
+        } catch (const DbError&) {
+            return std::nullopt;
+        }
+    }
     const auto& h = histogram;
     const size_t k = h.size() - 1;  // buckets
     double below;                   // fraction of the non-NULL values below v
@@ -137,7 +147,7 @@ std::vector<ColumnStats> ComputeStats(const Schema& schema, const std::function<
         const double avg = static_cast<double>(values.size()) / static_cast<double>(runs.size());
         std::stable_sort(runs.begin(), runs.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
         for (const auto& [count, first] : runs) {
-            if (s.mcv.size() == ColumnStats::kMaxMcv || count < 2 || static_cast<double>(count) <= avg * 1.25) break;
+            if (s.mcv.size() == ColumnStats::kMaxMcv || count < 2 || static_cast<double>(count) <= avg) break;
             s.mcv.push_back(values[first]);
             s.mcv_counts.push_back(std::max<int64_t>(1, static_cast<int64_t>(static_cast<double>(count) * scale)));
         }

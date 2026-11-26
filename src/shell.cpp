@@ -29,7 +29,7 @@ SQL (end every statement with ';'):
          GROUP BY ... HAVING ... ORDER BY ... [DESC] LIMIT n OFFSET m;
   SELECT ... UNION [ALL] | INTERSECT [ALL] | EXCEPT [ALL] SELECT ... [ORDER BY col|n] [LIMIT n];
   UPDATE t SET col = expr WHERE ...;           DELETE FROM t WHERE ...;
-  EXPLAIN [ANALYZE] SELECT ...;
+  EXPLAIN [ANALYZE] SELECT ...;   ANALYZE [t];  (column statistics for the planner)
   BEGIN;  ...  COMMIT; | ROLLBACK;            (without BEGIN, every statement commits on its own)
   SAVEPOINT s;  ROLLBACK TO [SAVEPOINT] s;  RELEASE [SAVEPOINT] s;
   Operators: = <> < <= > >= AND OR NOT + - * / % || LIKE BETWEEN IN IS [NOT] NULL
@@ -215,6 +215,15 @@ bool Shell::RunMeta(const std::string& line) {
                 out_ << "  constraint " << fk->name << " " << fk->ToString() << "\n";
             for (ForeignKey* fk : db_.GetCatalog().ForeignKeysTo(name))
                 out_ << "  referenced by " << fk->table << "(" << fk->column << ") via " << fk->name << "\n";
+            if (t->stats.size() == t->schema.Size()) {  // ANALYZE
+                out_ << "  statistics (" << t->stats[0].rows << " rows when analyzed):";
+                for (size_t i = 0; i < t->stats.size(); ++i) {
+                    const ColumnStats& s = t->stats[i];
+                    out_ << (i ? "," : "") << " " << t->schema.At(i).name << " " << s.distinct << " distinct";
+                    if (s.nulls) out_ << " " << s.nulls << " null";
+                }
+                out_ << "\n";
+            }
         } else if (cmd == ".stats") {
             auto& b = db_.Bpm();
             auto& d = db_.Disk();

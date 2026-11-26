@@ -3,8 +3,8 @@
 //
 // For every column ANALYZE records
 //   * the number of NULLs and of distinct non-NULL values,
-//   * the most common values (MCVs) with their exact counts: values seen more
-//     often than the average value, at most kMaxMcv of them, and
+//   * the most common values (MCVs) with their counts: values seen more often
+//     than the average value (and at least twice), at most kMaxMcv of them, and
 //   * an equi-depth histogram: k + 1 sorted bounds such that each of the k
 //     buckets holds about the same number of the column's non-NULL values.
 // Equality with an MCV is estimated from its count; with another value from

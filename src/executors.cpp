@@ -55,10 +55,53 @@ IndexScanExecutor::IndexScanExecutor(TableInfo* table, IndexInfo* index, std::st
                                      std::optional<IndexBound> lo, std::optional<IndexBound> hi, ExprPtr pred)
     : table_(table), index_(index), alias_(std::move(alias)), lo_(lo), hi_(hi), pred_(std::move(pred)) {
     schema_ = std::move(schema);
+    static_lo_ = lo;
+    static_hi_ = hi;
+}
+
+void IndexScanExecutor::SetParamBounds(std::vector<ParamBound> bounds, TypeId key_type) {
+    param_bounds_ = std::move(bounds);
+    key_type_ = key_type;
 }
 
 void IndexScanExecutor::InitImpl() {
     done_ = false;
+    if (!param_bounds_.empty()) {
+        lo_ = static_lo_;
+        hi_ = static_hi_;
+        for (const ParamBound& b : param_bounds_) {
+            Value v = Evaluate(*b.value, {});
+            if (v.IsNull()) {  // a comparison with NULL is never true
+                done_ = true;
+                return;
+            }
+            // The nearest key value k of the column's type. If k differs from v
+            // (2.5 for an INT column), "=" matches nothing, and a range is bounded
+            // at k, inclusive exactly when k lies on the matching side of v.
+            std::optional<int64_t> key;
+            int cmp = 0;  // k compared with v
+            try {
+                Value k = v.CastTo(key_type_);
+                cmp = k.Compare(v);
+                key = IndexKeyPart(k);
+            } catch (const DbError&) {  // incomparable: the filter reports it
+            }
+            if (!key) continue;
+            if (cmp != 0 && b.op == BinOp::EQ) {
+                done_ = true;
+                return;
+            }
+            const bool lower = b.op == BinOp::EQ || b.op == BinOp::GT || b.op == BinOp::GE;
+            const bool upper = b.op == BinOp::EQ || b.op == BinOp::LT || b.op == BinOp::LE;
+            bool incl;
+            if (cmp == 0)
+                incl = b.op == BinOp::EQ || b.op == BinOp::GE || b.op == BinOp::LE;
+            else
+                incl = lower ? cmp > 0 : cmp < 0;
+            if (lower && (!lo_ || *key > lo_->value || (*key == lo_->value && !incl))) lo_ = IndexBound{*key, incl};
+            if (upper && (!hi_ || *key < hi_->value || (*key == hi_->value && !incl))) hi_ = IndexBound{*key, incl};
+        }
+    }
     if (!lo_) {
         it_.emplace(index_->tree->Begin());
         return;
@@ -145,6 +188,11 @@ std::string IndexScanExecutor::Describe() const {
     } else {
         if (lo_) conds.push_back(side(*lo_) + (lo_->inclusive ? " >= " : " > ") + value(*lo_));
         if (hi_) conds.push_back(side(*hi_) + (hi_->inclusive ? " <= " : " < ") + value(*hi_));
+    }
+    if (!param_bounds_.empty()) {  // bounds from the outer row (see SetParamBounds)
+        conds.clear();
+        for (const ParamBound& b : param_bounds_)
+            conds.push_back(col + " " + BinOpSymbol(b.op) + " " + b.value->ToString());
     }
     if (!conds.empty()) s += "  Index Cond: " + Join(conds, " AND ");
     if (pred_) s += "  Filter: " + pred_->ToString();
