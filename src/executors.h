@@ -208,6 +208,7 @@ struct AggSpec {
     AggFunc func;
     ExprPtr arg;  // bound; null for COUNT(*)
     std::string name;
+    bool distinct = false;  // COUNT(DISTINCT x) etc.: duplicate values are ignored
 };
 
 // Hash aggregation (GROUP BY + aggregate functions).

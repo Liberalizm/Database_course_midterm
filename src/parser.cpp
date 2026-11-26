@@ -15,7 +15,7 @@ const std::set<std::string>& Reserved() {
         "desc",   "insert", "into",   "values",  "create", "table",   "index",  "drop",    "delete",
         "update", "set",    "explain", "analyze", "null",  "is",      "true",   "false",   "distinct",
         "primary", "key",   "unique", "between", "in",     "like",    "left",   "right",   "full",
-        "outer"};
+        "outer",  "case",   "when",    "then",   "else",    "end"};
     return kw;
 }
 
@@ -479,14 +479,14 @@ ExprPtr Parser::ParseNot() {
 }
 
 ExprPtr Parser::ParseComparison() {
-    ExprPtr l = ParseAdditive();
+    ExprPtr l = ParseConcat();
     struct {
         const char* sym;
         BinOp op;
     } ops[] = {{"=", BinOp::EQ}, {"!=", BinOp::NE}, {"<>", BinOp::NE}, {"<=", BinOp::LE},
                {">=", BinOp::GE}, {"<", BinOp::LT},  {">", BinOp::GT}};
     for (auto& o : ops) {
-        if (AcceptSym(o.sym)) return Expr::Binary(o.op, l, ParseAdditive());
+        if (AcceptSym(o.sym)) return Expr::Binary(o.op, l, ParseConcat());
     }
     if (AcceptKw("is")) {
         bool neg = AcceptKw("not");
@@ -495,9 +495,9 @@ ExprPtr Parser::ParseComparison() {
     }
     bool neg = AcceptKw("not");
     if (AcceptKw("between")) {  // x BETWEEN a AND b  ==>  x >= a AND x <= b
-        ExprPtr lo = ParseAdditive();
+        ExprPtr lo = ParseConcat();
         ExpectKw("and");
-        ExprPtr hi = ParseAdditive();
+        ExprPtr hi = ParseConcat();
         ExprPtr e = Expr::Binary(BinOp::AND, Expr::Binary(BinOp::GE, l, lo), Expr::Binary(BinOp::LE, l, hi));
         return neg ? Expr::Unary(UnaryOp::NOT, e) : e;
     }
@@ -520,11 +520,85 @@ ExprPtr Parser::ParseComparison() {
         return neg ? Expr::Unary(UnaryOp::NOT, terms[0]) : terms[0];
     }
     if (AcceptKw("like")) {
-        ExprPtr e = Expr::Binary(BinOp::LIKE, l, ParseAdditive());
+        ExprPtr e = Expr::Binary(BinOp::LIKE, l, ParseConcat());
         return neg ? Expr::Unary(UnaryOp::NOT, e) : e;
     }
     if (neg) Error("expected BETWEEN, IN or LIKE after NOT");
     return l;
+}
+
+ExprPtr Parser::ParseConcat() {
+    ExprPtr l = ParseAdditive();
+    while (AcceptSym("||")) l = Expr::Binary(BinOp::CONCAT, l, ParseAdditive());
+    return l;
+}
+
+// After CASE:  WHEN c THEN v [...] [ELSE e] END   (searched CASE), or
+//              x WHEN a THEN v [...] [ELSE e] END (simple CASE, becomes x = a).
+ExprPtr Parser::ParseCase() {
+    NestingGuard guard(this);
+    ExprPtr subject;
+    if (!CheckKw("when") && !CheckKw("end")) subject = ParseExpr();
+    std::vector<ExprPtr> args;
+    if (!CheckKw("when")) Error("expected WHEN");
+    while (AcceptKw("when")) {
+        ExprPtr cond = ParseExpr();
+        args.push_back(subject ? Expr::Binary(BinOp::EQ, subject, cond) : cond);
+        ExpectKw("then");
+        args.push_back(ParseExpr());
+    }
+    if (AcceptKw("else")) args.push_back(ParseExpr());
+    ExpectKw("end");
+    return Expr::Func("case", std::move(args));
+}
+
+ExprPtr Parser::ParseFunctionCall() {
+    NestingGuard guard(this);
+    std::string name = Advance().text;
+    ExpectSym("(");
+
+    static const std::pair<const char*, AggFunc> aggs[] = {{"count", AggFunc::COUNT},
+                                                           {"sum", AggFunc::SUM},
+                                                           {"avg", AggFunc::AVG},
+                                                           {"min", AggFunc::MIN},
+                                                           {"max", AggFunc::MAX}};
+    for (auto& [agg_name, f] : aggs) {
+        if (name != agg_name) continue;
+        if (f == AggFunc::COUNT && AcceptSym("*")) {
+            ExpectSym(")");
+            return Expr::Agg(f, nullptr, true);
+        }
+        bool distinct = AcceptKw("distinct");
+        ExprPtr arg = ParseExpr();
+        ExpectSym(")");
+        return Expr::Agg(f, arg, false, distinct);
+    }
+
+    // Scalar functions: name, minimum and maximum number of arguments.
+    struct Fn {
+        const char* name;
+        size_t min_args, max_args;
+    };
+    static const Fn fns[] = {{"abs", 1, 1},   {"round", 1, 2},     {"length", 1, 1}, {"upper", 1, 1},
+                             {"lower", 1, 1}, {"substr", 2, 3},    {"coalesce", 1, 64},
+                             {"nullif", 2, 2}};
+    for (const Fn& fn : fns) {
+        if (name != fn.name) continue;
+        std::vector<ExprPtr> args;
+        if (!CheckSym(")")) {
+            do {
+                args.push_back(ParseExpr());
+            } while (AcceptSym(","));
+        }
+        ExpectSym(")");
+        if (args.size() < fn.min_args || args.size() > fn.max_args)
+            throw DbError("function " + name + " takes " +
+                          (fn.min_args == fn.max_args ? std::to_string(fn.min_args)
+                                                      : std::to_string(fn.min_args) + " to " + std::to_string(fn.max_args)) +
+                          " argument(s), got " + std::to_string(args.size()));
+        return Expr::Func(name, std::move(args));
+    }
+    throw DbError("function " + name + "() does not exist");
 }
 
 ExprPtr Parser::ParseAdditive() {
@@ -606,27 +680,8 @@ ExprPtr Parser::ParsePrimary() {
             if (AcceptKw("null")) return Expr::Const(Value::Null());
             if (AcceptKw("true")) return Expr::Const(Value::Bool(true));
             if (AcceptKw("false")) return Expr::Const(Value::Bool(false));
-            if (Peek(1).type == TokenType::SYMBOL && Peek(1).text == "(") {
-                static const std::pair<const char*, AggFunc> aggs[] = {{"count", AggFunc::COUNT},
-                                                                       {"sum", AggFunc::SUM},
-                                                                       {"avg", AggFunc::AVG},
-                                                                       {"min", AggFunc::MIN},
-                                                                       {"max", AggFunc::MAX}};
-                for (auto& [name, f] : aggs) {
-                    if (t.text == name) {
-                        Advance();
-                        ExpectSym("(");
-                        if (f == AggFunc::COUNT && AcceptSym("*")) {
-                            ExpectSym(")");
-                            return Expr::Agg(f, nullptr, true);
-                        }
-                        ExprPtr arg = ParseExpr();
-                        ExpectSym(")");
-                        return Expr::Agg(f, arg, false);
-                    }
-                }
-                Error("unknown function");
-            }
+            if (AcceptKw("case")) return ParseCase();
+            if (!t.quoted && Peek(1).type == TokenType::SYMBOL && Peek(1).text == "(") return ParseFunctionCall();
             std::string first = ExpectIdent();
             if (AcceptSym(".")) return Expr::Col(first, ExpectIdent());
             return Expr::Col("", first);

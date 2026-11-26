@@ -1,5 +1,7 @@
 #include "expression.h"
 
+#include <algorithm>
+#include <cctype>
 #include <cmath>
 
 namespace minidb {
@@ -20,6 +22,7 @@ const char* BinOpSymbol(BinOp op) {
         case BinOp::DIV: return "/";
         case BinOp::MOD: return "%";
         case BinOp::LIKE: return "LIKE";
+        case BinOp::CONCAT: return "||";
     }
     return "?";
 }
@@ -39,7 +42,20 @@ std::string Expr::ToString() const {
         case ExprKind::AGG: {
             static const char* names[] = {"count", "sum", "avg", "min", "max"};
             std::string n = names[static_cast<int>(agg)];
-            return n + "(" + (agg_star ? std::string("*") : left->ToString()) + ")";
+            return n + "(" + (agg_star ? std::string("*") : (agg_distinct ? "DISTINCT " : "") + left->ToString()) + ")";
+        }
+        case ExprKind::FUNC: {
+            std::string s;
+            if (func == "case") {
+                s = "CASE";
+                size_t i = 0;
+                for (; i + 1 < args.size(); i += 2)
+                    s += " WHEN " + args[i]->ToString() + " THEN " + args[i + 1]->ToString();
+                if (i < args.size()) s += " ELSE " + args[i]->ToString();
+                return s + " END";
+            }
+            for (size_t i = 0; i < args.size(); ++i) s += (i ? ", " : "") + args[i]->ToString();
+            return func + "(" + s + ")";
         }
     }
     return "?";
@@ -60,13 +76,17 @@ ExprPtr BindExpr(const ExprPtr& e, const Schema& schema) {
         default:
             c->left = BindExpr(e->left, schema);
             c->right = BindExpr(e->right, schema);
+            for (auto& a : c->args) a = BindExpr(a, schema);
             return c;
     }
 }
 
 bool ContainsAggregate(const Expr& e) {
     if (e.kind == ExprKind::AGG) return true;
-    return (e.left && ContainsAggregate(*e.left)) || (e.right && ContainsAggregate(*e.right));
+    if ((e.left && ContainsAggregate(*e.left)) || (e.right && ContainsAggregate(*e.right))) return true;
+    for (const auto& a : e.args)
+        if (ContainsAggregate(*a)) return true;
+    return false;
 }
 
 std::vector<ExprPtr> SplitConjuncts(const ExprPtr& e) {
@@ -156,6 +176,91 @@ void CheckBool(const Value& v, const char* what) {
         throw DbError(std::string("argument of ") + what + " must be boolean, not " + TypeName(v.Type()));
 }
 
+const std::string& TextArg(const Value& v, const std::string& fn) {
+    if (v.Type() != TypeId::TEXT)
+        throw DbError("function " + fn + " requires a TEXT argument, not " + TypeName(v.Type()));
+    return v.AsText();
+}
+
+int64_t IntArg(const Value& v, const std::string& fn) {
+    if (v.Type() != TypeId::INT) throw DbError("function " + fn + " requires an INT argument, not " + TypeName(v.Type()));
+    return v.AsInt();
+}
+
+// Scalar functions and CASE. The parser has already checked the argument counts.
+Value EvaluateFunction(const Expr& e, const Row& row) {
+    const std::string& fn = e.func;
+    const auto& args = e.args;
+
+    // Functions that must not evaluate all their arguments up front.
+    if (fn == "case") {
+        size_t i = 0;
+        for (; i + 1 < args.size(); i += 2) {
+            Value c = Evaluate(*args[i], row);
+            CheckBool(c, "CASE WHEN");
+            if (!c.IsNull() && c.AsBool()) return Evaluate(*args[i + 1], row);
+        }
+        return i < args.size() ? Evaluate(*args[i], row) : Value::Null();
+    }
+    if (fn == "coalesce") {
+        for (const auto& a : args) {
+            Value v = Evaluate(*a, row);
+            if (!v.IsNull()) return v;
+        }
+        return Value::Null();
+    }
+
+    std::vector<Value> v;
+    for (const auto& a : args) v.push_back(Evaluate(*a, row));
+    if (fn == "nullif") {
+        if (!v[0].IsNull() && !v[1].IsNull() && v[0].Compare(v[1]) == 0) return Value::Null();
+        return v[0];
+    }
+    for (const auto& x : v)  // every remaining function is NULL on NULL input
+        if (x.IsNull()) return Value::Null();
+
+    if (fn == "abs") {
+        if (v[0].Type() == TypeId::INT) {
+            int64_t x = v[0].AsInt();
+            return Value::Int(x < 0 ? checked::Neg(x) : x);
+        }
+        if (v[0].Type() == TypeId::DOUBLE) return Value::Double(std::fabs(v[0].AsDouble()));
+        throw DbError("function abs requires a numeric argument, not " + std::string(TypeName(v[0].Type())));
+    }
+    if (fn == "round") {
+        int64_t digits = v.size() > 1 ? IntArg(v[1], fn) : 0;
+        if (digits < -15 || digits > 15) throw DbError("round: number of digits must be between -15 and 15");
+        if (v[0].Type() == TypeId::INT && digits >= 0) return v[0];
+        if (!v[0].IsNumeric()) throw DbError("function round requires a numeric argument");
+        double scale = std::pow(10.0, static_cast<double>(digits));
+        double r = std::round(v[0].AsDouble() * scale) / scale;
+        if (!std::isfinite(r)) throw DbError("value out of range: overflow");
+        return v[0].Type() == TypeId::INT ? Value::Int(checked::FromDouble(r)) : Value::Double(r);
+    }
+    if (fn == "length") return Value::Int(static_cast<int64_t>(TextArg(v[0], fn).size()));
+    if (fn == "upper" || fn == "lower") {
+        std::string s = TextArg(v[0], fn);
+        for (char& ch : s)
+            ch = static_cast<char>(fn == "upper" ? std::toupper(static_cast<unsigned char>(ch))
+                                                 : std::tolower(static_cast<unsigned char>(ch)));
+        return Value::Text(std::move(s));
+    }
+    if (fn == "substr") {  // 1-based like SQL; start may lie before the string
+        const std::string& s = TextArg(v[0], fn);
+        int64_t start = IntArg(v[1], fn);
+        int64_t end = static_cast<int64_t>(s.size()) + 1;  // exclusive, 1-based
+        if (v.size() > 2) {
+            int64_t len = IntArg(v[2], fn);
+            if (len < 0) throw DbError("negative substring length not allowed");
+            end = std::min(end, start > INT64_MAX - len ? INT64_MAX : start + len);
+        }
+        start = std::max<int64_t>(start, 1);
+        if (start >= end) return Value::Text("");
+        return Value::Text(s.substr(static_cast<size_t>(start - 1), static_cast<size_t>(end - start)));
+    }
+    throw DbError("internal: unknown function " + fn);
+}
+
 }  // namespace
 
 Value Evaluate(const Expr& e, const Row& row) {
@@ -178,6 +283,7 @@ Value Evaluate(const Expr& e, const Row& row) {
         }
         case ExprKind::IS_NULL: return Value::Bool(Evaluate(*e.left, row).IsNull() != e.negated);
         case ExprKind::AGG: throw DbError("internal: aggregate evaluated as scalar");
+        case ExprKind::FUNC: return EvaluateFunction(e, row);
         case ExprKind::BINARY: break;
     }
 
@@ -218,6 +324,9 @@ Value Evaluate(const Expr& e, const Row& row) {
         case BinOp::LIKE:
             if (l.IsNull() || r.IsNull()) return Value::Null();
             return Value::Bool(LikeMatch(l.AsText(), r.AsText()));
+        case BinOp::CONCAT:  // like PostgreSQL: NULL if either side is NULL; other types print as text
+            if (l.IsNull() || r.IsNull()) return Value::Null();
+            return Value::Text(l.ToString() + r.ToString());
         default: return Arithmetic(e.op, l, r);
     }
 }

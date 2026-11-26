@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <climits>
+#include <unordered_set>
 
 namespace minidb {
 
@@ -301,6 +302,7 @@ struct AggState {
     int64_t count = 0;
     Value acc;  // SUM / MIN / MAX
     double dsum = 0;
+    std::unordered_set<std::string> seen;  // DISTINCT aggregates: values already counted
 };
 }  // namespace
 
@@ -336,6 +338,11 @@ void AggregateExecutor::InitImpl() {
             }
             Value v = Evaluate(*a.arg, r);
             if (v.IsNull()) continue;
+            if (a.distinct) {
+                std::string vk;
+                v.AppendKey(&vk);  // 1 and 1.0 are the same value, as in comparisons
+                if (!s.seen.insert(std::move(vk)).second) continue;
+            }
             ++s.count;
             switch (a.func) {
                 case AggFunc::COUNT: break;

@@ -23,8 +23,10 @@ SQL (end every statement with ';'):
          GROUP BY ... HAVING ... ORDER BY ... [DESC] LIMIT n OFFSET m;
   UPDATE t SET col = expr WHERE ...;           DELETE FROM t WHERE ...;
   EXPLAIN [ANALYZE] SELECT ...;
-  Operators: = <> < <= > >= AND OR NOT + - * / % LIKE BETWEEN IN IS [NOT] NULL
-  Aggregates: COUNT(*) COUNT(x) SUM AVG MIN MAX
+  Operators: = <> < <= > >= AND OR NOT + - * / % || LIKE BETWEEN IN IS [NOT] NULL
+  CASE [x] WHEN ... THEN ... [ELSE ...] END
+  Functions: ABS ROUND LENGTH UPPER LOWER SUBSTR COALESCE NULLIF
+  Aggregates: COUNT(*) COUNT(x) SUM AVG MIN MAX, each also with DISTINCT: COUNT(DISTINCT x)
 
 Meta commands:
   .tables               list tables          .schema <table>    show columns and indexes

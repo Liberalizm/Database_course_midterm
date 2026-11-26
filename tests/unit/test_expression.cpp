@@ -1,4 +1,6 @@
 // Unit tests: expression binding and evaluation (built directly from AST nodes, no parser).
+#include <optional>
+
 #include "expression.h"
 #include "test_util.h"
 
@@ -66,6 +68,90 @@ TEST(Expression, DoubleOverflowIsAnError) {
     EXPECT_THROW(Eval(Bin(BinOp::MUL, C(D(1e300)), C(D(1e300)))), DbError);
     EXPECT_THROW(Eval(Bin(BinOp::SUB, C(D(-1e308)), C(D(1e308)))), DbError);
     EXPECT_DOUBLE_EQ(Eval(Bin(BinOp::MUL, C(D(1e150)), C(D(1e150)))).AsDouble(), 1e300);
+}
+
+// ---- scalar functions, CASE, || ----
+
+ExprPtr F(const std::string& name, std::vector<ExprPtr> args) { return Expr::Func(name, std::move(args)); }
+
+TEST(Expression, StringFunctions) {
+    EXPECT_EQ(Eval(F("upper", {C(T("aBc"))})).AsText(), "ABC");
+    EXPECT_EQ(Eval(F("lower", {C(T("aBc"))})).AsText(), "abc");
+    EXPECT_EQ(Eval(F("length", {C(T("hello"))})).AsInt(), 5);
+    EXPECT_EQ(Eval(F("length", {C(T(""))})).AsInt(), 0);
+    EXPECT_THROW(Eval(F("upper", {C(I(1))})), DbError);
+}
+
+TEST(Expression, SubstrFollowsSqlSemantics) {
+    auto sub = [](const std::string& s, int64_t start, std::optional<int64_t> len = std::nullopt) {
+        std::vector<ExprPtr> args = {C(T(s)), C(I(start))};
+        if (len) args.push_back(C(I(*len)));
+        return Eval(F("substr", args)).AsText();
+    };
+    EXPECT_EQ(sub("hello", 2), "ello");
+    EXPECT_EQ(sub("hello", 2, 3), "ell");
+    EXPECT_EQ(sub("hello", 0, 2), "h") << "positions before the string count towards the length";
+    EXPECT_EQ(sub("hello", -5, 3), "");
+    EXPECT_EQ(sub("hello", 4, 100), "lo");
+    EXPECT_EQ(sub("hello", 9), "");
+    EXPECT_EQ(sub("hello", 1, INT64_MAX), "hello") << "no overflow on start + len";
+    EXPECT_THROW(sub("hello", 1, -1), DbError);
+}
+
+TEST(Expression, NumericFunctions) {
+    EXPECT_EQ(Eval(F("abs", {C(I(-7))})).AsInt(), 7);
+    EXPECT_DOUBLE_EQ(Eval(F("abs", {C(D(-2.5))})).AsDouble(), 2.5);
+    EXPECT_THROW(Eval(F("abs", {C(I(INT64_MIN))})), DbError) << "|INT64_MIN| does not fit";
+    EXPECT_DOUBLE_EQ(Eval(F("round", {C(D(2.5))})).AsDouble(), 3.0) << "half away from zero";
+    EXPECT_DOUBLE_EQ(Eval(F("round", {C(D(-2.5))})).AsDouble(), -3.0);
+    EXPECT_DOUBLE_EQ(Eval(F("round", {C(D(3.14159)), C(I(2))})).AsDouble(), 3.14);
+    EXPECT_EQ(Eval(F("round", {C(I(1234)), C(I(-2))})).AsInt(), 1200) << "INT stays INT";
+    EXPECT_EQ(Eval(F("round", {C(I(17))})).Type(), TypeId::INT);
+    EXPECT_THROW(Eval(F("round", {C(D(1.0)), C(I(99))})), DbError);
+}
+
+TEST(Expression, FunctionsPropagateNull) {
+    for (const char* fn : {"upper", "lower", "length", "abs", "round"}) EXPECT_TRUE(Eval(F(fn, {C(N())})).IsNull()) << fn;
+    EXPECT_TRUE(Eval(F("substr", {C(T("abc")), C(N())})).IsNull());
+}
+
+TEST(Expression, CoalesceAndNullif) {
+    EXPECT_EQ(Eval(F("coalesce", {C(N()), C(N()), C(I(3)), C(I(4))})).AsInt(), 3);
+    EXPECT_TRUE(Eval(F("coalesce", {C(N())})).IsNull());
+    EXPECT_EQ(Eval(F("coalesce", {C(I(1)), Bin(BinOp::DIV, C(I(1)), C(I(0)))})).AsInt(), 1)
+        << "later arguments are not evaluated once a value is found";
+    EXPECT_TRUE(Eval(F("nullif", {C(I(5)), C(D(5.0))})).IsNull());
+    EXPECT_EQ(Eval(F("nullif", {C(I(5)), C(I(6))})).AsInt(), 5);
+    EXPECT_EQ(Eval(F("nullif", {C(I(5)), C(N())})).AsInt(), 5);
+}
+
+TEST(Expression, CaseIsLazyAndUsesThreeValuedLogic) {
+    auto when = [](ExprPtr cond, ExprPtr then) { return std::vector<ExprPtr>{cond, then}; };
+    auto args = when(C(B(false)), C(T("a")));
+    auto more = when(C(N()), C(T("b")));  // unknown is not true
+    args.insert(args.end(), more.begin(), more.end());
+    args.push_back(C(T("else")));
+    EXPECT_EQ(Eval(F("case", args)).AsText(), "else");
+    EXPECT_TRUE(Eval(F("case", when(C(B(false)), C(I(1))))).IsNull()) << "no ELSE -> NULL";
+    EXPECT_EQ(Eval(F("case", {C(B(true)), C(I(1)), Bin(BinOp::DIV, C(I(1)), C(I(0)))})).AsInt(), 1)
+        << "branches not taken are not evaluated";
+    EXPECT_THROW(Eval(F("case", when(C(I(1)), C(I(2))))), DbError) << "WHEN must be boolean";
+}
+
+TEST(Expression, ConcatOperator) {
+    EXPECT_EQ(Eval(Bin(BinOp::CONCAT, C(T("ab")), C(T("cd")))).AsText(), "abcd");
+    EXPECT_EQ(Eval(Bin(BinOp::CONCAT, C(T("n=")), C(I(5)))).AsText(), "n=5") << "non-text operands print as text";
+    EXPECT_TRUE(Eval(Bin(BinOp::CONCAT, C(T("a")), C(N()))).IsNull());
+}
+
+TEST(Expression, FunctionArgumentsAreBoundAndCountTowardsHeight) {
+    Schema s({Col("x", TypeId::INT)});
+    auto e = F("abs", {Bin(BinOp::SUB, Expr::Col("", "x"), C(I(10)))});
+    EXPECT_EQ(e->height, 3);
+    EXPECT_EQ(Evaluate(*BindExpr(e, s), {I(4)}).AsInt(), 6);
+    EXPECT_THROW(BindExpr(F("abs", {Expr::Col("", "nope")}), s), DbError);
+    EXPECT_TRUE(ContainsAggregate(*F("coalesce", {Expr::Agg(AggFunc::MAX, Expr::Col("", "x"), false)})));
+    EXPECT_EQ(F("case", {C(B(true)), C(I(1)), C(I(2))})->ToString(), "CASE WHEN true THEN 1 ELSE 2 END");
 }
 
 TEST(Expression, FilterResultMustBeBoolean) {

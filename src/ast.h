@@ -10,8 +10,8 @@
 
 namespace minidb {
 
-enum class ExprKind { CONST, COLUMN, BINARY, UNARY, IS_NULL, AGG };
-enum class BinOp { EQ, NE, LT, LE, GT, GE, AND, OR, ADD, SUB, MUL, DIV, MOD, LIKE };
+enum class ExprKind { CONST, COLUMN, BINARY, UNARY, IS_NULL, AGG, FUNC };
+enum class BinOp { EQ, NE, LT, LE, GT, GE, AND, OR, ADD, SUB, MUL, DIV, MOD, LIKE, CONCAT };
 enum class UnaryOp { NOT, NEG };
 enum class AggFunc { COUNT, SUM, AVG, MIN, MAX };
 
@@ -34,6 +34,11 @@ struct Expr {
     bool negated = false;        // IS_NULL: true means IS NOT NULL
     AggFunc agg = AggFunc::COUNT;
     bool agg_star = false;       // COUNT(*)
+    bool agg_distinct = false;   // COUNT(DISTINCT x): each distinct value counted once
+    // FUNC: scalar function call `func(args...)`. CASE is func "case" with args
+    // [cond1, val1, cond2, val2, ...] plus a trailing ELSE value if args.size() is odd.
+    std::string func;
+    std::vector<ExprPtr> args;
     ExprPtr left, right;         // children (UNARY / IS_NULL / AGG use `left`)
     int height = 1;              // 1 for leaves, 1 + tallest child otherwise
 
@@ -44,6 +49,8 @@ struct Expr {
         int h = 0;
         if (left) h = left->height;
         if (right && right->height > h) h = right->height;
+        for (const auto& a : args)
+            if (a->height > h) h = a->height;
         height = h + 1;
         if (height > kMaxExprHeight)
             throw DbError("expression is too deeply nested (more than " + std::to_string(kMaxExprHeight) + " levels)");
@@ -87,12 +94,21 @@ struct Expr {
         e->FixHeight();
         return e;
     }
-    static ExprPtr Agg(AggFunc f, ExprPtr arg, bool star) {
+    static ExprPtr Agg(AggFunc f, ExprPtr arg, bool star, bool distinct = false) {
         auto e = std::make_shared<Expr>();
         e->kind = ExprKind::AGG;
         e->agg = f;
         e->agg_star = star;
+        e->agg_distinct = distinct;
         e->left = std::move(arg);
+        e->FixHeight();
+        return e;
+    }
+    static ExprPtr Func(std::string name, std::vector<ExprPtr> args) {
+        auto e = std::make_shared<Expr>();
+        e->kind = ExprKind::FUNC;
+        e->func = std::move(name);
+        e->args = std::move(args);
         e->FixHeight();
         return e;
     }

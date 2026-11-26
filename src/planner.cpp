@@ -122,6 +122,7 @@ ExprPtr Planner::Canonicalize(const ExprPtr& e, const std::vector<Source>& srcs)
     }
     c->left = Canonicalize(e->left, srcs);
     c->right = Canonicalize(e->right, srcs);
+    for (auto& a : c->args) a = Canonicalize(a, srcs);
     return c;
 }
 
@@ -132,6 +133,7 @@ void Planner::ReferencedTables(const Expr& e, const std::vector<Source>& srcs, s
     }
     if (e.left) ReferencedTables(*e.left, srcs, out);
     if (e.right) ReferencedTables(*e.right, srcs, out);
+    for (const auto& a : e.args) ReferencedTables(*a, srcs, out);
 }
 
 std::unique_ptr<ScanExecutor> Planner::BuildAccessPath(const Source& src, const std::vector<ExprPtr>& conjuncts) {
@@ -509,12 +511,13 @@ ExecPtr Planner::PlanSelect(const SelectStmt& stmt) {
             if (!agg_index.count(k)) {
                 if (e->left && ContainsAggregate(*e->left)) throw DbError("aggregate calls cannot be nested");
                 agg_index[k] = static_cast<int>(aggs.size());
-                aggs.push_back({e->agg, e->agg_star ? nullptr : BindExpr(e->left, root->OutSchema()), k});
+                aggs.push_back({e->agg, e->agg_star ? nullptr : BindExpr(e->left, root->OutSchema()), k, e->agg_distinct});
             }
             return;
         }
         collect(e->left);
         collect(e->right);
+        for (const auto& a : e->args) collect(a);
     };
     std::function<ExprPtr(const ExprPtr&)> rewrite = [&](const ExprPtr& e) -> ExprPtr {
         if (!e) return nullptr;
@@ -528,6 +531,7 @@ ExecPtr Planner::PlanSelect(const SelectStmt& stmt) {
         auto c = std::make_shared<Expr>(*e);
         c->left = rewrite(e->left);
         c->right = rewrite(e->right);
+        for (auto& a : c->args) a = rewrite(a);
         return c;
     };
 

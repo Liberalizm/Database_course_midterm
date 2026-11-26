@@ -285,6 +285,33 @@ TEST_F(SqlTest, LeftJoin) {
               "INSERT 5");
 }
 
+TEST_F(SqlTest, FunctionsCaseConcatAndDistinctAggregates) {
+    SeedCompany();
+    auto r = Q("SELECT UPPER(name) || ' (' || COALESCE(dept_id, 0) || ')' FROM emp ORDER BY id");
+    ASSERT_EQ(r.size(), 5u);
+    EXPECT_EQ(r[0][0].AsText(), "ANN (1)");
+    EXPECT_EQ(r[4][0].AsText(), "EVE (0)");
+    auto bands = Q("SELECT CASE WHEN salary >= 80 THEN 'high' WHEN salary >= 60 THEN 'mid' ELSE 'low' END AS band, "
+                   "COUNT(*) FROM emp GROUP BY CASE WHEN salary >= 80 THEN 'high' WHEN salary >= 60 THEN 'mid' "
+                   "ELSE 'low' END ORDER BY band");
+    ASSERT_EQ(bands.size(), 3u);
+    EXPECT_EQ(bands[0][0].AsText(), "high");
+    EXPECT_EQ(bands[0][1].AsInt(), 2);
+    EXPECT_EQ(bands[1][0].AsText(), "low");
+    EXPECT_EQ(bands[2][1].AsInt(), 2);
+    EXPECT_EQ(Scalar("SELECT COUNT(DISTINCT dept_id) FROM emp"), 2);
+    EXPECT_EQ(Scalar("SELECT COUNT(*) FROM emp WHERE LENGTH(name) = 3 AND LOWER(SUBSTR(name, 1, 1)) = 'a'"), 1);
+    EXPECT_EQ(Scalar("SELECT SUM(CASE WHEN dept_id IS NULL THEN 1 ELSE 0 END) FROM emp"), 1);
+    // Functions in DML and in joins.
+    EXPECT_EQ(Msg("UPDATE emp SET name = UPPER(SUBSTR(name, 1, 1)) || SUBSTR(name, 2) WHERE dept_id = 1"), "UPDATE 2");
+    EXPECT_EQ(Q("SELECT name FROM emp WHERE id = 1")[0][0].AsText(), "Ann");
+    EXPECT_EQ(Scalar("SELECT COUNT(*) FROM emp e LEFT JOIN dept d ON e.dept_id = d.id WHERE COALESCE(d.name, '-') = '-'"),
+              1);
+    EXPECT_THROW(db->Execute("SELECT NOSUCHFN(id) FROM emp"), DbError);
+    EXPECT_THROW(db->Execute("SELECT name FROM emp GROUP BY UPPER(name)"), DbError)
+        << "name itself is not grouped, only UPPER(name)";
+}
+
 TEST_F(SqlTest, QuotedIdentifiersAreNeverKeywords) {
     db->Execute("CREATE TABLE \"select\" (\"left\" INT, \"right\" TEXT, \"null\" INT)");
     db->Execute("INSERT INTO \"select\" (\"left\", \"right\", \"null\") VALUES (1, 'r', 7)");

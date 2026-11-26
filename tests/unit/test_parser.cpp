@@ -122,6 +122,39 @@ TEST(Parser, JoinKeywordsAreNotTableAliases) {
     EXPECT_EQ(ParseExpr("\"left\"")->column, "left") << "quoted, the word is still a valid name";
 }
 
+TEST(Parser, ScalarFunctionsCaseAndConcat) {
+    EXPECT_EQ(ParseExpr("UPPER(name)")->ToString(), "upper(name)");
+    EXPECT_EQ(ParseExpr("COALESCE(a, b, 0)")->args.size(), 3u);
+    EXPECT_EQ(ParseExpr("'x' || 1 + 2")->ToString(), "'x' || (1 + 2)") << "|| binds looser than +";
+    EXPECT_EQ(ParseExpr("a || b = 'ab'")->ToString(), "(a || b) = 'ab'") << "and tighter than =";
+    EXPECT_EQ(ParseExpr("CASE WHEN x > 1 THEN 'big' ELSE 'small' END")->ToString(),
+              "CASE WHEN x > 1 THEN 'big' ELSE 'small' END");
+    EXPECT_EQ(ParseExpr("CASE x WHEN 1 THEN 'one' WHEN 2 THEN 'two' END")->ToString(),
+              "CASE WHEN x = 1 THEN 'one' WHEN x = 2 THEN 'two' END")
+        << "simple CASE becomes a searched CASE";
+    EXPECT_THROW(ParseExpr("CASE END"), DbError);
+    EXPECT_THROW(ParseExpr("CASE WHEN x THEN 1"), DbError) << "missing END";
+}
+
+TEST(Parser, FunctionArityAndUnknownFunctions) {
+    EXPECT_THROW(ParseExpr("ABS()"), DbError);
+    EXPECT_THROW(ParseExpr("ABS(1, 2)"), DbError);
+    EXPECT_THROW(ParseExpr("SUBSTR('a')"), DbError);
+    EXPECT_NO_THROW(ParseExpr("SUBSTR('a', 1)"));
+    EXPECT_NO_THROW(ParseExpr("ROUND(1.5, 1)"));
+    EXPECT_THROW(ParseExpr("FROBNICATE(1)"), DbError);
+}
+
+TEST(Parser, DistinctAggregates) {
+    auto e = ParseExpr("COUNT(DISTINCT x)");
+    ASSERT_EQ(e->kind, ExprKind::AGG);
+    EXPECT_TRUE(e->agg_distinct);
+    EXPECT_EQ(e->ToString(), "count(DISTINCT x)");
+    EXPECT_FALSE(ParseExpr("COUNT(x)")->agg_distinct);
+    EXPECT_TRUE(ParseExpr("SUM(DISTINCT x)")->agg_distinct);
+    EXPECT_THROW(ParseExpr("COUNT(DISTINCT *)"), DbError);
+}
+
 TEST(Parser, OperatorPrecedence) {
     EXPECT_EQ(ParseExpr("1 + 2 * 3")->ToString(), "1 + (2 * 3)");
     EXPECT_EQ(ParseExpr("(1 + 2) * 3")->ToString(), "(1 + 2) * 3");

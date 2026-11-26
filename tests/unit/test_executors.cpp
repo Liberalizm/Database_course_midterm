@@ -263,6 +263,28 @@ TEST(Executors, AggregateIntegerSumOverflowIsAnError) {
     EXPECT_DOUBLE_EQ(Drain(avg)[0][0].AsDouble(), static_cast<double>(INT64_MAX)) << "AVG sums in double";
 }
 
+TEST(Executors, DistinctAggregatesIgnoreDuplicatesPerGroup) {
+    Schema s({Col("g", TypeId::INT), Col("x", TypeId::NULL_T)});
+    ExprPtr g = ColRef(s, "", "g"), x = ColRef(s, "", "x");
+    std::vector<Row> rows = {{I(1), I(5)}, {I(1), I(5)}, {I(1), D(5.0)}, {I(1), I(7)}, {I(1), N()},
+                             {I(2), I(5)}, {I(2), I(5)}};
+    AggSpec cd{AggFunc::COUNT, x, "cd", true};
+    AggSpec sd{AggFunc::SUM, x, "sd", true};
+    AggSpec c{AggFunc::COUNT, x, "c", false};
+    AggSpec ad{AggFunc::AVG, x, "ad", true};
+    AggregateExecutor agg(Vec(s, rows), {g}, {"g"}, {cd, sd, c, ad});
+    auto out = Drain(agg);
+    ASSERT_EQ(out.size(), 2u);
+    const Row& g1 = out[0][0].AsInt() == 1 ? out[0] : out[1];
+    const Row& g2 = out[0][0].AsInt() == 1 ? out[1] : out[0];
+    EXPECT_EQ(g1[1].AsInt(), 2) << "5, 5.0 and 5 are one value; NULL is ignored";
+    EXPECT_EQ(g1[2].AsInt(), 12);
+    EXPECT_EQ(g1[3].AsInt(), 4);
+    EXPECT_DOUBLE_EQ(g1[4].AsDouble(), 6.0);
+    EXPECT_EQ(g2[1].AsInt(), 1) << "the seen-set is per group";
+    EXPECT_EQ(g2[2].AsInt(), 5);
+}
+
 TEST(Executors, SortMultiKeyNullsLastAndStable) {
     Schema s({Col("a", TypeId::INT), Col("b", TypeId::INT), Col("tag", TypeId::TEXT)});
     std::vector<Row> rows = {{I(2), I(1), T("p")}, {N(), I(0), T("q")}, {I(1), I(5), T("r")},

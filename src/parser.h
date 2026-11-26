@@ -39,7 +39,10 @@ private:
     ExprPtr ParseAnd();
     ExprPtr ParseNot();
     ExprPtr ParseComparison();
+    ExprPtr ParseConcat();  // a || b  (binds looser than + and -, tighter than comparisons)
     ExprPtr ParseAdditive();
+    ExprPtr ParseCase();
+    ExprPtr ParseFunctionCall();
     ExprPtr ParseMultiplicative();
     ExprPtr ParseUnary();
     ExprPtr ParsePrimary();
