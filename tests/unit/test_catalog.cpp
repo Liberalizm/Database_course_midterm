@@ -56,7 +56,7 @@ TEST_F(CatalogTest, IndexIsBuiltFromExistingRows) {
     TableInfo* t = cat->CreateTable("t", {Col("k", TypeId::INT), Col("s", TypeId::TEXT)});
     for (int i = 0; i < 300; ++i) AddRow(t, {i % 10 == 0 ? N() : I(i), T("x")});
     IndexInfo* idx = cat->CreateIndex("t_k", "t", "k", false);
-    EXPECT_EQ(idx->col_idx, 0);
+    EXPECT_EQ(idx->col_idxs, std::vector<int>{0});
     EXPECT_EQ(idx->tree->CheckAndCount(), 270u) << "NULL keys are not indexed";
     ASSERT_EQ(cat->IndexesOf("t").size(), 1u);
 }
@@ -323,8 +323,8 @@ TEST_F(CatalogTest, TextIndexKindIsRestoredAfterRestart) {
     cat->CreateIndex("u_name", "u", "name", true);
     cat->CreateIndex("u_id", "u", "id", false);
     Reopen();
-    for (IndexInfo* idx : cat->IndexesOf("u")) EXPECT_EQ(idx->hashed, idx->column == "name") << idx->name;
-    IndexInfo* by_name = cat->IndexesOf("u")[0]->column == "name" ? cat->IndexesOf("u")[0] : cat->IndexesOf("u")[1];
+    for (IndexInfo* idx : cat->IndexesOf("u")) EXPECT_EQ(idx->hashed, idx->columns[0] == "name") << idx->name;
+    IndexInfo* by_name = cat->IndexesOf("u")[0]->columns[0] == "name" ? cat->IndexesOf("u")[0] : cat->IndexesOf("u")[1];
     EXPECT_TRUE(cat->KeyTaken(by_name, T("ann")));
 }
 
@@ -353,7 +353,7 @@ TEST_F(CatalogTest, RenameTableAndColumnCarryIndexesAlong) {
     AddRow(t, {I(1), I(10)});
     cat->CreateIndex("t_v", "t", "v", false);
     cat->RenameColumn("t", "v", "w");
-    EXPECT_EQ(cat->IndexesOf("t")[0]->column, "w");
+    EXPECT_EQ(cat->IndexesOf("t")[0]->columns, std::vector<std::string>{"w"});
     EXPECT_THROW(cat->RenameColumn("t", "w", "id"), DbError) << "name taken";
     EXPECT_THROW(cat->RenameColumn("t", "nope", "x"), DbError);
     cat->CreateTable("other", {Col("a", TypeId::INT)});
@@ -367,7 +367,7 @@ TEST_F(CatalogTest, RenameTableAndColumnCarryIndexesAlong) {
     Reopen();
     EXPECT_EQ(cat->RequireTable("u")->schema.At(1).name, "w");
     ASSERT_EQ(cat->IndexesOf("u").size(), 1u);
-    EXPECT_EQ(cat->IndexesOf("u")[0]->col_idx, 1);
+    EXPECT_EQ(cat->IndexesOf("u")[0]->col_idxs, std::vector<int>{1});
 }
 
 TEST_F(CatalogTest, RewriteTableConvertsRowsRebuildsIndexesAndFreesPages) {
@@ -385,7 +385,7 @@ TEST_F(CatalogTest, RewriteTableConvertsRowsRebuildsIndexesAndFreesPages) {
     EXPECT_EQ(ScanCount(t), 2000u);
     ASSERT_EQ(cat->IndexesOf("t").size(), 1u) << "the index on the dropped column is gone";
     IndexInfo* v = cat->IndexesOf("t")[0];
-    EXPECT_EQ(v->col_idx, 1) << "rebuilt against the new column positions";
+    EXPECT_EQ(v->col_idxs, std::vector<int>{1}) << "rebuilt against the new column positions";
     EXPECT_EQ(v->tree->CheckAndCount(), 2000u);
     EXPECT_TRUE(cat->KeyTaken(v, I(3998)));
     EXPECT_FALSE(bpm->FreePages().empty()) << "old heap pages were freed";
@@ -451,6 +451,156 @@ TEST_F(CatalogTest, CatalogWithoutDefaultsSectionStillLoads) {
     cat = std::make_unique<Catalog>(bpm.get());
     EXPECT_NE(cat->GetTable("t"), nullptr);
     EXPECT_FALSE(cat->RequireTable("t")->schema.At(0).default_value);
+}
+
+// ---- multi-column indexes ----
+
+using Cols = std::vector<std::string>;
+
+TEST_F(CatalogTest, MultiColumnIndexIsBuiltFromExistingRows) {
+    TableInfo* t = cat->CreateTable("t", {Col("a", TypeId::INT), Col("b", TypeId::TEXT), Col("c", TypeId::INT)});
+    for (int i = 0; i < 400; ++i) AddRow(t, {i % 50 == 0 ? N() : I(i % 20), i % 7 == 0 ? N() : T("s" + std::to_string(i)), I(i)});
+    IndexInfo* idx = cat->CreateIndex("t_ab", "t", Cols{"a", "b"}, true);
+    EXPECT_EQ(idx->columns, (Cols{"a", "b"}));
+    EXPECT_EQ(idx->col_idxs, (std::vector<int>{0, 1}));
+    EXPECT_TRUE(idx->Composite());
+    EXPECT_TRUE(idx->tree->Wide());
+    EXPECT_FALSE(idx->hashed);
+    EXPECT_TRUE(idx->Key2Hashed()) << "TEXT second column";
+    EXPECT_EQ(idx->tree->CheckAndCount(), 392u) << "rows with a NULL leading column are not indexed, others are";
+
+    EXPECT_TRUE(cat->KeyTaken(idx, Row{I(1), T("s1")}));
+    EXPECT_FALSE(cat->KeyTaken(idx, Row{I(2), T("s1")})) << "both columns must match";
+    EXPECT_FALSE(cat->KeyTaken(idx, Row{I(1), T("s2")}));
+    EXPECT_FALSE(cat->KeyTaken(idx, Row{I(1), N()})) << "a key with a NULL is never taken";
+    EXPECT_FALSE(cat->KeyTaken(idx, Row{I(1), T("s1")}, [](RID) { return true; }));
+}
+
+TEST_F(CatalogTest, MultiColumnUniqueIndexRejectsDuplicatePairsOnly) {
+    TableInfo* t = cat->CreateTable("t", {Col("a", TypeId::INT), Col("b", TypeId::INT)});
+    AddRow(t, {I(1), I(1)});
+    AddRow(t, {I(1), I(2)});  // same a, other b: fine
+    AddRow(t, {I(2), I(1)});
+    AddRow(t, {I(3), N()});
+    AddRow(t, {I(3), N()});  // NULLs are distinct: fine
+    EXPECT_NO_THROW(cat->CreateIndex("t_ab", "t", Cols{"a", "b"}, true));
+    AddRow(t, {I(2), I(1)});
+    try {
+        cat->CreateIndex("t_ab2", "t", Cols{"a", "b"}, true);
+        FAIL() << "duplicate (2, 1) must be rejected";
+    } catch (const DbError& e) {
+        EXPECT_NE(std::string(e.what()).find("duplicate key (a, b)=(2, 1)"), std::string::npos) << e.what();
+    }
+    EXPECT_EQ(cat->IndexesOf("t").size(), 1u) << "the failed index is not registered";
+}
+
+TEST_F(CatalogTest, MultiColumnIndexRejectsBadColumnLists) {
+    cat->CreateTable("t", {Col("a", TypeId::INT), Col("b", TypeId::TEXT), Col("d", TypeId::DOUBLE)});
+    EXPECT_THROW(cat->CreateIndex("i1", "t", Cols{"a", "a"}, false), DbError) << "repeated column";
+    EXPECT_THROW(cat->CreateIndex("i2", "t", Cols{"a", "d"}, false), DbError) << "DOUBLE not indexable";
+    EXPECT_THROW(cat->CreateIndex("i3", "t", Cols{"a", "zz"}, false), DbError);
+    EXPECT_THROW(cat->CreateIndex("i4", "t", Cols{}, false), DbError);
+    EXPECT_THROW(cat->CreateIndex("i5", "t", Cols(IndexInfo::kMaxColumns + 1, "a"), false), DbError);
+    EXPECT_TRUE(cat->IndexesOf("t").empty());
+    EXPECT_NO_THROW(cat->CreateIndex("i6", "t", Cols{"b", "a"}, false)) << "any column order";
+}
+
+TEST_F(CatalogTest, MultiColumnKeyCollisionIsNotADuplicate) {
+    // Three columns: key2 is a hash of (b, c), so equal tree keys must be confirmed
+    // against the row. Fake an entry with the key of (1, 'x', 5) that points at
+    // the row holding (1, 'y', 5).
+    TableInfo* t = cat->CreateTable("t", {Col("a", TypeId::INT), Col("b", TypeId::TEXT), Col("c", TypeId::INT)});
+    AddRow(t, {I(1), T("y"), I(5)});
+    IndexInfo* idx = cat->CreateIndex("t_abc", "t", Cols{"a", "b", "c"}, true);
+    RID rid;
+    {
+        auto it = t->heap->Begin();
+        std::string buf;
+        ASSERT_TRUE(it.Next(&rid, &buf));
+    }
+    idx->tree->Insert(idx->EntryFor(Row{I(1), T("x"), I(5)}, rid));
+    EXPECT_FALSE(cat->KeyTaken(idx, Row{I(1), T("x"), I(5)})) << "same tree key, different values";
+    EXPECT_TRUE(cat->KeyTaken(idx, Row{I(1), T("y"), I(5)}));
+    EXPECT_FALSE(cat->KeyTaken(idx, Row{I(1), T("y"), I(6)}));
+}
+
+TEST_F(CatalogTest, NullSecondColumnDoesNotLookLikeAValue) {
+    // An INT second column keeps its value as key2, and NULL is stored as
+    // kNullKey2 (INT64_MIN). A real INT64_MIN must still not count as taken.
+    TableInfo* t = cat->CreateTable("t", {Col("a", TypeId::INT), Col("b", TypeId::INT)});
+    AddRow(t, {I(1), N()});
+    IndexInfo* idx = cat->CreateIndex("t_ab", "t", Cols{"a", "b"}, true);
+    EXPECT_TRUE(idx->OrderedKey2());
+    EXPECT_EQ(idx->tree->CheckAndCount(), 1u);
+    EXPECT_FALSE(cat->KeyTaken(idx, Row{I(1), I(INT64_MIN)}));
+}
+
+TEST_F(CatalogTest, MultiColumnIndexSurvivesRestart) {
+    TableInfo* t = cat->CreateTable("t", {Col("a", TypeId::INT), Col("b", TypeId::TEXT), Col("c", TypeId::INT)});
+    for (int i = 0; i < 1000; ++i) AddRow(t, {I(i / 10), T("b" + std::to_string(i % 10)), I(i)});
+    cat->CreateIndex("t_ab", "t", Cols{"a", "b"}, true);
+    cat->CreateIndex("t_cba", "t", Cols{"c", "b", "a"}, false);
+    cat->CreateIndex("t_c", "t", "c", true);
+    Reopen();
+    std::map<std::string, IndexInfo*> by_name;
+    for (IndexInfo* i : cat->IndexesOf("t")) by_name[i->name] = i;
+    ASSERT_EQ(by_name.size(), 3u);
+    EXPECT_EQ(by_name["t_ab"]->columns, (Cols{"a", "b"}));
+    EXPECT_EQ(by_name["t_cba"]->columns, (Cols{"c", "b", "a"}));
+    EXPECT_EQ(by_name["t_cba"]->col_idxs, (std::vector<int>{2, 1, 0}));
+    EXPECT_EQ(by_name["t_c"]->columns, Cols{"c"});
+    EXPECT_TRUE(by_name["t_ab"]->tree->Wide());
+    EXPECT_FALSE(by_name["t_c"]->tree->Wide());
+    for (auto& [n, i] : by_name) EXPECT_EQ(i->tree->CheckAndCount(), 1000u) << n;
+    EXPECT_TRUE(cat->KeyTaken(by_name["t_ab"], Row{I(42), T("b7")}));
+    EXPECT_FALSE(cat->KeyTaken(by_name["t_ab"], Row{I(42), T("b10")}));
+}
+
+TEST_F(CatalogTest, FileWithoutMultiColumnSectionStillLoads) {
+    // Files written before multi-column indexes end right after the DEFAULT
+    // section. Recreate one by cutting off the (empty) last section: its count.
+    TableInfo* t = cat->CreateTable("t", {Col("a", TypeId::INT)});
+    for (int i = 0; i < 10; ++i) AddRow(t, {I(i)});
+    cat->CreateIndex("t_a", "t", "a", true);
+    cat->Save();
+    {
+        PageGuard g = PageGuard::Fetch(bpm.get(), CATALOG_PAGE_ID);
+        WriteAs<uint32_t>(g.Data() + 4, ReadAs<uint32_t>(g.Data() + 4) - 4);
+        g.MarkDirty();
+    }
+    cat.reset();  // no Save: keep the shortened catalog
+    bpm->FlushAll();
+    bpm.reset();
+    disk.reset();
+    disk = std::make_unique<DiskManager>(file.path());
+    bpm = std::make_unique<BufferPoolManager>(32, disk.get());
+    cat = std::make_unique<Catalog>(bpm.get());
+    ASSERT_EQ(cat->IndexesOf("t").size(), 1u);
+    IndexInfo* idx = cat->IndexesOf("t")[0];
+    EXPECT_EQ(idx->columns, Cols{"a"});
+    EXPECT_EQ(idx->tree->CheckAndCount(), 10u);
+    EXPECT_TRUE(cat->KeyTaken(idx, I(7)));
+}
+
+TEST_F(CatalogTest, RenameAndDropColumnsOfAMultiColumnIndex) {
+    TableInfo* t = cat->CreateTable("t", {Col("a", TypeId::INT), Col("b", TypeId::INT), Col("c", TypeId::INT)});
+    for (int i = 0; i < 100; ++i) AddRow(t, {I(i), I(i % 3), I(i % 5)});
+    cat->CreateIndex("t_cb", "t", Cols{"c", "b"}, false);
+    cat->CreateIndex("t_ab", "t", Cols{"a", "b"}, true);
+    cat->RenameColumn("t", "b", "bb");
+    for (IndexInfo* i : cat->IndexesOf("t")) EXPECT_EQ(i->columns[1], "bb") << i->name;
+    Reopen();
+    t = cat->RequireTable("t");
+    // Dropping `a` drops the index that contains it, the other is rebuilt.
+    cat->RewriteTable(t, {Col("bb", TypeId::INT), Col("c", TypeId::INT)}, [](Row r) {
+        r.erase(r.begin());
+        return r;
+    });
+    ASSERT_EQ(cat->IndexesOf("t").size(), 1u);
+    IndexInfo* idx = cat->IndexesOf("t")[0];
+    EXPECT_EQ(idx->name, "t_cb");
+    EXPECT_EQ(idx->col_idxs, (std::vector<int>{1, 0})) << "rebuilt against the new column positions";
+    EXPECT_EQ(idx->tree->CheckAndCount(), 100u);
 }
 
 }  // namespace

@@ -270,5 +270,100 @@ TEST_F(BPlusTreeTest, CycleInLeafChainIsAnErrorNotAHang) {
     EXPECT_EQ(bpm.PinnedFrames(), 0u);
 }
 
+// ---- wide trees: (key, key2, rid) entries, for multi-column indexes ----
+
+TEST_F(BPlusTreeTest, WideTreeOrdersByBothKeyParts) {
+    BPlusTree t(&bpm, INVALID_PAGE_ID, BPlusTree::LEAF_CAPACITY, BPlusTree::INTERNAL_CAPACITY, true);
+    EXPECT_TRUE(t.Wide());
+    EXPECT_EQ(t.LeafCapacity(), BPlusTree::WIDE_LEAF_CAPACITY);
+    // Every (key, key2) pair in [0,30) x [-15,15), inserted in a scrambled order.
+    std::vector<IndexKey> in;
+    for (int64_t k = 0; k < 30; ++k)
+        for (int64_t k2 = -15; k2 < 15; ++k2) in.push_back(IndexKey{k, RID{static_cast<page_id_t>(k), 0}, k2});
+    std::shuffle(in.begin(), in.end(), std::mt19937(7));
+    for (const auto& k : in) ASSERT_TRUE(t.Insert(k));
+    EXPECT_FALSE(t.Insert(in[0])) << "exact duplicate entry";
+    EXPECT_TRUE(t.Insert(IndexKey{in[0].key, RID{999, 0}, in[0].key2})) << "same key pair, other row";
+    ASSERT_TRUE(t.Remove(IndexKey{in[0].key, RID{999, 0}, in[0].key2}));
+    EXPECT_GT(t.Height(), 1) << "900 wide entries need more than one leaf";
+    EXPECT_EQ(t.CheckAndCount(), 900u);
+
+    std::sort(in.begin(), in.end());
+    std::vector<IndexKey> out;
+    for (auto it = t.Begin(); it.Valid(); it.Next()) out.push_back(it.Entry());
+    EXPECT_EQ(out, in) << "leaf chain is sorted by key, then key2";
+
+    EXPECT_EQ(t.LowerBound(7, 3).Entry().key, 7);
+    EXPECT_EQ(t.LowerBound(7, 3).Entry().key2, 3);
+    EXPECT_EQ(t.LowerBound(7).Entry().key2, -15) << "without key2: the first entry of the key";
+    auto next = t.LowerBound(7, 15);  // past the last key2 of 7
+    EXPECT_EQ(next.Entry().key, 8);
+    EXPECT_EQ(next.Entry().key2, -15);
+    EXPECT_FALSE(t.LowerBound(29, 15).Valid());
+    EXPECT_FALSE(t.Remove(IndexKey{7, RID{7, 0}, 99})) << "key2 is part of the entry";
+    EXPECT_TRUE(t.Remove(IndexKey{7, RID{7, 0}, 3}));
+    EXPECT_EQ(t.LowerBound(7, 3).Entry().key2, 4);
+    EXPECT_EQ(bpm.PinnedFrames(), 0u);
+}
+
+TEST_F(BPlusTreeTest, WideTreeRandomOperationsMatchReferenceModel) {
+    for (uint32_t seed = 1; seed <= 4; ++seed) {
+        BPlusTree t(&bpm, INVALID_PAGE_ID, 4, 4, true);  // tiny nodes: many splits
+        std::set<IndexKey> ref;
+        std::mt19937 rng(seed);
+        auto random_entry = [&] {
+            return IndexKey{static_cast<int64_t>(rng() % 12) - 6,
+                            RID{static_cast<page_id_t>(rng() % 4), static_cast<uint32_t>(rng() % 3)},
+                            static_cast<int64_t>(rng() % 10) - 5};
+        };
+        for (int step = 0; step < 3000; ++step) {
+            IndexKey k = random_entry();
+            bool insert = (step / 1000) % 2 == 0 ? rng() % 4 != 0 : rng() % 4 == 0;
+            if (insert)
+                ASSERT_EQ(t.Insert(k), ref.insert(k).second) << "seed " << seed << " step " << step;
+            else
+                ASSERT_EQ(t.Remove(k), ref.erase(k) == 1) << "seed " << seed << " step " << step;
+            if (step % 89 != 0) continue;
+            ASSERT_EQ(t.CheckAndCount(), ref.size());
+            for (int64_t q = -7; q <= 7; ++q) {
+                for (int64_t q2 = -6; q2 <= 6; q2 += 3) {
+                    auto it = t.LowerBound(q, q2);
+                    auto rit = ref.lower_bound(IndexKey{q, RID{INT32_MIN, 0}, q2});
+                    ASSERT_EQ(it.Valid(), rit != ref.end()) << "LowerBound(" << q << ", " << q2 << ")";
+                    if (it.Valid()) {
+                        ASSERT_EQ(it.Entry(), *rit) << "LowerBound(" << q << ", " << q2 << ")";
+                    }
+                }
+            }
+        }
+        EXPECT_EQ(bpm.PinnedFrames(), 0u);
+    }
+}
+
+TEST_F(BPlusTreeTest, NarrowTreeHasNoSecondKeyPart) {
+    BPlusTree t(&bpm, INVALID_PAGE_ID);
+    EXPECT_FALSE(t.Wide());
+    EXPECT_THROW(t.Insert(IndexKey{1, RID{1, 1}, 5}), DbError) << "a single-key tree cannot store key2";
+    t.Insert(1, RID{1, 1});
+    EXPECT_EQ(t.Begin().Entry().key2, 0);
+}
+
+TEST_F(BPlusTreeTest, LayoutMismatchIsDetected) {
+    // A node records whether it is wide; reading it with the other layout would
+    // misinterpret every entry, so it must be reported as corruption.
+    BPlusTree wide(&bpm, INVALID_PAGE_ID, 4, 4, true);
+    BPlusTree narrow(&bpm, INVALID_PAGE_ID, 4, 4, false);
+    for (int i = 0; i < 50; ++i) {
+        wide.Insert(IndexKey{i, RID{i, 0}, i});
+        narrow.Insert(i, RID{i, 0});
+    }
+    BPlusTree wide_as_narrow(&bpm, wide.Root());
+    BPlusTree narrow_as_wide(&bpm, narrow.Root(), 4, 4, true);
+    EXPECT_THROW(wide_as_narrow.LowerBound(5), DbError);
+    EXPECT_THROW(narrow_as_wide.CheckAndCount(), DbError);
+    EXPECT_EQ(wide.CheckAndCount(), 50u);
+    EXPECT_EQ(bpm.PinnedFrames(), 0u);
+}
+
 }  // namespace
 }  // namespace minidb

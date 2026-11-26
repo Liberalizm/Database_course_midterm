@@ -36,9 +36,38 @@ TEST(Parser, CreateTable) {
 
 TEST(Parser, TableLevelPrimaryKey) {
     auto c = ParseOne<CreateTableStmt>("CREATE TABLE t (a INT, b INT, PRIMARY KEY (b))");
-    EXPECT_FALSE(c.cols[0].primary_key);
-    EXPECT_TRUE(c.cols[1].primary_key);
+    EXPECT_EQ(c.primary_key, std::vector<std::string>{"b"});
+    EXPECT_FALSE(c.cols[0].not_null);
+    EXPECT_TRUE(c.cols[1].not_null) << "PRIMARY KEY implies NOT NULL";
     EXPECT_THROW(Parser("CREATE TABLE t (a INT, PRIMARY KEY (zz))").ParseAll(), DbError);
+}
+
+TEST(Parser, CompositePrimaryKeyAndUniqueConstraints) {
+    auto c = ParseOne<CreateTableStmt>(
+        "CREATE TABLE t (a INT, PRIMARY KEY (a, c), b TEXT, c INT, UNIQUE (b, c), UNIQUE (c))");
+    EXPECT_EQ(c.primary_key, (std::vector<std::string>{"a", "c"}));
+    ASSERT_EQ(c.cols.size(), 3u) << "constraints may come between the columns";
+    EXPECT_TRUE(c.cols[0].not_null);
+    EXPECT_FALSE(c.cols[1].not_null);
+    EXPECT_TRUE(c.cols[2].not_null);
+    EXPECT_FALSE(c.cols[0].primary_key) << "a table constraint does not mark the column itself";
+    ASSERT_EQ(c.unique_keys.size(), 2u);
+    EXPECT_EQ(c.unique_keys[0], (std::vector<std::string>{"b", "c"}));
+    EXPECT_EQ(c.unique_keys[1], std::vector<std::string>{"c"});
+
+    EXPECT_THROW(Parser("CREATE TABLE t (a INT, b INT, PRIMARY KEY (a, a))").ParseAll(), DbError) << "repeated";
+    EXPECT_THROW(Parser("CREATE TABLE t (a INT, PRIMARY KEY (a), PRIMARY KEY (a))").ParseAll(), DbError);
+    EXPECT_THROW(Parser("CREATE TABLE t (a INT, UNIQUE (a, zz))").ParseAll(), DbError) << "unknown column";
+    EXPECT_THROW(Parser("CREATE TABLE t (a INT, PRIMARY KEY ())").ParseAll(), DbError);
+    EXPECT_THROW(Parser("CREATE TABLE t (a INT, UNIQUE a)").ParseAll(), DbError);
+}
+
+TEST(Parser, MultiColumnIndex) {
+    auto i = ParseOne<CreateIndexStmt>("CREATE INDEX i ON t (a, b, c)");
+    EXPECT_EQ(i.columns, (std::vector<std::string>{"a", "b", "c"}));
+    EXPECT_THROW(Parser("CREATE INDEX i ON t (a, b, a)").ParseAll(), DbError);
+    EXPECT_THROW(Parser("CREATE INDEX i ON t (a,)").ParseAll(), DbError);
+    EXPECT_THROW(Parser("CREATE INDEX i ON t ()").ParseAll(), DbError);
 }
 
 TEST(Parser, UnknownTypeIsRejected) { EXPECT_THROW(Parser("CREATE TABLE t (a BLOB)").ParseAll(), DbError); }
@@ -48,7 +77,7 @@ TEST(Parser, CreateIndexAndDrop) {
     EXPECT_TRUE(i.unique);
     EXPECT_EQ(i.name, "idx");
     EXPECT_EQ(i.table, "t");
-    EXPECT_EQ(i.column, "col");
+    EXPECT_EQ(i.columns, std::vector<std::string>{"col"});
     EXPECT_FALSE(ParseOne<CreateIndexStmt>("CREATE INDEX i ON t (c)").unique);
     EXPECT_FALSE(ParseOne<DropStmt>("DROP TABLE t").index);
     EXPECT_TRUE(ParseOne<DropStmt>("DROP INDEX i").index);

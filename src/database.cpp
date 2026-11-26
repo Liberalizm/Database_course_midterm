@@ -84,7 +84,10 @@ std::optional<Value> Database::EvalDefault(const ColumnDef& d) {
 
 QueryResult Database::RunCreateTable(const CreateTableStmt& s) {
     std::vector<Column> cols;
-    std::string pk;
+    // The primary key (from a column or the table constraint) and the UNIQUE
+    // constraints, each a list of columns. Each becomes a unique index.
+    std::vector<std::string> pk = s.primary_key;
+    std::vector<std::vector<std::string>> unique_keys;
     for (const auto& d : s.cols) {
         Column c{};
         c.name = d.name;
@@ -94,23 +97,46 @@ QueryResult Database::RunCreateTable(const CreateTableStmt& s) {
         cols.push_back(c);
         if (d.primary_key) {
             if (!pk.empty()) throw DbError("multiple primary keys for table \"" + s.name + "\" are not allowed");
-            pk = d.name;
+            pk = {d.name};
         }
-        if ((d.primary_key || d.unique) && d.type != TypeId::INT && d.type != TypeId::TEXT)
-            throw DbError("PRIMARY KEY / UNIQUE is only supported on INT and TEXT columns");
+        if (d.unique) unique_keys.push_back({d.name});
     }
+    unique_keys.insert(unique_keys.end(), s.unique_keys.begin(), s.unique_keys.end());
+
+    auto check_types = [&](const std::vector<std::string>& key) {
+        for (const auto& name : key)
+            for (const auto& d : s.cols)
+                if (d.name == name && d.type != TypeId::INT && d.type != TypeId::TEXT)
+                    throw DbError("PRIMARY KEY / UNIQUE is only supported on INT and TEXT columns");
+    };
+    check_types(pk);
+    for (const auto& key : unique_keys) check_types(key);
+
+    // Index names as in PostgreSQL: t_pkey, t_a_key, t_a_b_key. A UNIQUE constraint
+    // on exactly the same columns as the primary key or an earlier one adds nothing.
+    std::vector<std::pair<std::string, std::vector<std::string>>> indexes;
+    if (!pk.empty()) indexes.emplace_back(s.name + "_pkey", pk);
+    for (const auto& key : unique_keys) {
+        bool redundant = false;
+        for (const auto& [n, cols_of] : indexes) redundant = redundant || cols_of == key;
+        if (redundant) continue;
+        std::string name = s.name;
+        for (const auto& c : key) name += "_" + c;
+        indexes.emplace_back(name + "_key", key);
+    }
+
     catalog_->CreateTable(s.name, cols);
-    for (const auto& d : s.cols) {
-        if (d.primary_key)
-            catalog_->CreateIndex(s.name + "_pkey", s.name, d.name, true);
-        else if (d.unique)
-            catalog_->CreateIndex(s.name + "_" + d.name + "_key", s.name, d.name, true);
+    try {
+        for (const auto& [name, key] : indexes) catalog_->CreateIndex(name, s.name, key, true);
+    } catch (...) {
+        catalog_->DropTable(s.name);  // e.g. an index name already taken: create nothing
+        throw;
     }
     return {{}, {}, "CREATE TABLE"};
 }
 
 QueryResult Database::RunCreateIndex(const CreateIndexStmt& s) {
-    catalog_->CreateIndex(s.name, s.table, s.column, s.unique);
+    catalog_->CreateIndex(s.name, s.table, s.columns, s.unique);
     return {{}, {}, "CREATE INDEX"};
 }
 
@@ -187,9 +213,19 @@ QueryResult Database::RunDrop(const DropStmt& s) {
 
 namespace {
 
-[[noreturn]] void ThrowDuplicate(const IndexInfo* idx, const Value& key) {
-    throw DbError("duplicate key value violates unique constraint \"" + idx->name + "\": " + idx->column + "=" +
-                  key.ToString());
+[[noreturn]] void ThrowDuplicate(const IndexInfo* idx, const Row& key) {
+    throw DbError("duplicate key value violates unique constraint \"" + idx->name + "\": " + idx->Describe(key));
+}
+
+bool HasNull(const Row& key) {
+    return std::any_of(key.begin(), key.end(), [](const Value& v) { return v.IsNull(); });
+}
+
+// A hashable encoding of key values (for duplicates within one statement).
+std::string EncodeKey(const Row& key) {
+    std::string out;
+    for (const Value& v : key) v.AppendKey(&out);
+    return out;
 }
 
 std::string SerializeChecked(const Schema& schema, const Row& row) {
@@ -200,8 +236,10 @@ std::string SerializeChecked(const Schema& schema, const Row& row) {
     return tuple;
 }
 
-bool SameKey(const Value& a, const Value& b) {
-    return a.IsNull() == b.IsNull() && (a.IsNull() || a.Compare(b) == 0);
+bool SameKey(const Row& a, const Row& b) {
+    for (size_t i = 0; i < a.size(); ++i)
+        if (a[i].IsNull() != b[i].IsNull() || (!a[i].IsNull() && a[i].Compare(b[i]) != 0)) return false;
+    return true;
 }
 
 }  // namespace
@@ -235,20 +273,16 @@ void Database::InsertRows(TableInfo* t, const std::vector<Row>& input) {
         if (!idx->unique) continue;
         std::unordered_set<std::string> seen;  // duplicates inside this statement (by value)
         for (const Row& r : rows) {
-            const Value& v = r[static_cast<size_t>(idx->col_idx)];
-            if (v.IsNull()) continue;
-            std::string vk;
-            v.AppendKey(&vk);
-            if (!seen.insert(std::move(vk)).second || catalog_->KeyTaken(idx, v)) ThrowDuplicate(idx, v);
+            Row key = idx->KeyValues(r);
+            if (HasNull(key)) continue;  // NULLs are distinct: never a duplicate
+            if (!seen.insert(EncodeKey(key)).second || catalog_->KeyTaken(idx, key)) ThrowDuplicate(idx, key);
         }
     }
 
     for (size_t i = 0; i < rows.size(); ++i) {
         RID rid = t->heap->Insert(tuples[i]);
-        for (IndexInfo* idx : indexes) {
-            const Value& v = rows[i][static_cast<size_t>(idx->col_idx)];
-            if (!v.IsNull()) idx->tree->Insert(idx->KeyOf(v), rid);
-        }
+        for (IndexInfo* idx : indexes)
+            if (idx->Indexes(rows[i])) idx->tree->Insert(idx->EntryFor(idx->KeyValues(rows[i]), rid));
         ++t->row_count;
     }
 }
@@ -342,10 +376,8 @@ QueryResult Database::RunDelete(const DeleteStmt& s) {
     // Phase 2: delete from indexes and heap.
     auto indexes = catalog_->IndexesOf(t->name);
     for (auto& [rid, r] : victims) {
-        for (IndexInfo* idx : indexes) {
-            const Value& v = r[static_cast<size_t>(idx->col_idx)];
-            if (!v.IsNull()) idx->tree->Remove(idx->KeyOf(v), rid);
-        }
+        for (IndexInfo* idx : indexes)
+            if (idx->Indexes(r)) idx->tree->Remove(idx->EntryFor(idx->KeyValues(r), rid));
         t->heap->Delete(rid);
         --t->row_count;
     }
@@ -394,16 +426,13 @@ QueryResult Database::RunUpdate(const UpdateStmt& s) {
     for (const auto& tr : targets) target_rids.insert(tr.first);
     for (IndexInfo* ix : indexes) {
         if (!ix->unique) continue;
-        const auto col = static_cast<size_t>(ix->col_idx);
         std::unordered_set<std::string> seen;
         for (size_t i = 0; i < targets.size(); ++i) {
-            const Value& nv = new_rows[i][col];
-            if (nv.IsNull()) continue;
-            std::string vk;
-            nv.AppendKey(&vk);
-            if (!seen.insert(std::move(vk)).second) ThrowDuplicate(ix, nv);
-            if (SameKey(targets[i].second[col], nv)) continue;  // keeps its own key
-            if (catalog_->KeyTaken(ix, nv, [&](RID r) { return target_rids.count(r) > 0; })) ThrowDuplicate(ix, nv);
+            Row nk = ix->KeyValues(new_rows[i]);
+            if (HasNull(nk)) continue;
+            if (!seen.insert(EncodeKey(nk)).second) ThrowDuplicate(ix, nk);
+            if (SameKey(ix->KeyValues(targets[i].second), nk)) continue;  // keeps its own key
+            if (catalog_->KeyTaken(ix, nk, [&](RID r) { return target_rids.count(r) > 0; })) ThrowDuplicate(ix, nk);
         }
     }
 
@@ -414,17 +443,18 @@ QueryResult Database::RunUpdate(const UpdateStmt& s) {
     new_rids.reserve(targets.size());
     for (size_t i = 0; i < targets.size(); ++i) new_rids.push_back(t->heap->Update(targets[i].first, tuples[i]));
     for (IndexInfo* ix : indexes) {
-        const auto col = static_cast<size_t>(ix->col_idx);
         auto changed = [&](size_t i) {
-            return new_rids[i] != targets[i].first || !SameKey(targets[i].second[col], new_rows[i][col]);
+            return new_rids[i] != targets[i].first ||
+                   !SameKey(ix->KeyValues(targets[i].second), ix->KeyValues(new_rows[i]));
         };
         for (size_t i = 0; i < targets.size(); ++i) {
-            const Value& ov = targets[i].second[col];
-            if (changed(i) && !ov.IsNull()) ix->tree->Remove(ix->KeyOf(ov), targets[i].first);
+            const Row& old_row = targets[i].second;
+            if (changed(i) && ix->Indexes(old_row))
+                ix->tree->Remove(ix->EntryFor(ix->KeyValues(old_row), targets[i].first));
         }
         for (size_t i = 0; i < targets.size(); ++i) {
-            const Value& nv = new_rows[i][col];
-            if (changed(i) && !nv.IsNull()) ix->tree->Insert(ix->KeyOf(nv), new_rids[i]);
+            if (changed(i) && ix->Indexes(new_rows[i]))
+                ix->tree->Insert(ix->EntryFor(ix->KeyValues(new_rows[i]), new_rids[i]));
         }
     }
     return {{}, {}, "UPDATE " + std::to_string(targets.size())};
@@ -438,14 +468,25 @@ QueryResult Database::Populate(const std::string& table, int64_t n, uint32_t see
                                   "india", "juliet", "kilo", "lima", "mike", "november", "oscar", "papa"};
 
     // Columns with a unique index (and the first INT column) get sequential ids;
-    // unique TEXT columns get "<column>_<n>", skipping values that are taken.
+    // unique TEXT columns get "<column>_<n>", skipping values that are taken. A
+    // multi-column unique index needs just one sequential column (preferably an
+    // INT one: it starts above every existing value, so no key can be taken).
     std::vector<bool> sequential(schema.Size(), false);
     std::vector<IndexInfo*> unique_idx(schema.Size(), nullptr);
-    for (IndexInfo* idx : catalog_->IndexesOf(table))
-        if (idx->unique) {
-            sequential[static_cast<size_t>(idx->col_idx)] = true;
-            unique_idx[static_cast<size_t>(idx->col_idx)] = idx;
+    for (IndexInfo* idx : catalog_->IndexesOf(table)) {
+        if (!idx->unique) continue;
+        auto col = static_cast<size_t>(idx->col_idxs[0]);
+        if (idx->Composite()) {
+            for (int c : idx->col_idxs)
+                if (schema.At(static_cast<size_t>(c)).type == TypeId::INT) {
+                    col = static_cast<size_t>(c);
+                    break;
+                }
+        } else {
+            unique_idx[col] = idx;
         }
+        sequential[col] = true;
+    }
     if (!schema.Columns().empty() && schema.At(0).type == TypeId::INT) sequential[0] = true;
     std::vector<int64_t> next_id(schema.Size(), 1);
     {
@@ -477,7 +518,7 @@ QueryResult Database::Populate(const std::string& table, int64_t n, uint32_t see
                         Value v;
                         do {
                             v = Value::Text(schema.At(i).name + "_" + std::to_string(next_id[i]++));
-                        } while (catalog_->KeyTaken(unique_idx[i], v));
+                        } while (unique_idx[i] && catalog_->KeyTaken(unique_idx[i], v));
                         r.push_back(std::move(v));
                     } else {
                         r.push_back(Value::Text(std::string(words[rng() % 16]) + "_" + std::to_string(rng() % 1000)));

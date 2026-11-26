@@ -30,6 +30,7 @@ private:
     ColumnDef ParseColumnDef();
     AlterTableStmt ParseAlterTable();
     CreateIndexStmt ParseCreateIndex(bool unique);
+    std::vector<std::string> ParseKeyColumns(const std::string& what);
     InsertStmt ParseInsert();
     SelectStmt ParseSelect();      // full query: cores + UNION/INTERSECT/EXCEPT + ORDER BY/LIMIT
     SelectStmt ParseSelectCore();  // SELECT ... FROM ... WHERE ... GROUP BY ... HAVING ...

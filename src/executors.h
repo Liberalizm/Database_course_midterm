@@ -77,9 +77,14 @@ private:
     RID cur_;
 };
 
+// A bound of an index scan, on the tree key (key) or, when has2, on the pair
+// (key, key2) compared lexicographically. Without has2 a bound covers every key2:
+// lo {5, true} starts at the first entry with key 5, hi {5, true} ends after the last.
 struct IndexBound {
     int64_t value;
     bool inclusive;
+    bool has2 = false;
+    int64_t value2 = 0;
 };
 
 class IndexScanExecutor : public ScanExecutor {

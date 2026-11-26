@@ -158,10 +158,15 @@ struct ColumnDef {
 struct CreateTableStmt {
     std::string name;
     std::vector<ColumnDef> cols;
+    // Table constraints: PRIMARY KEY (a, b, ...) and UNIQUE (a, b, ...). The parser
+    // checks that the columns exist and marks the primary key's NOT NULL.
+    std::vector<std::string> primary_key;
+    std::vector<std::vector<std::string>> unique_keys;
 };
 
 struct CreateIndexStmt {
-    std::string name, table, column;
+    std::string name, table;
+    std::vector<std::string> columns;  // one or more, in index order
     bool unique = false;
 };
 

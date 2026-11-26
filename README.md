@@ -35,7 +35,7 @@ SQL summary and the meta commands (`.tables`, `.schema t`, `.indexes`,
 | Area | Supported |
 |---|---|
 | Types | `INT` (64-bit), `DOUBLE`, `TEXT`, `BOOL`, `NULL` |
-| DDL | `CREATE TABLE` with `PRIMARY KEY`, `UNIQUE`, `NOT NULL`, `DEFAULT`; `CREATE [UNIQUE] INDEX`; `DROP TABLE / INDEX`; `ALTER TABLE ADD / DROP / RENAME [COLUMN]`, `RENAME TO` |
+| DDL | `CREATE TABLE` with `PRIMARY KEY`, `UNIQUE`, `NOT NULL`, `DEFAULT`, and composite `PRIMARY KEY (a, b)` / `UNIQUE (a, b)` table constraints; `CREATE [UNIQUE] INDEX` on one or more columns; `DROP TABLE / INDEX`; `ALTER TABLE ADD / DROP / RENAME [COLUMN]`, `RENAME TO` |
 | DML | `INSERT ... VALUES / SELECT`, `UPDATE`, `DELETE` — each statement is atomic |
 | Queries | `SELECT [DISTINCT]`, `WHERE`, `[INNER] JOIN`, `LEFT [OUTER] JOIN`, `CROSS JOIN` / comma joins, `GROUP BY`, `HAVING`, `ORDER BY` (names, aliases, positions), `LIMIT` / `OFFSET` |
 | Set operations | `UNION`, `INTERSECT`, `EXCEPT`, each with or without `ALL` |
@@ -97,6 +97,18 @@ range scans); `TEXT` columns by a 64-bit FNV-1a hash (equality only). Hashes
 can collide, so uniqueness checks compare the real values and index scans
 re-check the condition. Deletes are lazy (nodes are never merged).
 
+A multi-column index — also behind `PRIMARY KEY (a, b)` and `UNIQUE (a, b)` —
+uses a "wide" tree with a second 64-bit key part: entries are
+(key(a), key2, RID), where key2 is the second column's key for a two-column
+index (so an `INT` second column stays ordered) and a hash of the remaining
+columns otherwise. The planner uses it for conditions on the leading column
+alone (`a = 1`, `a < 5`), for `a = 1 AND b BETWEEN 3 AND 7` when `b` is the
+`INT` second column, and for equality on every column. Conditions on the later
+columns are always re-checked (key2 may be a hash, or stand for a `NULL`).
+Rows whose leading column is `NULL` are not indexed, and a key containing a
+`NULL` never violates uniqueness (as in PostgreSQL). Single-column trees keep
+the original node format, so existing database files open unchanged.
+
 **Planning.** For every table the planner compares a sequential scan with
 each usable index (min/max statistics from the B+ tree, Cardenas' formula
 for heap pages touched), pushes single-table conditions below joins,
@@ -123,12 +135,13 @@ the middle of a statement can leave it partially written.
 - No transactions or concurrency: one connection, autocommit only.
 - No write-ahead log (see above) and no page checksums.
 - No `RIGHT` / `FULL` joins, foreign keys or views; `DEFAULT` must be a constant.
-- Indexes on `INT` and `TEXT` columns only; one column per index.
+- Indexes on `INT` and `TEXT` columns only. A multi-column index is not used
+  for a range on a column after the second, or on a `TEXT` column.
 - B+ tree nodes are not merged after deletes.
 
 ## Tests
 
-About 330 tests in three layers — unit tests per component, integration
+About 360 tests in three layers — unit tests per component, integration
 tests through the `Database` API, and end-to-end tests that run the shell
 binary against golden output — plus randomized differential and
 file-corruption tests. See [docs/TESTING.md](docs/TESTING.md).
