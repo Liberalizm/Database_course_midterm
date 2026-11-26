@@ -308,6 +308,34 @@ TEST_F(SqlTest, IntegerOverflowNeverReachesTheTable) {
     EXPECT_EQ(Scalar("SELECT COUNT(*) FROM n WHERE v = -9223372036854775808"), 1);
 }
 
+TEST_F(SqlTest, NonBooleanConditionsAreErrors) {
+    SeedCompany();
+    EXPECT_THROW(db->Execute("SELECT * FROM emp WHERE 1"), DbError);
+    EXPECT_THROW(db->Execute("SELECT * FROM emp WHERE name"), DbError);
+    EXPECT_THROW(db->Execute("SELECT * FROM emp WHERE id = 1 AND salary"), DbError)
+        << "AND checks its operands";
+    EXPECT_THROW(db->Execute("SELECT * FROM emp e JOIN dept d ON e.dept_id"), DbError);
+    EXPECT_THROW(db->Execute("SELECT dept_id FROM emp GROUP BY dept_id HAVING COUNT(*)"), DbError);
+    EXPECT_THROW(db->Execute("DELETE FROM emp WHERE id + 1"), DbError);
+    EXPECT_THROW(db->Execute("UPDATE emp SET name = 'x' WHERE salary * 2"), DbError);
+    EXPECT_EQ(Scalar("SELECT COUNT(*) FROM emp WHERE dept_id = NULL"), 0) << "NULL is not an error";
+    EXPECT_EQ(Scalar("SELECT COUNT(*) FROM emp WHERE TRUE"), 5);
+    EXPECT_EQ(Scalar("SELECT COUNT(*) FROM emp"), 5) << "the failed DELETE removed nothing";
+}
+
+TEST_F(SqlTest, ColumnsMayBeTargetedOnlyOnce) {
+    db->Execute("CREATE TABLE t (a INT, b INT)");
+    EXPECT_THROW(db->Execute("INSERT INTO t (a, a) VALUES (1, 2)"), DbError);
+    EXPECT_THROW(db->Execute("INSERT INTO t (a, b, A) VALUES (1, 2, 3)"), DbError) << "identifiers are case-insensitive";
+    db->Execute("INSERT INTO t (b, a) VALUES (2, 1)");
+    EXPECT_THROW(db->Execute("UPDATE t SET a = 5, a = 6"), DbError);
+    EXPECT_THROW(db->Execute("UPDATE t SET a = 5, b = 1, a = 6"), DbError);
+    auto rows = Q("SELECT a, b FROM t");
+    ASSERT_EQ(rows.size(), 1u);
+    EXPECT_EQ(rows[0][0].AsInt(), 1);
+    EXPECT_EQ(rows[0][1].AsInt(), 2);
+}
+
 TEST_F(SqlTest, ErrorsDoNotBreakTheSession) {
     SeedCompany();
     EXPECT_THROW(db->Execute("SELEC 1"), DbError);

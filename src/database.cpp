@@ -180,6 +180,8 @@ QueryResult Database::RunInsert(const InsertStmt& s) {
         for (const auto& c : s.columns) {
             int idx = schema.Find("", c);
             if (idx < 0) throw DbError("column \"" + c + "\" of relation \"" + s.table + "\" does not exist");
+            if (std::find(positions.begin(), positions.end(), static_cast<size_t>(idx)) != positions.end())
+                throw DbError("column \"" + c + "\" specified more than once");
             positions.push_back(static_cast<size_t>(idx));
         }
     }
@@ -271,6 +273,9 @@ QueryResult Database::RunUpdate(const UpdateStmt& s) {
     for (const auto& [col, e] : s.sets) {
         int idx = schema.Find("", col);
         if (idx < 0) throw DbError("column \"" + col + "\" of relation \"" + s.table + "\" does not exist");
+        for (const auto& prev : sets)
+            if (prev.first == static_cast<size_t>(idx))
+                throw DbError("multiple assignments to same column \"" + col + "\"");
         if (ContainsAggregate(*e)) throw DbError("aggregate functions are not allowed in UPDATE");
         sets.emplace_back(static_cast<size_t>(idx), BindExpr(e, schema));
     }

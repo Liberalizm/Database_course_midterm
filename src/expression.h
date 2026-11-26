@@ -14,7 +14,15 @@ ExprPtr BindExpr(const ExprPtr& e, const Schema& schema);
 // Evaluates a bound expression against one row. Implements SQL three-valued logic.
 Value Evaluate(const Expr& e, const Row& row);
 
-inline bool IsTrue(const Value& v) { return v.Type() == TypeId::BOOL && v.AsBool(); }
+// Result of a filter condition (WHERE / ON / HAVING): only TRUE keeps the row,
+// NULL ("unknown") does not. Any other type is an error rather than a silent
+// "false", so that e.g. "WHERE 1" or "WHERE name" is reported, not ignored.
+inline bool IsTrue(const Value& v) {
+    if (v.IsNull()) return false;
+    if (v.Type() != TypeId::BOOL)
+        throw DbError(std::string("filter condition must be boolean, not ") + TypeName(v.Type()));
+    return v.AsBool();
+}
 
 bool ContainsAggregate(const Expr& e);
 std::vector<ExprPtr> SplitConjuncts(const ExprPtr& e);  // a AND b AND c -> [a, b, c]

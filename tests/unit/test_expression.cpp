@@ -68,6 +68,15 @@ TEST(Expression, DoubleOverflowIsAnError) {
     EXPECT_DOUBLE_EQ(Eval(Bin(BinOp::MUL, C(D(1e150)), C(D(1e150)))).AsDouble(), 1e300);
 }
 
+TEST(Expression, FilterResultMustBeBoolean) {
+    EXPECT_TRUE(IsTrue(B(true)));
+    EXPECT_FALSE(IsTrue(B(false)));
+    EXPECT_FALSE(IsTrue(N())) << "unknown does not pass a filter";
+    EXPECT_THROW(IsTrue(I(1)), DbError) << "WHERE 1 is an error, not a silent false";
+    EXPECT_THROW(IsTrue(D(0.5)), DbError);
+    EXPECT_THROW(IsTrue(T("true")), DbError);
+}
+
 TEST(Expression, ArithmeticTypeErrors) {
     EXPECT_THROW(Eval(Bin(BinOp::ADD, C(T("a")), C(I(1)))), DbError);
     EXPECT_THROW(Eval(Expr::Unary(UnaryOp::NEG, C(T("a")))), DbError);

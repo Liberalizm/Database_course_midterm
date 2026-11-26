@@ -45,6 +45,7 @@ std::vector<Token> Tokenize(const std::string& sql) {
             size_t j = i + 1;
             while (j < n && sql[j] != '"') ++j;
             if (j >= n) throw DbError("unterminated quoted identifier");
+            if (j == i + 1) throw DbError("zero-length quoted identifier");
             t.type = TokenType::IDENT;
             t.text = sql.substr(i + 1, j - i - 1);
             i = j + 1;

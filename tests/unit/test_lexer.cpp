@@ -32,6 +32,11 @@ TEST(Lexer, QuotedIdentifierKeepsCase) {
     EXPECT_EQ(t[0], std::make_pair(TT::IDENT, std::string("MixedCase")));
 }
 
+TEST(Lexer, EmptyQuotedIdentifierIsRejected) {
+    EXPECT_THROW(Tokenize("CREATE TABLE \"\" (x INT)"), DbError);
+    EXPECT_THROW(Tokenize("SELECT \"unterminated"), DbError);
+}
+
 TEST(Lexer, Numbers) {
     auto t = Lex("42 3.14 1e3 2.5E-2 7.");
     EXPECT_EQ(t[0], std::make_pair(TT::INTEGER, std::string("42")));
