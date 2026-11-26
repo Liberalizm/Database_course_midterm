@@ -1,9 +1,11 @@
 // Integration tests: durability — data written by one Database instance must be
 // readable by the next one opening the same file.
+#include <algorithm>
 #include <fstream>
 #include <iterator>
 #include <random>
 
+#include "checksum.h"
 #include "database.h"
 #include "test_util.h"
 
@@ -99,6 +101,9 @@ TEST(Persistence, DroppedTablesDoNotGrowTheFileForever) {
 // A damaged database file must produce errors, never crash or hang. Flips bytes in
 // the structural parts of pages (headers, slot arrays, node headers) and runs a
 // mix of reads and writes; any crash takes down this test process.
+// The damaged pages are given fresh, valid checksums. Otherwise the checksum
+// would reject every one of them on read, and the structural validation in the
+// page layers (still needed for pages a bug wrote wrongly) would never run.
 TEST(Persistence, CorruptedFileNeverCrashesOrHangs) {
     TempFile f;
     {
@@ -111,7 +116,8 @@ TEST(Persistence, CorruptedFileNeverCrashesOrHangs) {
         std::ifstream in(f.path(), std::ios::binary);
         pristine.assign(std::istreambuf_iterator<char>(in), {});
     }
-    const size_t pages = pristine.size() / PAGE_SIZE;
+    ASSERT_EQ(pristine.size() % DISK_PAGE_SIZE, 0u);
+    const size_t pages = pristine.size() / DISK_PAGE_SIZE;
     ASSERT_GT(pages, 20u);
     const char* queries[] = {"SELECT COUNT(*) FROM t",
                              "SELECT COUNT(*) FROM t WHERE id = 500",
@@ -127,7 +133,11 @@ TEST(Persistence, CorruptedFileNeverCrashesOrHangs) {
         int flips = 1 + static_cast<int>(rng() % 6);
         for (int k = 0; k < flips; ++k) {
             size_t page = 1 + rng() % (pages - 1);  // page 0 (catalog) is tested elsewhere
-            bytes[page * PAGE_SIZE + rng() % 96] = static_cast<char>(rng() % 256);
+            bytes[page * DISK_PAGE_SIZE + rng() % 96] = static_cast<char>(rng() % 256);
+        }
+        for (size_t page = 0; page < pages; ++page) {
+            char* frame = bytes.data() + page * DISK_PAGE_SIZE;
+            WriteAs<uint32_t>(frame + PAGE_SIZE, PageChecksum(static_cast<page_id_t>(page), frame));
         }
         {
             std::ofstream out(f.path(), std::ios::binary | std::ios::trunc);
@@ -147,6 +157,39 @@ TEST(Persistence, CorruptedFileNeverCrashesOrHangs) {
         }
     }
     EXPECT_GT(errors, 0) << "the damage should have been noticed at least sometimes";
+}
+
+// Damage that no structural check can see: one character of a stored value is
+// changed on disk. Without checksums the query would silently return the wrong
+// value; with them the damage is reported. (Opening the database already walks
+// every table's page chain, so the error may come from opening, not the query.)
+TEST(Persistence, ChecksumCatchesSilentDataCorruption) {
+    TempFile f;
+    {
+        Database db(f.path(), 32);
+        db.Execute("CREATE TABLE accounts (id INT PRIMARY KEY, s TEXT)");
+        db.Execute("INSERT INTO accounts VALUES (1, 'balance=1000')");
+    }
+    std::vector<char> bytes;
+    {
+        std::ifstream in(f.path(), std::ios::binary);
+        bytes.assign(std::istreambuf_iterator<char>(in), {});
+    }
+    const std::string needle = "balance=1000";
+    auto it = std::search(bytes.begin(), bytes.end(), needle.begin(), needle.end());
+    ASSERT_NE(it, bytes.end());
+    *(it + 8) = '9';  // balance=9000
+    {
+        std::ofstream out(f.path(), std::ios::binary | std::ios::trunc);
+        out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+    }
+    try {
+        Database db(f.path(), 32);
+        auto rows = db.Execute("SELECT s FROM accounts WHERE id = 1").back().rows;
+        FAIL() << "the damaged row was returned: " << rows.at(0).at(0).AsText();
+    } catch (const DbError& e) {
+        EXPECT_NE(std::string(e.what()).find("failed its checksum"), std::string::npos) << e.what();
+    }
 }
 
 TEST(Persistence, TextKeysSurviveRestart) {

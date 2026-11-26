@@ -81,15 +81,19 @@ ALTER TABLE emp RENAME COLUMN salary TO pay;
  table_heap.cpp   table = linked list of slotted pages
  table_page.cpp   slotted page with variable-length tuples
  buffer_pool.cpp  page cache: pinning, LRU replacement, write-back
- disk_manager.cpp the database file as an array of 4 KB pages
+ disk_manager.cpp the database file as an array of 4 KB pages + checksums
 ```
 
 **Storage.** Every page is 4 KB. Tables are heap files of slotted pages; a
 row is addressed by its RID (page, slot), which stays stable while the row
 lives. Pages freed by `DROP TABLE` / `DROP INDEX` / `ALTER TABLE` go to a
 free-page list (persisted in the catalog) and are reused before the file
-grows. Page headers and slots are validated on access, so a damaged file
-produces an error rather than a crash.
+grows. On disk every page is followed by a CRC-32C checksum of its contents
+and its page id. The checksum is checked whenever the page is read, so damage
+to the file (a flipped bit, a truncated file, a page written to the wrong
+place) is reported as an error, never returned as data. Page headers and
+slots are also validated on access, so a bad page that somehow has a valid
+checksum still produces an error rather than a crash.
 
 **Indexes.** A B+ tree whose entries are (key, RID) pairs, which makes
 non-unique indexes natural. `INT` columns are indexed by value (equality and
@@ -121,7 +125,10 @@ the middle of a statement can leave it partially written.
 ## Limitations
 
 - No transactions or concurrency: one connection, autocommit only.
-- No write-ahead log (see above) and no page checksums.
+- No write-ahead log (see above). Checksums detect a damaged page but
+  cannot repair it.
+- Database files from before page checksums (pages of exactly 4096 bytes)
+  cannot be opened.
 - No `RIGHT` / `FULL` joins, foreign keys or views; `DEFAULT` must be a constant.
 - Indexes on `INT` and `TEXT` columns only; one column per index.
 - B+ tree nodes are not merged after deletes.

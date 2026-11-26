@@ -7,7 +7,8 @@ the part that broke.
 ```
 tests/
 ├── unit/                    one executable per component, tested in isolation
-│   ├── test_disk_manager    storage: raw page I/O
+│   ├── test_checksum        storage: CRC-32C and the per-page checksum
+│   ├── test_disk_manager    storage: raw page I/O, checksum verification
 │   ├── test_lru_replacer    storage: eviction policy
 │   ├── test_buffer_pool     storage: caching, pinning, write-back, PageGuard
 │   ├── test_value           storage: values, schemas, tuple serialization
