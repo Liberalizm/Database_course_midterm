@@ -43,7 +43,15 @@ Page* BufferPoolManager::FetchPage(page_id_t pid) {
     if (!GetFreeFrame(&f)) throw DbError("buffer pool exhausted: all frames are pinned");
     Page& p = frames_[f];
     p.Reset();
-    disk_->ReadPage(pid, p.data_);
+    try {
+        disk_->ReadPage(pid, p.data_);
+    } catch (...) {
+        // E.g. a page that failed its checksum: the frame holds nothing, so it
+        // must go back on the free list instead of being lost.
+        p.Reset();
+        free_list_.push_front(f);
+        throw;
+    }
     p.id_ = pid;
     p.pin_count_ = 1;
     page_table_[pid] = f;

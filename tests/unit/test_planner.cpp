@@ -116,15 +116,77 @@ TEST_F(PlannerTest, EquiJoinUsesHashJoinWithSmallerBuildSide) {
     EXPECT_TRUE(Has(kids[1]->Describe(), "on small")) << "build = small";
 }
 
-TEST_F(PlannerTest, LeftJoinAlwaysProbesWithThePreservedSide) {
-    // Even though `small` is the smaller input, it is the preserved side of the
-    // LEFT JOIN, so it must be probed, and `big` becomes the build side.
-    auto plan = PlanOf("SELECT * FROM small s LEFT JOIN big b ON b.grp = s.id");
-    const Executor* join = plan->Children().at(0);
-    ASSERT_TRUE(Has(join->Describe(), "Hash Left Join")) << join->Describe();
-    EXPECT_TRUE(Has(join->Children()[0]->Describe(), "on small"));
-    EXPECT_TRUE(Has(join->Children()[1]->Describe(), "on big"));
+TEST_F(PlannerTest, OuterHashJoinsBuildOnTheSmallerSideEvenIfItIsPreserved) {
+    // The hash join can keep unmatched rows of either input, so the smaller one is
+    // hashed whichever side is preserved. Its type is relative to (probe, build):
+    // `small` LEFT JOIN `big` with `small` hashed is a Hash Right Join.
+    auto check = [&](const std::string& sql, const std::string& type) {
+        auto plan = PlanOf(sql);
+        const Executor* join = plan->Children().at(0);
+        EXPECT_TRUE(Has(join->Describe(), "Hash " + type)) << sql << "\n" << join->Describe();
+        EXPECT_TRUE(Has(join->Children()[0]->Describe(), "on big")) << sql << ": probe = big";
+        EXPECT_TRUE(Has(join->Children()[1]->Describe(), "on small")) << sql << ": build = small";
+    };
+    check("SELECT * FROM small s LEFT JOIN big b ON b.grp = s.id", "Right Join");
+    check("SELECT * FROM big b LEFT JOIN small s ON b.grp = s.id", "Left Join");
+    check("SELECT * FROM small s RIGHT JOIN big b ON b.grp = s.id", "Left Join");
+    check("SELECT * FROM big b RIGHT JOIN small s ON b.grp = s.id", "Right Join");
+    check("SELECT * FROM small s FULL JOIN big b ON b.grp = s.id", "Full Join");
+    EXPECT_GE(Rows("SELECT * FROM small s LEFT JOIN big b ON b.grp = s.id"), 50u);
+    EXPECT_GE(Rows("SELECT * FROM small s RIGHT JOIN big b ON b.grp = s.id"), 20000u);
     EXPECT_TRUE(Has(ExplainOf("SELECT * FROM tiny a LEFT JOIN tiny b ON a.v < b.v"), "Nested Loop Left Join"));
+    EXPECT_TRUE(Has(ExplainOf("SELECT * FROM tiny a RIGHT JOIN tiny b ON a.v < b.v"), "Nested Loop Right Join"));
+    EXPECT_TRUE(Has(ExplainOf("SELECT * FROM tiny a FULL JOIN tiny b ON a.v < b.v"), "Nested Loop Full Join"));
+}
+
+TEST_F(PlannerTest, RightJoinFiltersAreAppliedOnTheCorrectSide) {
+    // tiny = (1,10), (2,20), (3,30). ON on the left (null-supplying) side filters it.
+    auto on_plan = ExplainOf("SELECT * FROM tiny a RIGHT JOIN tiny b ON a.id = b.id AND a.v > 10");
+    EXPECT_TRUE(Has(on_plan, "Seq Scan on tiny a  Filter: a.v > 10")) << on_plan;
+    EXPECT_EQ(Rows("SELECT * FROM tiny a RIGHT JOIN tiny b ON a.id = b.id AND a.v > 10"), 3u);
+    // The same condition in WHERE removes padded rows, so it runs after the join.
+    auto where_plan = ExplainOf("SELECT * FROM tiny a RIGHT JOIN tiny b ON a.id = b.id WHERE a.v > 10");
+    EXPECT_FALSE(Has(where_plan, "Seq Scan on tiny a  Filter")) << where_plan;
+    EXPECT_EQ(Rows("SELECT * FROM tiny a RIGHT JOIN tiny b ON a.id = b.id WHERE a.v > 10"), 2u);
+    // WHERE on the preserved side is pushed down; ON on it must not drop rows.
+    EXPECT_TRUE(Has(ExplainOf("SELECT * FROM tiny a RIGHT JOIN tiny b ON a.id = b.id WHERE b.v > 10"),
+                    "Seq Scan on tiny b  Filter: b.v > 10"));
+    EXPECT_EQ(Rows("SELECT * FROM tiny a RIGHT JOIN tiny b ON b.v > 10 AND a.id = b.id"), 3u);
+    EXPECT_EQ(Rows("SELECT * FROM tiny a RIGHT JOIN tiny b ON a.id = b.id AND 1 = 0"), 3u);
+    // A condition on no table must not run before the RIGHT JOIN brings rows back.
+    EXPECT_EQ(Rows("SELECT * FROM tiny a RIGHT JOIN tiny b ON a.id = b.id WHERE 1 = 0"), 0u);
+}
+
+TEST_F(PlannerTest, FullJoinKeepsBothSidesAndFiltersOnlyAfterwards) {
+    // a.id = b.id + 1 pairs a2-b1 and a3-b2; a1 and b3 are kept unmatched.
+    EXPECT_EQ(Rows("SELECT * FROM tiny a FULL JOIN tiny b ON a.id = b.id + 1"), 4u);
+    EXPECT_EQ(Rows("SELECT * FROM tiny a FULL JOIN tiny b ON a.id = b.id + 1 AND a.v > 20"), 5u);
+    for (const char* cond : {"a.v > 10", "b.v > 10"}) {
+        std::string sql = std::string("SELECT * FROM tiny a FULL JOIN tiny b ON a.id = b.id + 1 WHERE ") + cond;
+        auto plan = ExplainOf(sql);
+        EXPECT_FALSE(Has(plan, "Seq Scan on tiny a  Filter")) << plan;
+        EXPECT_FALSE(Has(plan, "Seq Scan on tiny b  Filter")) << plan;
+        EXPECT_EQ(Rows(sql), 2u) << sql;
+    }
+}
+
+TEST_F(PlannerTest, InnerJoinBeforeARightJoinIsAppliedBeforeIt) {
+    // (a JOIN b ON ... a.v > 15) keeps a2, a3; the RIGHT JOIN then keeps all of c,
+    // so c1 appears padded. Applying the inner ON after the RIGHT JOIN would drop it.
+    EXPECT_EQ(Rows("SELECT * FROM tiny a JOIN tiny b ON a.id = b.id AND a.v > 15 RIGHT JOIN tiny c ON c.id = a.id"),
+              3u);
+    EXPECT_EQ(Rows("SELECT * FROM tiny a JOIN tiny b ON a.id = b.id RIGHT JOIN tiny c ON c.id = a.id WHERE a.v > 15"),
+              2u);
+    EXPECT_EQ(Rows("SELECT * FROM tiny a CROSS JOIN tiny b RIGHT JOIN tiny c ON c.id = a.id AND a.id = b.id"), 3u);
+}
+
+TEST_F(PlannerTest, WhereConditionsAfterAnOuterJoinCanStillDriveAHashJoin) {
+    // b is padded by the LEFT JOIN, but that join is already done when c is
+    // joined, so b.id = c.id can be the hash key of the inner join with c.
+    auto plan = ExplainOf("SELECT * FROM tiny a LEFT JOIN tiny b ON a.id = b.id + 1 JOIN tiny c ON b.id = c.id");
+    EXPECT_TRUE(Has(plan, "Hash Join  Hash Cond: ")) << plan;
+    EXPECT_FALSE(Has(plan, "cross product")) << plan;
+    EXPECT_EQ(Rows("SELECT * FROM tiny a LEFT JOIN tiny b ON a.id = b.id + 1 JOIN tiny c ON b.id = c.id"), 2u);
 }
 
 TEST_F(PlannerTest, LeftJoinFiltersAreAppliedOnTheCorrectSide) {

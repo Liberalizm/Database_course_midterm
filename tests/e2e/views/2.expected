@@ -1,0 +1,21 @@
+  dept  (3 rows, 1 pages)
+  emp  (5 rows, 1 pages)
+  payroll  (view)
+  staff  (view)
+ dept | people | total
+------+--------+-------
+ eng  | 2      | 180
+ hr   | 1      | 90
+ ops  | 1      | 50
+ NULL | 1      | 70
+(4 rows)
+CREATE VIEW
+ dept | people | total
+------+--------+-------
+ n/a  | 3      | 270
+(1 row)
+DROP VIEW
+ERROR: view "payroll": table "staff" does not exist
+DROP VIEW
+  dept  (3 rows, 1 pages)
+  emp  (5 rows, 1 pages)

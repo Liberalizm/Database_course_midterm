@@ -113,16 +113,25 @@ std::vector<Token> Tokenize(const std::string& sql) {
                 ++i;
             }
         }
+        t.end = i;
         out.push_back(std::move(t));
     }
     Token end;
     end.type = TokenType::END;
-    end.pos = n;
+    end.pos = end.end = n;
     out.push_back(end);
     return out;
 }
 
-Parser::Parser(const std::string& sql) : toks_(Tokenize(sql)) {}
+Parser::Parser(const std::string& sql) : sql_(sql), toks_(Tokenize(sql)) {}
+
+SelectStmt Parser::ParseQuery(const std::string& sql) {
+    Parser p(sql);
+    if (!p.CheckKw("select")) p.Error("expected SELECT");
+    SelectStmt s = p.ParseSelect();
+    if (p.Peek().type != TokenType::END) p.Error("unexpected text after the query");
+    return s;
+}
 
 const Token& Parser::Peek(size_t k) const {
     size_t i = std::min(pos_ + k, toks_.size() - 1);
@@ -196,19 +205,26 @@ std::vector<Statement> Parser::ParseAll() {
 
 Statement Parser::ParseStatement() {
     if (AcceptKw("create")) {
+        // VIEW and REPLACE are matched in context only (not reserved words).
+        if (AcceptKw("or")) {
+            ExpectKw("replace");
+            ExpectKw("view");
+            return ParseCreateView(true);
+        }
+        if (AcceptKw("view")) return ParseCreateView(false);
         bool unique = AcceptKw("unique");
         if (!unique && AcceptKw("table")) return ParseCreateTable();
-        ExpectKw("index");
+        if (!AcceptKw("index")) Error(unique ? "expected INDEX" : "expected TABLE, INDEX or VIEW");
         return ParseCreateIndex(unique);
     }
     if (AcceptKw("drop")) {
         DropStmt d;
-        if (AcceptKw("table")) {
-            d.index = false;
-        } else {
-            ExpectKw("index");
+        if (AcceptKw("index"))
             d.index = true;
-        }
+        else if (AcceptKw("view"))
+            d.view = true;
+        else if (!AcceptKw("table"))
+            Error("expected TABLE, INDEX or VIEW");
         d.name = ExpectIdent();
         return d;
     }
@@ -406,17 +422,38 @@ AlterTableStmt Parser::ParseAlterTable() {
     return a;
 }
 
+// "(a, b, ...)": the column list of an index or a table constraint. `what`
+// names it in the error for a column listed twice.
+std::vector<std::string> Parser::ParseKeyColumns(const std::string& what) {
+    std::vector<std::string> cols;
+    ExpectSym("(");
+    do {
+        std::string c = ExpectIdent();
+        if (std::find(cols.begin(), cols.end(), c) != cols.end())
+            throw DbError("column \"" + c + "\" appears twice in " + what);
+        cols.push_back(std::move(c));
+    } while (AcceptSym(","));
+    ExpectSym(")");
+    return cols;
+}
+
+// CREATE TABLE name (column definitions and table constraints, in any order):
+//   PRIMARY KEY (a [, b ...])   UNIQUE (a [, b ...])
 CreateTableStmt Parser::ParseCreateTable() {
     CreateTableStmt c;
     c.name = ExpectIdent();
     ExpectSym("(");
-    std::string table_pk;
+    bool table_pk = false;
     do {
         if (AcceptKw("primary")) {
             ExpectKw("key");
-            ExpectSym("(");
-            table_pk = ExpectIdent();
-            ExpectSym(")");
+            if (table_pk) throw DbError("multiple primary keys for table \"" + c.name + "\" are not allowed");
+            c.primary_key = ParseKeyColumns("primary key constraint");
+            table_pk = true;
+            continue;
+        }
+        if (AcceptKw("unique")) {
+            c.unique_keys.push_back(ParseKeyColumns("unique constraint"));
             continue;
         }
         if (AtTableConstraint()) {
@@ -426,29 +463,51 @@ CreateTableStmt Parser::ParseCreateTable() {
         c.cols.push_back(ParseColumnDef());
     } while (AcceptSym(","));
     ExpectSym(")");
-    if (!table_pk.empty()) {
-        bool found = false;
-        for (auto& d : c.cols) {
-            if (d.name == table_pk) {
-                d.primary_key = true;
-                d.not_null = true;
-                found = true;
-            }
-        }
-        if (!found) throw DbError("primary key column \"" + table_pk + "\" does not exist");
+
+    auto find = [&](const std::string& name) -> ColumnDef* {
+        for (auto& d : c.cols)
+            if (d.name == name) return &d;
+        return nullptr;
+    };
+    for (const auto& name : c.primary_key) {
+        ColumnDef* d = find(name);
+        if (!d) throw DbError("primary key column \"" + name + "\" does not exist");
+        d->not_null = true;  // implied by PRIMARY KEY
     }
+    for (const auto& key : c.unique_keys)
+        for (const auto& name : key)
+            if (!find(name)) throw DbError("unique constraint column \"" + name + "\" does not exist");
     return c;
 }
 
+// After CREATE [OR REPLACE] VIEW:  name [(col, ...)] AS SELECT ...
+CreateViewStmt Parser::ParseCreateView(bool or_replace) {
+    CreateViewStmt v;
+    v.or_replace = or_replace;
+    v.name = ExpectIdent();
+    if (AcceptSym("(")) {
+        do {
+            v.columns.push_back(ExpectIdent());
+        } while (AcceptSym(","));
+        ExpectSym(")");
+    }
+    ExpectKw("as");
+    if (!CheckKw("select")) Error("expected SELECT");
+    size_t start = Peek().pos;
+    v.select = std::make_shared<SelectStmt>(ParseSelect());
+    // The query's own text, from SELECT to its last token (comments in between are kept).
+    v.sql = sql_.substr(start, toks_[pos_ - 1].end - start);
+    return v;
+}
+
+// CREATE [UNIQUE] INDEX name ON table (a [, b ...])
 CreateIndexStmt Parser::ParseCreateIndex(bool unique) {
     CreateIndexStmt c;
     c.unique = unique;
     c.name = ExpectIdent();
     ExpectKw("on");
     c.table = ExpectIdent();
-    ExpectSym("(");
-    c.column = ExpectIdent();
-    ExpectSym(")");
+    c.columns = ParseKeyColumns("index \"" + c.name + "\"");
     return c;
 }
 
@@ -526,18 +585,30 @@ SelectStmt Parser::ParseSelectCore() {
             s.from.push_back(r);
         };
         parse_ref();
+        bool saw_comma = false;
+        std::vector<std::pair<size_t, ExprPtr>> inner_ons;  // (FROM index, ON) of inner joins
         while (true) {
             if (AcceptSym(",")) {
+                saw_comma = true;
                 parse_ref();
-            } else if (AcceptKw("left")) {
+            } else if (CheckKw("left") || CheckKw("right") || CheckKw("full")) {
+                JoinType jt = JoinType::FULL;
+                if (AcceptKw("left"))
+                    jt = JoinType::LEFT;
+                else if (AcceptKw("right"))
+                    jt = JoinType::RIGHT;
+                else
+                    ExpectKw("full");
+                // "a, b RIGHT JOIN c" means a × (b RIGHT JOIN c): the join binds
+                // tighter than the comma, which a left-deep join list cannot express.
+                if (jt != JoinType::LEFT && saw_comma)
+                    Error("RIGHT / FULL JOIN cannot follow a comma-separated FROM list (use CROSS JOIN instead of the comma)");
                 AcceptKw("outer");
                 ExpectKw("join");
                 parse_ref();
                 ExpectKw("on");
-                s.from.back().left_join = true;
+                s.from.back().join = jt;
                 s.from.back().on = ParseExpr();
-            } else if (CheckKw("right") || CheckKw("full")) {
-                Error("only INNER, CROSS and LEFT joins are supported (rewrite RIGHT JOIN as LEFT JOIN)");
             } else if (CheckKw("join") || CheckKw("inner") || CheckKw("cross")) {
                 bool cross = AcceptKw("cross");
                 if (!cross) AcceptKw("inner");
@@ -545,11 +616,22 @@ SelectStmt Parser::ParseSelectCore() {
                 parse_ref();
                 if (!cross) {
                     ExpectKw("on");
-                    join_conds.push_back(ParseExpr());
+                    inner_ons.emplace_back(s.from.size() - 1, ParseExpr());
                 }
             } else {
                 break;
             }
+        }
+        // Inner ON conditions become WHERE conditions, except those before a
+        // RIGHT / FULL JOIN, which stay with their join (see TableRef::join).
+        size_t keep_before = 0;
+        for (size_t i = 0; i < s.from.size(); ++i)
+            if (s.from[i].join == JoinType::RIGHT || s.from[i].join == JoinType::FULL) keep_before = i;
+        for (auto& [idx, on] : inner_ons) {
+            if (idx < keep_before)
+                s.from[idx].on = std::move(on);
+            else
+                join_conds.push_back(std::move(on));
         }
     }
     if (AcceptKw("where")) join_conds.push_back(ParseExpr());

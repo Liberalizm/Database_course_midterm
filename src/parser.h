@@ -14,7 +14,8 @@ struct Token {
     TokenType type = TokenType::END;
     std::string text;  // identifiers / keywords are lower-cased
     bool quoted = false;  // "quoted identifier": never a keyword, keeps its case
-    size_t pos = 0;
+    size_t pos = 0;  // the token is sql[pos, end)
+    size_t end = 0;
 };
 
 std::vector<Token> Tokenize(const std::string& sql);
@@ -24,9 +25,13 @@ public:
     explicit Parser(const std::string& sql);
     std::vector<Statement> ParseAll();
 
+    // Parses text that must be exactly one SELECT query (a view's definition).
+    static SelectStmt ParseQuery(const std::string& sql);
+
 private:
     Statement ParseStatement();
     CreateTableStmt ParseCreateTable();
+    CreateViewStmt ParseCreateView(bool or_replace);
     ColumnDef ParseColumnDef();
     ForeignKey ParseReferences();       // after REFERENCES: table [(column)] [ON DELETE a] [ON UPDATE a]
     FkAction ParseFkAction();
@@ -34,6 +39,7 @@ private:
     ForeignKey ParseTableConstraint();  // [CONSTRAINT name] FOREIGN KEY (column) REFERENCES ...
     AlterTableStmt ParseAlterTable();
     CreateIndexStmt ParseCreateIndex(bool unique);
+    std::vector<std::string> ParseKeyColumns(const std::string& what);
     InsertStmt ParseInsert();
     SelectStmt ParseSelect();      // full query: cores + UNION/INTERSECT/EXCEPT + ORDER BY/LIMIT
     SelectStmt ParseSelectCore();  // SELECT ... FROM ... WHERE ... GROUP BY ... HAVING ...
@@ -79,6 +85,7 @@ private:
         Parser* p_;
     };
 
+    std::string sql_;
     std::vector<Token> toks_;
     size_t pos_ = 0;
     int depth_ = 0;

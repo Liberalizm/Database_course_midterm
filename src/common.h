@@ -9,8 +9,12 @@
 
 namespace minidb {
 
-// Every page on disk and in memory has exactly this size.
+// Every page has exactly this many bytes of contents, on disk and in memory.
 constexpr size_t PAGE_SIZE = 4096;
+// On disk each page is followed by a checksum of its contents (see checksum.h).
+// Only the DiskManager sees it; every layer above works with PAGE_SIZE bytes.
+constexpr size_t PAGE_CHECKSUM_SIZE = sizeof(uint32_t);
+constexpr size_t DISK_PAGE_SIZE = PAGE_SIZE + PAGE_CHECKSUM_SIZE;
 
 using page_id_t = int32_t;   // index of a page inside the database file
 using frame_id_t = int32_t;  // index of a frame inside the buffer pool

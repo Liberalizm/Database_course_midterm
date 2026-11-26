@@ -16,11 +16,13 @@ const char* kHelp = R"(MiniDB - a relational database written from scratch.
 
 SQL (end every statement with ';'):
   CREATE TABLE t (id INT PRIMARY KEY, name TEXT NOT NULL DEFAULT '?', score DOUBLE, ok BOOL);
-  CREATE [UNIQUE] INDEX idx ON t (col);        DROP TABLE t;  DROP INDEX idx;
+  CREATE TABLE u (a INT, b TEXT, n INT, PRIMARY KEY (a, b), UNIQUE (b, n));
+  CREATE [UNIQUE] INDEX idx ON t (col [, col2 ...]);  DROP TABLE t;  DROP INDEX idx;
   ALTER TABLE t ADD [COLUMN] c TYPE [UNIQUE] | DROP [COLUMN] c | RENAME [COLUMN] a TO b | RENAME TO u;
   Foreign keys: c INT REFERENCES p [(col)]   or   [CONSTRAINT n] FOREIGN KEY (c) REFERENCES p [(col)]
                 [ON DELETE | ON UPDATE  CASCADE | SET NULL | SET DEFAULT | RESTRICT | NO ACTION]
   ALTER TABLE t ADD [CONSTRAINT n] FOREIGN KEY (c) REFERENCES p [(col)] ... | DROP CONSTRAINT n;
+  CREATE [OR REPLACE] VIEW v [(a, b)] AS SELECT ...;   DROP VIEW v;   (views are read-only)
   INSERT INTO t VALUES (1, 'a', 2.5, true), (2, 'b', NULL, false);
   INSERT INTO t (id, name) SELECT ...;
   SELECT [DISTINCT] cols | * FROM a [[LEFT] JOIN b ON ...] [, c] WHERE ...
@@ -36,12 +38,18 @@ SQL (end every statement with ';'):
   Aggregates: COUNT(*) COUNT(x) SUM AVG MIN MAX, each also with DISTINCT: COUNT(DISTINCT x)
 
 Meta commands:
-  .tables               list tables          .schema <table>    show columns and indexes
+  .tables               tables and views     .schema <name>     a table's columns and indexes, a view's query
   .indexes              list indexes         .stats             buffer pool / disk statistics
   .populate <t> <n>     insert n random rows .read <file>       run a script (SQL + meta commands)
   .timer on|off         show query time      .checkpoint        flush everything to disk
   .help                 this text            .exit / .quit      leave
 )";
+
+std::string ColumnList(const IndexInfo& idx) {
+    std::string out;
+    for (size_t i = 0; i < idx.columns.size(); ++i) out += (i ? ", " : "") + idx.columns[i];
+    return out;
+}
 
 std::string Trim(const std::string& s) {
     size_t a = s.find_first_not_of(" \t\r\n");
@@ -170,13 +178,20 @@ bool Shell::RunMeta(const std::string& line) {
         } else if (cmd == ".tables") {
             for (TableInfo* t : db_.GetCatalog().Tables())
                 out_ << "  " << t->name << "  (" << t->row_count << " rows, " << t->heap->PageCount() << " pages)\n";
+            for (ViewInfo* v : db_.GetCatalog().Views()) out_ << "  " << v->name << "  (view)\n";
         } else if (cmd == ".indexes") {
             for (IndexInfo* i : db_.GetCatalog().Indexes())
-                out_ << "  " << i->name << " ON " << i->table << "(" << i->column << ")" << (i->unique ? " UNIQUE" : "")
-                     << "  height=" << i->tree->Height() << "\n";
+                out_ << "  " << i->name << " ON " << i->table << "(" << ColumnList(*i) << ")"
+                     << (i->unique ? " UNIQUE" : "") << "  height=" << i->tree->Height() << "\n";
         } else if (cmd == ".schema") {
             std::string name;
             in >> name;
+            if (const ViewInfo* v = db_.GetCatalog().GetView(name)) {
+                out_ << "View \"" << v->name << "\"\n  CREATE VIEW " << v->name;
+                for (size_t i = 0; i < v->columns.size(); ++i) out_ << (i ? ", " : " (") << v->columns[i];
+                out_ << (v->columns.empty() ? "" : ")") << " AS " << v->sql << ";\n";
+                return true;
+            }
             TableInfo* t = db_.GetCatalog().RequireTable(name);
             out_ << "Table \"" << t->name << "\"\n";
             for (const auto& c : t->schema.Columns()) {
@@ -188,7 +203,8 @@ bool Shell::RunMeta(const std::string& line) {
                 out_ << "\n";
             }
             for (IndexInfo* i : db_.GetCatalog().IndexesOf(name))
-                out_ << "  index " << i->name << " (" << i->column << ")" << (i->unique ? " UNIQUE" : "") << " btree\n";
+                out_ << "  index " << i->name << " (" << ColumnList(*i) << ")" << (i->unique ? " UNIQUE" : "")
+                     << " btree\n";
             for (ForeignKey* fk : db_.GetCatalog().ForeignKeysOf(name))
                 out_ << "  constraint " << fk->name << " " << fk->ToString() << "\n";
             for (ForeignKey* fk : db_.GetCatalog().ForeignKeysTo(name))

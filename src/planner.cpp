@@ -6,6 +6,8 @@
 #include <functional>
 #include <map>
 
+#include "parser.h"
+
 namespace minidb {
 
 namespace {
@@ -57,10 +59,12 @@ BinOp Flip(BinOp op) {
     }
 }
 
-// Does `e` have the shape  alias.col <op> <constant>  (either order) usable by `idx`?
-// INT index: any comparison with an INT constant. Hashed TEXT index: only
-// equality with a TEXT constant, and `v` is the hash of that constant.
-bool MatchIndexPredicate(const Expr& e, const std::string& alias, const IndexInfo& idx, BinOp* op, int64_t* v) {
+// Does `e` have the shape  alias.column <op> <constant>  (either order), with a
+// constant an index on a column of type `type` can look up? INT column: any
+// comparison with an INT constant. TEXT column (indexed by hash): only equality
+// with a TEXT constant. Returns the operator (column on the left) and the constant.
+bool MatchKeyPredicate(const Expr& e, const std::string& alias, const std::string& column, TypeId type, BinOp* op,
+                       const Value** constant) {
     if (e.kind != ExprKind::BINARY) return false;
     BinOp o = e.op;
     if (o != BinOp::EQ && o != BinOp::LT && o != BinOp::LE && o != BinOp::GT && o != BinOp::GE) return false;
@@ -71,24 +75,54 @@ bool MatchIndexPredicate(const Expr& e, const std::string& alias, const IndexInf
         o = Flip(o);
     }
     if (c->kind != ExprKind::COLUMN || k->kind != ExprKind::CONST) return false;
-    if (c->table != alias || c->column != idx.column) return false;
-    if (idx.hashed) {
-        if (o != BinOp::EQ || k->value.Type() != TypeId::TEXT) return false;
-        *op = o;
-        *v = HashTextKey(k->value.AsText());
-        return true;
-    }
-    if (k->value.Type() != TypeId::INT) return false;
+    if (c->table != alias || c->column != column) return false;
+    if (k->value.Type() != type) return false;
+    if (type == TypeId::TEXT && o != BinOp::EQ) return false;
+    if (type != TypeId::TEXT && type != TypeId::INT) return false;
     *op = o;
-    *v = k->value.AsInt();
+    *constant = &k->value;
     return true;
 }
+
+// What the conditions on one key column allow: an equality (its constant) or
+// a range on the column's tree key, and which conjuncts these came from.
+struct KeyColumnConds {
+    std::optional<size_t> eq_conj;
+    const Value* eq_value = nullptr;
+    std::optional<IndexBound> lo, hi;
+    std::vector<size_t> range_used;
+};
 
 void TightenLo(std::optional<IndexBound>& lo, int64_t v, bool incl) {
     if (!lo || v > lo->value || (v == lo->value && !incl)) lo = IndexBound{v, incl};
 }
 void TightenHi(std::optional<IndexBound>& hi, int64_t v, bool incl) {
     if (!hi || v < hi->value || (v == hi->value && !incl)) hi = IndexBound{v, incl};
+}
+
+KeyColumnConds CollectKeyConds(const std::vector<ExprPtr>& conjuncts, const std::string& alias,
+                               const std::string& column, TypeId type) {
+    KeyColumnConds k;
+    for (size_t i = 0; i < conjuncts.size(); ++i) {
+        BinOp op;
+        const Value* c;
+        if (!MatchKeyPredicate(*conjuncts[i], alias, column, type, &op, &c)) continue;
+        int64_t v = IndexKeyPart(*c);
+        switch (op) {
+            case BinOp::EQ:
+                if (!k.eq_conj) {
+                    k.eq_conj = i;
+                    k.eq_value = c;
+                }
+                break;
+            case BinOp::GT: TightenLo(k.lo, v, false); k.range_used.push_back(i); break;
+            case BinOp::GE: TightenLo(k.lo, v, true); k.range_used.push_back(i); break;
+            case BinOp::LT: TightenHi(k.hi, v, false); k.range_used.push_back(i); break;
+            case BinOp::LE: TightenHi(k.hi, v, true); k.range_used.push_back(i); break;
+            default: break;
+        }
+    }
+    return k;
 }
 
 bool IsSubset(const std::set<int>& a, const std::set<int>& b) {
@@ -181,14 +215,31 @@ ExprPtr Planner::RunSubquery(const Expr& node, ExprPtr left, const std::vector<S
     throw DbError("internal: bad subquery kind");
 }
 
-ExprPtr Planner::ResolveSubqueries(const ExprPtr& e) {
+ExprPtr Planner::ResolveSubqueries(const ExprPtr& e, const TableInfo* insert_target) {
+    struct Restore {
+        const TableInfo** slot;
+        const TableInfo* saved;
+        ~Restore() { *slot = saved; }
+    } restore{&insert_target_, insert_target_};
+    insert_target_ = insert_target;
+    return ResolveSubqueriesRec(e);
+}
+
+ExprPtr Planner::ResolveSubqueriesRec(const ExprPtr& e) {
     if (!e) return nullptr;
-    if (e->kind == ExprKind::SUBQUERY) return RunSubquery(*e, ResolveSubqueries(e->left), nullptr);
+    if (e->kind == ExprKind::SUBQUERY) return RunSubquery(*e, ResolveSubqueriesRec(e->left), nullptr);
     auto c = std::make_shared<Expr>(*e);
-    c->left = ResolveSubqueries(e->left);
-    c->right = ResolveSubqueries(e->right);
-    for (auto& a : c->args) a = ResolveSubqueries(a);
+    c->left = ResolveSubqueriesRec(e->left);
+    c->right = ResolveSubqueriesRec(e->right);
+    for (auto& a : c->args) a = ResolveSubqueriesRec(a);
     return c;
+}
+
+ExprPtr Planner::PlanRowExpr(TableInfo* table, const ExprPtr& e) {
+    // The same scope as the statement's WHERE (PlanTableScan): the target table,
+    // under its own name, so a subquery's reference to it becomes a PARAM.
+    std::vector<Source> srcs{{table, table->name, table->schema.WithQualifier(table->name)}};
+    return BindExpr(Canonicalize(e, srcs), srcs[0].schema);
 }
 
 ExprPtr Planner::Canonicalize(const ExprPtr& e, const std::vector<Source>& srcs) {
@@ -233,6 +284,14 @@ ExprPtr Planner::Canonicalize(const ExprPtr& e, const std::vector<Source>& srcs)
         if (found < 0) {
             for (const Scope* s : scopes_)  // e.g. "emp.nope" where emp is an outer table
                 for (const auto& src : *s->srcs) alias_exists = alias_exists || src.alias == e->table;
+            if (const TableInfo* t = insert_target_) {  // in a subquery of INSERT ... VALUES
+                if (!alias_exists && e->table == t->name)
+                    throw DbError("invalid reference to table \"" + t->name +
+                                  "\": INSERT ... VALUES has no current row to refer to");
+                if (e->table.empty() && t->schema.Find("", e->column) >= 0)
+                    throw DbError("column \"" + e->column + "\" does not exist (table \"" + t->name +
+                                  "\" has one, but INSERT ... VALUES cannot refer to it)");
+            }
             if (!e->table.empty() && !alias_exists)
                 throw DbError("missing FROM-clause entry for table \"" + e->table + "\"");
             throw DbError("column \"" + e->ToString() + "\" does not exist");
@@ -266,32 +325,16 @@ std::unique_ptr<ScanExecutor> Planner::BuildAccessPath(const Source& src, const 
     double best_rows = rows * SelectivityOf(conjuncts);
     IndexInfo* best_idx = nullptr;
     std::optional<IndexBound> best_lo, best_hi;
-    std::vector<size_t> best_used;
+    std::vector<size_t> best_answered;
 
-    // Option 2..n: an index scan for every usable index.
+    // Option 2..n: an index scan for every usable index. A multi-column index is
+    // searched on its leading column, and once that is fixed by an equality, also
+    // on the next: a range (or equality) on an INT second column of a two-column
+    // index, or equality on all the other columns (whose hash is key2).
     for (IndexInfo* idx : catalog_->IndexesOf(t->name)) {
-        std::optional<IndexBound> lo, hi;
-        std::optional<size_t> eq_conj;
-        int64_t eq_val = 0;
-        std::vector<size_t> range_used;
-        for (size_t i = 0; i < conjuncts.size(); ++i) {
-            BinOp op;
-            int64_t v;
-            if (!MatchIndexPredicate(*conjuncts[i], src.alias, *idx, &op, &v)) continue;
-            switch (op) {
-                case BinOp::EQ:
-                    if (!eq_conj) {
-                        eq_conj = i;
-                        eq_val = v;
-                    }
-                    break;
-                case BinOp::GT: TightenLo(lo, v, false); range_used.push_back(i); break;
-                case BinOp::GE: TightenLo(lo, v, true); range_used.push_back(i); break;
-                case BinOp::LT: TightenHi(hi, v, false); range_used.push_back(i); break;
-                case BinOp::LE: TightenHi(hi, v, true); range_used.push_back(i); break;
-                default: break;
-            }
-        }
+        auto type_of = [&](size_t i) { return t->schema.At(static_cast<size_t>(idx->col_idxs[i])).type; };
+        const KeyColumnConds k0 = CollectKeyConds(conjuncts, src.alias, idx->columns[0], type_of(0));
+        std::optional<IndexBound> lo = k0.lo, hi = k0.hi;
         // Statistics: min/max of the column straight from the B+ tree. Assume
         // values are uniformly distributed in [min, max].
         int64_t kmin = 0, kmax = 0;
@@ -300,18 +343,53 @@ std::unique_ptr<ScanExecutor> Planner::BuildAccessPath(const Source& src, const 
         double domain = have_stats ? static_cast<double>(kmax) - static_cast<double>(kmin) + 1.0 : 0.0;
 
         double matched;
-        std::vector<size_t> used;
-        if (eq_conj) {
+        std::vector<size_t> used;      // conjuncts the scan bounds come from (for estimates)
+        std::vector<size_t> answered;  // ... of which the scan alone guarantees (no re-check)
+        if (k0.eq_conj) {
+            const int64_t eq_val = IndexKeyPart(*k0.eq_value);
             lo = hi = IndexBound{eq_val, true};
-            used = {*eq_conj};
-            if (idx->unique)
+            used = {*k0.eq_conj};
+            bool full_key = !idx->Composite();  // every key column fixed by an equality
+            double narrow = 1.0;                 // selectivity of the conditions on the other columns
+            if (idx->OrderedKey2()) {
+                KeyColumnConds k1 = CollectKeyConds(conjuncts, src.alias, idx->columns[1], TypeId::INT);
+                if (k1.eq_conj) {
+                    lo = hi = IndexBound{eq_val, true, true, k1.eq_value->AsInt()};
+                    used.push_back(*k1.eq_conj);
+                    full_key = true;
+                    narrow = 0.05;
+                } else if (k1.lo || k1.hi) {
+                    if (k1.lo) lo = IndexBound{eq_val, k1.lo->inclusive, true, k1.lo->value};
+                    if (k1.hi) hi = IndexBound{eq_val, k1.hi->inclusive, true, k1.hi->value};
+                    used.insert(used.end(), k1.range_used.begin(), k1.range_used.end());
+                    narrow = (k1.lo && k1.hi) ? 0.1 : 0.3;
+                }
+            } else if (idx->Key2Hashed()) {
+                Row rest;
+                std::vector<size_t> rest_used;
+                for (size_t i = 1; i < idx->columns.size(); ++i) {
+                    KeyColumnConds ki = CollectKeyConds(conjuncts, src.alias, idx->columns[i], type_of(i));
+                    if (!ki.eq_conj) break;
+                    rest.push_back(*ki.eq_value);
+                    rest_used.push_back(*ki.eq_conj);
+                }
+                if (rest.size() == idx->columns.size() - 1) {
+                    lo = hi = IndexBound{eq_val, true, true, IndexKey2(rest.data(), rest.size())};
+                    used.insert(used.end(), rest_used.begin(), rest_used.end());
+                    full_key = true;
+                    narrow = std::pow(0.05, static_cast<double>(rest.size()));
+                }
+            }
+            if (idx->unique && full_key)
                 matched = 1.0;
             else if (have_stats)
-                matched = (eq_val < kmin || eq_val > kmax) ? 1.0 : std::max(1.0, rows / domain);
+                matched = (eq_val < kmin || eq_val > kmax) ? 1.0 : std::max(1.0, rows / domain * narrow);
             else
-                matched = std::max(1.0, rows * 0.05);
+                matched = std::max(1.0, rows * 0.05 * narrow);
+            answered.push_back(*k0.eq_conj);
         } else if (lo || hi) {
-            used = range_used;
+            used = k0.range_used;
+            answered = k0.range_used;
             if (have_stats) {
                 double a = lo ? static_cast<double>(lo->value) + (lo->inclusive ? 0 : 1) : static_cast<double>(kmin);
                 double b = hi ? static_cast<double>(hi->value) - (hi->inclusive ? 0 : 1) : static_cast<double>(kmax);
@@ -325,6 +403,10 @@ std::unique_ptr<ScanExecutor> Planner::BuildAccessPath(const Source& src, const 
         } else {
             continue;
         }
+        // Only conditions on an INT leading column are answered exactly. A TEXT one
+        // is looked up by hash, and key2 can be a hash or stand for a NULL, so
+        // those conditions stay in the filter as a re-check.
+        if (idx->hashed) answered.clear();
         std::vector<ExprPtr> rest;
         for (size_t i = 0; i < conjuncts.size(); ++i)
             if (std::find(used.begin(), used.end(), i) == used.end()) rest.push_back(conjuncts[i]);
@@ -333,24 +415,22 @@ std::unique_ptr<ScanExecutor> Planner::BuildAccessPath(const Source& src, const 
         // fetching `matched` random rows out of `pages` pages.
         double pages_fetched = pages * (1.0 - std::pow(1.0 - 1.0 / pages, matched));
         if (pages <= 1.0) pages_fetched = 1.0;
-        double cost = idx->tree->Height() + matched / BPlusTree::LEAF_CAPACITY + pages_fetched * RANDOM_PAGE_COST +
+        double cost = idx->tree->Height() + matched / idx->tree->LeafCapacity() + pages_fetched * RANDOM_PAGE_COST +
                       matched * CPU_TUPLE_COST;
         if (cost < best_cost) {
             best_cost = cost;
             best_idx = idx;
             best_lo = lo;
             best_hi = hi;
-            best_used = used;
+            best_answered = answered;
             best_rows = matched * SelectivityOf(rest);
         }
     }
 
-    // Conditions answered by the index are dropped from the filter, except for a
-    // hashed (TEXT) index: two texts can share a hash, so `col = 'x'` is re-checked.
-    const bool recheck = best_idx && best_idx->hashed;
+    // Conditions the index answers exactly are dropped from the filter.
     std::vector<ExprPtr> residual;
     for (size_t i = 0; i < conjuncts.size(); ++i)
-        if (recheck || std::find(best_used.begin(), best_used.end(), i) == best_used.end())
+        if (std::find(best_answered.begin(), best_answered.end(), i) == best_answered.end())
             residual.push_back(conjuncts[i]);
     ExprPtr pred = MakeConjunction(residual);
     ExprPtr bound = pred ? BindExpr(pred, src.schema) : nullptr;
@@ -422,6 +502,43 @@ ExecPtr Planner::PlanSetOp(const SelectStmt& stmt) {
     return root;
 }
 
+ExecPtr Planner::PlanView(const std::string& name, const std::vector<std::string>& columns, const SelectStmt& query,
+                          Schema* out) {
+    if (std::find(view_stack_.begin(), view_stack_.end(), name) != view_stack_.end())
+        throw DbError("view \"" + name + "\" refers to itself");
+    if (view_stack_.size() >= kMaxViewDepth)
+        throw DbError("views are nested more than " + std::to_string(kMaxViewDepth) + " levels deep");
+    // The view's query is planned as a query of its own: outer scopes are hidden,
+    // so a column it no longer finds (after ALTER TABLE) is an error instead of
+    // silently turning into a reference to the query that uses the view.
+    struct Restore {
+        Planner* p;
+        std::vector<Scope*> scopes;
+        ~Restore() {
+            p->scopes_ = std::move(scopes);
+            p->view_stack_.pop_back();
+        }
+    } restore{this, std::move(scopes_)};
+    scopes_.clear();
+    view_stack_.push_back(name);
+
+    ExecPtr plan = PlanSelect(query);
+    std::vector<Column> cols = plan->OutSchema().Columns();
+    if (!columns.empty()) {
+        if (columns.size() != cols.size())
+            throw DbError("view \"" + name + "\" names " + std::to_string(columns.size()) +
+                          " columns but its query returns " + std::to_string(cols.size()));
+        for (size_t i = 0; i < cols.size(); ++i) cols[i].name = columns[i];
+    }
+    for (size_t i = 0; i < cols.size(); ++i)
+        for (size_t j = 0; j < i; ++j)
+            if (cols[i].name == cols[j].name)
+                throw DbError("view \"" + name + "\" has more than one column named \"" + cols[i].name +
+                              "\" (give them different aliases)");
+    *out = Schema(std::move(cols));
+    return plan;
+}
+
 ExecPtr Planner::PlanSelect(const SelectStmt& stmt) {
     if (stmt.set_lhs) return PlanSetOp(stmt);
     // ---------- 1. resolve FROM ----------
@@ -441,6 +558,20 @@ ExecPtr Planner::PlanSelect(const SelectStmt& stmt) {
                     if (out.At(i).name == out.At(j).name)
                         throw DbError("subquery \"" + alias + "\" has more than one column named \"" + out.At(i).name +
                                       "\" (give them different aliases)");
+            srcs.push_back({nullptr, alias, out.WithQualifier(alias)});
+            derived.push_back(std::move(plan));
+            continue;
+        }
+        if (const ViewInfo* v = catalog_->GetView(ref.name)) {
+            // A view is expanded into a derived table: its stored query is parsed
+            // and planned again here, so it sees the tables as they are now.
+            Schema out;
+            ExecPtr plan;
+            try {
+                plan = PlanView(v->name, v->columns, Parser::ParseQuery(v->sql), &out);
+            } catch (const DbError& e) {
+                throw DbError("view \"" + v->name + "\": " + e.what());
+            }
             srcs.push_back({nullptr, alias, out.WithQualifier(alias)});
             derived.push_back(std::move(plan));
             continue;
@@ -480,17 +611,32 @@ ExecPtr Planner::PlanSelect(const SelectStmt& stmt) {
         if (!stmt.items[i].star) item_exprs[i] = Canonicalize(stmt.items[i].expr, srcs);
 
     // ---------- 4. classify WHERE conjuncts by the tables they touch ----------
-    // A table on the right of a LEFT JOIN is "nullable": its columns are NULL in
-    // padded rows, so WHERE conditions on it must run after that join, never be
-    // pushed into its scan (that would turn the LEFT JOIN into an inner join).
-    bool has_left_join = false;
-    std::vector<bool> nullable(srcs.size(), false);
-    for (size_t i = 0; i < stmt.from.size(); ++i)
-        if (stmt.from[i].left_join) has_left_join = nullable[i] = true;
+    // Outer joins pad rows with NULLs: a LEFT JOIN pads the table it adds, a RIGHT
+    // JOIN every table before it, a FULL JOIN both. pad_step[t] is the last join
+    // (FROM position) that pads table t, -1 if none. A WHERE condition on a padded
+    // table must run after that join, never below it: pushed into the table's scan
+    // it would turn the outer join into an inner one. A condition on no table at
+    // all (WHERE FALSE) must run after the last RIGHT / FULL JOIN, which would
+    // otherwise bring back the rows it removed.
+    bool has_outer_join = false;
+    int last_keep_left = -1;  // last RIGHT / FULL JOIN
+    std::vector<int> pad_step(srcs.size(), -1);
+    for (size_t i = 1; i < stmt.from.size(); ++i) {
+        JoinType jt = stmt.from[i].join;
+        if (jt == JoinType::INNER) continue;
+        has_outer_join = true;
+        int step = static_cast<int>(i);
+        if (jt == JoinType::LEFT || jt == JoinType::FULL) pad_step[i] = step;
+        if (jt == JoinType::RIGHT || jt == JoinType::FULL) {
+            for (size_t t = 0; t < i; ++t) pad_step[t] = step;
+            last_keep_left = step;
+        }
+    }
 
     struct Pending {
         ExprPtr e;
         std::set<int> tabs;
+        int ready;  // may only run once the join at this FROM position is done
         bool used = false;
     };
     std::vector<Pending> pending;
@@ -498,26 +644,37 @@ ExecPtr Planner::PlanSelect(const SelectStmt& stmt) {
     for (auto& c : SplitConjuncts(where)) {
         std::set<int> tabs;
         ReferencedTables(*c, srcs, &tabs);
-        if (tabs.size() == 1 && !nullable[static_cast<size_t>(*tabs.begin())])
+        int ready = tabs.empty() ? last_keep_left : -1;
+        for (int t : tabs) ready = std::max(ready, pad_step[static_cast<size_t>(t)]);
+        if (tabs.size() == 1 && ready < 0)
             per_table[static_cast<size_t>(*tabs.begin())].push_back(c);  // pushdown
         else
-            pending.push_back({c, tabs});
+            pending.push_back({c, tabs, ready});
     }
 
-    // LEFT JOIN ... ON: conditions on the joined table alone only decide which of
-    // its rows can match, so they may filter its scan; the rest stay join conditions.
+    // ON conditions kept with their join (outer joins, and inner joins before a
+    // RIGHT / FULL JOIN). Conditions that only limit which rows of one input can
+    // match may filter that input instead:
+    //   INNER / LEFT JOIN: conditions on the joined table alone filter its scan;
+    //   RIGHT JOIN: conditions on the left input alone filter it (left_filters).
+    // A FULL JOIN keeps every row of both inputs, so its ON stays whole.
     // An ON clause may only refer to tables up to and including its own.
-    std::vector<std::vector<ExprPtr>> on_conds(srcs.size());
-    for (size_t i = 0; i < stmt.from.size(); ++i) {
-        if (!stmt.from[i].left_join) continue;
+    std::vector<std::vector<ExprPtr>> on_conds(srcs.size()), left_filters(srcs.size());
+    for (size_t i = 1; i < stmt.from.size(); ++i) {
+        if (!stmt.from[i].on) continue;
+        JoinType jt = stmt.from[i].join;
         std::vector<Source> visible(srcs.begin(), srcs.begin() + static_cast<std::ptrdiff_t>(i) + 1);
         ExprPtr on = Canonicalize(stmt.from[i].on, visible);
         if (ContainsAggregate(*on)) throw DbError("aggregate functions are not allowed in JOIN conditions");
         for (auto& c : SplitConjuncts(on)) {
             std::set<int> tabs;
             ReferencedTables(*c, srcs, &tabs);
-            if (tabs == std::set<int>{static_cast<int>(i)})
+            if ((jt == JoinType::INNER || jt == JoinType::LEFT) && tabs == std::set<int>{static_cast<int>(i)})
                 per_table[i].push_back(c);
+            else if (jt == JoinType::RIGHT && i == 1 && tabs == std::set<int>{0})
+                per_table[0].push_back(c);  // the left input is just that table
+            else if (jt == JoinType::RIGHT && !tabs.count(static_cast<int>(i)))
+                left_filters[i].push_back(c);
             else
                 on_conds[i].push_back(c);
         }
@@ -546,27 +703,32 @@ ExecPtr Planner::PlanSelect(const SelectStmt& stmt) {
     // ---------- 6. join ordering + join algorithm ----------
     ExecPtr root;
     std::set<int> joined;
-    auto apply_ready_filters = [&](ExecPtr node) {
-        std::vector<ExprPtr> ready;
-        for (auto& p : pending) {
-            if (!p.used && IsSubset(p.tabs, joined)) {
-                ready.push_back(p.e);
-                p.used = true;
-            }
-        }
-        if (ready.empty()) return node;
-        double est = node->est_rows * SelectivityOf(ready), cost = node->est_cost;
-        ExprPtr pred = BindExpr(MakeConjunction(ready), node->OutSchema());
+    auto add_filter = [&](ExecPtr node, const std::vector<ExprPtr>& conds) {
+        if (conds.empty()) return node;
+        double est = node->est_rows * SelectivityOf(conds), cost = node->est_cost;
+        ExprPtr pred = BindExpr(MakeConjunction(conds), node->OutSchema());
         auto f = std::make_unique<FilterExecutor>(std::move(node), pred);
         f->est_rows = std::max(1.0, est);
         f->est_cost = cost;
         return ExecPtr(std::move(f));
     };
+    // Filters `node` (the tables in `joined`, after the join at FROM position
+    // `step`) by the pending WHERE conditions that can run there.
+    auto apply_ready_filters = [&](ExecPtr node, int step) {
+        std::vector<ExprPtr> ready;
+        for (auto& p : pending) {
+            if (!p.used && IsSubset(p.tabs, joined) && p.ready <= step) {
+                ready.push_back(p.e);
+                p.used = true;
+            }
+        }
+        return add_filter(std::move(node), ready);
+    };
 
     // Joins `left` (the tables in `joined`) with `right` (table `next`) on `conds`:
     // a hash join if there are equi-join keys, a nested loop join otherwise.
     auto make_join = [&](ExecPtr left, ExecPtr right, int next, const std::vector<ExprPtr>& conds,
-                         bool left_outer) -> ExecPtr {
+                         JoinType type) -> ExecPtr {
         // Split into equi-join keys (left_expr = right_expr) and residual predicates.
         std::vector<ExprPtr> lkeys, rkeys, residual;
         std::vector<std::string> cond_text;
@@ -600,13 +762,17 @@ ExecPtr Planner::PlanSelect(const SelectStmt& stmt) {
         ExecPtr join;
         double out_rows, cost;
         if (!lkeys.empty()) {
-            // Hash join; the smaller input becomes the build (hashed) side. For a
-            // LEFT JOIN the preserved left side must be the probe side.
+            // Hash join; the smaller input becomes the build (hashed) side. Either
+            // side of an outer join can be the preserved one: the executor's join
+            // type is relative to (probe, build), so it flips when `left` is built.
             out_rows = l_rows * r_rows / std::max(l_rows, r_rows) * SelectivityOf(residual);
             cost = l_cost + r_cost + (l_rows + r_rows) * HASH_TUPLE_COST;
             std::string text;
             for (size_t i = 0; i < cond_text.size(); ++i) text += (i ? " AND " : "") + cond_text[i];
-            bool build_left = !left_outer && l_rows < r_rows;
+            bool build_left = l_rows < r_rows;
+            JoinType hash_type = type;
+            if (build_left && type == JoinType::LEFT) hash_type = JoinType::RIGHT;
+            if (build_left && type == JoinType::RIGHT) hash_type = JoinType::LEFT;
             ExecPtr probe = build_left ? std::move(right) : std::move(left);
             ExecPtr build = build_left ? std::move(left) : std::move(right);
             std::vector<ExprPtr> pk, bk;
@@ -619,32 +785,31 @@ ExecPtr Planner::PlanSelect(const SelectStmt& stmt) {
             Schema combined = Schema::Concat(probe->OutSchema(), build->OutSchema());
             ExprPtr res = residual.empty() ? nullptr : BindExpr(MakeConjunction(residual), combined);
             join = std::make_unique<HashJoinExecutor>(std::move(probe), std::move(build), pk, bk, res, text,
-                                                      left_outer);
+                                                      hash_type);
         } else {
             out_rows = l_rows * r_rows * SelectivityOf(residual);
             cost = l_cost + l_rows * r_cost + l_rows * r_rows * CPU_TUPLE_COST;
             Schema combined = Schema::Concat(left->OutSchema(), right->OutSchema());
             ExprPtr pred = residual.empty() ? nullptr : BindExpr(MakeConjunction(residual), combined);
-            join = std::make_unique<NestedLoopJoinExecutor>(std::move(left), std::move(right), pred, left_outer);
+            join = std::make_unique<NestedLoopJoinExecutor>(std::move(left), std::move(right), pred, type);
         }
-        if (left_outer) out_rows = std::max(out_rows, l_rows);  // every left row survives
+        // Every row of a preserved side survives.
+        if (type == JoinType::LEFT || type == JoinType::FULL) out_rows = std::max(out_rows, l_rows);
+        if (type == JoinType::RIGHT || type == JoinType::FULL) out_rows = std::max(out_rows, r_rows);
         join->est_rows = std::max(1.0, out_rows);
         join->est_cost = cost;
         return join;
     };
 
-    // Predicates from WHERE / inner ON that can become join conditions once `next`
-    // is joined. Conditions on a nullable table never do: they must filter after
-    // the LEFT JOIN that pads it (apply_ready_filters takes care of them).
+    // WHERE conditions that can become conditions of the inner join adding `next`.
+    // Never those on a table an outer join pads at or after `next`: they must
+    // filter after that join (apply_ready_filters takes care of them).
     auto take_applicable = [&](int next) {
         std::set<int> with = joined;
         with.insert(next);
         std::vector<ExprPtr> applicable;
         for (auto& p : pending) {
-            if (p.used || !IsSubset(p.tabs, with)) continue;
-            bool touches_nullable = false;
-            for (int t : p.tabs) touches_nullable = touches_nullable || nullable[static_cast<size_t>(t)];
-            if (touches_nullable) continue;
+            if (p.used || !IsSubset(p.tabs, with) || p.ready >= next) continue;
             applicable.push_back(p.e);
             p.used = true;
         }
@@ -653,19 +818,24 @@ ExecPtr Planner::PlanSelect(const SelectStmt& stmt) {
 
     if (srcs.empty()) {
         root = std::make_unique<ValuesExecutor>();
-        root = apply_ready_filters(std::move(root));
-    } else if (has_left_join) {
+        root = apply_ready_filters(std::move(root), 0);
+    } else if (has_outer_join) {
         // Outer joins are not freely reorderable: join in the order written.
         root = std::move(base[0]);
         joined.insert(0);
-        root = apply_ready_filters(std::move(root));
+        root = apply_ready_filters(std::move(root), 0);
         for (size_t i = 1; i < srcs.size(); ++i) {
             int next = static_cast<int>(i);
-            bool left_outer = stmt.from[i].left_join;
-            std::vector<ExprPtr> conds = left_outer ? on_conds[i] : take_applicable(next);
-            root = make_join(std::move(root), std::move(base[i]), next, conds, left_outer);
+            JoinType jt = stmt.from[i].join;
+            std::vector<ExprPtr> conds = on_conds[i];
+            if (jt == JoinType::INNER) {
+                auto more = take_applicable(next);
+                conds.insert(conds.end(), more.begin(), more.end());
+            }
+            root = add_filter(std::move(root), left_filters[i]);
+            root = make_join(std::move(root), std::move(base[i]), next, conds, jt);
             joined.insert(next);
-            root = apply_ready_filters(std::move(root));
+            root = apply_ready_filters(std::move(root), next);
         }
     } else {
         int start = 0;
@@ -673,7 +843,7 @@ ExecPtr Planner::PlanSelect(const SelectStmt& stmt) {
             if (base[i]->est_rows < base[static_cast<size_t>(start)]->est_rows) start = static_cast<int>(i);
         root = std::move(base[static_cast<size_t>(start)]);
         joined.insert(start);
-        root = apply_ready_filters(std::move(root));
+        root = apply_ready_filters(std::move(root), 0);
 
         while (joined.size() < srcs.size()) {
             // Prefer a table connected to the current set by a join predicate.
@@ -694,9 +864,10 @@ ExecPtr Planner::PlanSelect(const SelectStmt& stmt) {
                 }
             }
             std::vector<ExprPtr> applicable = take_applicable(next);
-            root = make_join(std::move(root), std::move(base[static_cast<size_t>(next)]), next, applicable, false);
+            root = make_join(std::move(root), std::move(base[static_cast<size_t>(next)]), next, applicable,
+                             JoinType::INNER);
             joined.insert(next);
-            root = apply_ready_filters(std::move(root));
+            root = apply_ready_filters(std::move(root), next);
         }
     }
 

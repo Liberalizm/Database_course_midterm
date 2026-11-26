@@ -13,8 +13,25 @@ std::string Encode(const Value& v) {
     return s;
 }
 
+// A hashable encoding of index key values (for duplicates within one statement).
+std::string Encode(const Row& key) {
+    std::string s;
+    for (const Value& v : key) v.AppendKey(&s);
+    return s;
+}
+
 bool SameKey(const Value& a, const Value& b) {
     return a.IsNull() == b.IsNull() && (a.IsNull() || a.Compare(b) == 0);
+}
+
+bool SameKey(const Row& a, const Row& b) {
+    for (size_t i = 0; i < a.size(); ++i)
+        if (!SameKey(a[i], b[i])) return false;
+    return true;
+}
+
+bool HasNull(const Row& key) {
+    return std::any_of(key.begin(), key.end(), [](const Value& v) { return v.IsNull(); });
 }
 
 size_t ColumnOf(const TableInfo* t, const std::string& column) {
@@ -23,9 +40,8 @@ size_t ColumnOf(const TableInfo* t, const std::string& column) {
     return static_cast<size_t>(i);
 }
 
-[[noreturn]] void ThrowDuplicate(const IndexInfo* idx, const Value& key) {
-    throw DbError("duplicate key value violates unique constraint \"" + idx->name + "\": " + idx->column + "=" +
-                  key.ToString());
+[[noreturn]] void ThrowDuplicate(const IndexInfo* idx, const Row& key) {
+    throw DbError("duplicate key value violates unique constraint \"" + idx->name + "\": " + idx->Describe(key));
 }
 
 std::string SerializeChecked(const Schema& schema, const Row& row) {
@@ -102,7 +118,9 @@ std::vector<RID> WriteSet::ReferencingRows(const ForeignKey& fk, const Value& ke
     }
     std::vector<RID> out;
     if (lk.index) {
-        const int64_t k = lk.index->KeyOf(key);
+        // The column is the index's only or leading one, so its key is the tree key
+        // (key2, if any, can be anything: LowerBound starts below every key2).
+        const int64_t k = IndexKeyPart(key);
         for (auto it = lk.index->tree->LowerBound(k); it.Valid() && it.Entry().key == k; it.Next()) {
             RID rid = it.Entry().rid;
             if (lk.index->hashed && !SameKey(ReadRow(child, rid)[col], key)) continue;  // hash collision
@@ -198,20 +216,19 @@ void WriteSet::CheckUnique(TableChanges& tc) {
     auto touched = [&tc](RID r) { return tc.changed.count(r) > 0; };  // their old keys don't count
     for (IndexInfo* idx : catalog_->IndexesOf(tc.table->name)) {
         if (!idx->unique) continue;
-        const auto col = static_cast<size_t>(idx->col_idx);
-        std::unordered_set<std::string> seen;
+        std::unordered_set<std::string> seen;  // NULLs are distinct: a key with one is never a duplicate
         for (auto& [rid, ch] : tc.changed) {
             if (!ch.new_row) continue;
-            const Value& v = (*ch.new_row)[col];
-            if (v.IsNull()) continue;
-            if (!seen.insert(Encode(v)).second) ThrowDuplicate(idx, v);
-            if (SameKey(ch.old_row[col], v)) continue;  // keeps its own key
-            if (catalog_->KeyTaken(idx, v, touched)) ThrowDuplicate(idx, v);
+            const Row k = idx->KeyValues(*ch.new_row);
+            if (HasNull(k)) continue;
+            if (!seen.insert(Encode(k)).second) ThrowDuplicate(idx, k);
+            if (SameKey(idx->KeyValues(ch.old_row), k)) continue;  // keeps its own key
+            if (catalog_->KeyTaken(idx, k, touched)) ThrowDuplicate(idx, k);
         }
         for (const Insertion& in : tc.inserted) {
-            const Value& v = in.row[col];
-            if (v.IsNull()) continue;
-            if (!seen.insert(Encode(v)).second || catalog_->KeyTaken(idx, v, touched)) ThrowDuplicate(idx, v);
+            const Row k = idx->KeyValues(in.row);
+            if (HasNull(k)) continue;
+            if (!seen.insert(Encode(k)).second || catalog_->KeyTaken(idx, k, touched)) ThrowDuplicate(idx, k);
         }
     }
 }
@@ -299,23 +316,18 @@ void WriteSet::Write(TableChanges& tc) {
         ++t->row_count;
     }
     for (IndexInfo* idx : catalog_->IndexesOf(t->name)) {
-        const auto col = static_cast<size_t>(idx->col_idx);
-        auto entry_changes = [col](RID rid, const Change& ch) {
-            return !ch.new_row || ch.new_rid != rid || !SameKey(ch.old_row[col], (*ch.new_row)[col]);
+        auto entry_changes = [idx](RID rid, const Change& ch) {
+            return !ch.new_row || ch.new_rid != rid || !SameKey(idx->KeyValues(ch.old_row), idx->KeyValues(*ch.new_row));
         };
-        for (auto& [rid, ch] : tc.changed) {
-            const Value& ov = ch.old_row[col];
-            if (entry_changes(rid, ch) && !ov.IsNull()) idx->tree->Remove(idx->KeyOf(ov), rid);
-        }
-        for (auto& [rid, ch] : tc.changed) {
-            if (!ch.new_row) continue;
-            const Value& nv = (*ch.new_row)[col];
-            if (entry_changes(rid, ch) && !nv.IsNull()) idx->tree->Insert(idx->KeyOf(nv), ch.new_rid);
-        }
-        for (size_t i = 0; i < tc.inserted.size(); ++i) {
-            const Value& v = tc.inserted[i].row[col];
-            if (!v.IsNull()) idx->tree->Insert(idx->KeyOf(v), inserted[i]);
-        }
+        for (auto& [rid, ch] : tc.changed)
+            if (entry_changes(rid, ch) && idx->Indexes(ch.old_row))
+                idx->tree->Remove(idx->EntryFor(idx->KeyValues(ch.old_row), rid));
+        for (auto& [rid, ch] : tc.changed)
+            if (ch.new_row && entry_changes(rid, ch) && idx->Indexes(*ch.new_row))
+                idx->tree->Insert(idx->EntryFor(idx->KeyValues(*ch.new_row), ch.new_rid));
+        for (size_t i = 0; i < tc.inserted.size(); ++i)
+            if (idx->Indexes(tc.inserted[i].row))
+                idx->tree->Insert(idx->EntryFor(idx->KeyValues(tc.inserted[i].row), inserted[i]));
     }
 }
 

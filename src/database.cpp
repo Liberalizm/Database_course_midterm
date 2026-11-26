@@ -56,6 +56,8 @@ QueryResult Database::Run(const Statement& stmt) {
             r = RunUpdate(*s6);
         else if (auto* s7 = std::get_if<AlterTableStmt>(&stmt))
             r = RunAlterTable(*s7);
+        else if (auto* s8 = std::get_if<CreateViewStmt>(&stmt))
+            r = RunCreateView(*s8);
     } catch (...) {
         Checkpoint();  // keep catalog statistics consistent with whatever was written
         throw;
@@ -84,7 +86,10 @@ std::optional<Value> Database::EvalDefault(const ColumnDef& d) {
 
 QueryResult Database::RunCreateTable(const CreateTableStmt& s) {
     std::vector<Column> cols;
-    std::string pk;
+    // The primary key (from a column or the table constraint) and the UNIQUE
+    // constraints, each a list of columns. Each becomes a unique index.
+    std::vector<std::string> pk = s.primary_key;
+    std::vector<std::vector<std::string>> unique_keys;
     for (const auto& d : s.cols) {
         Column c{};
         c.name = d.name;
@@ -94,21 +99,39 @@ QueryResult Database::RunCreateTable(const CreateTableStmt& s) {
         cols.push_back(c);
         if (d.primary_key) {
             if (!pk.empty()) throw DbError("multiple primary keys for table \"" + s.name + "\" are not allowed");
-            pk = d.name;
+            pk = {d.name};
         }
-        if ((d.primary_key || d.unique) && d.type != TypeId::INT && d.type != TypeId::TEXT)
-            throw DbError("PRIMARY KEY / UNIQUE is only supported on INT and TEXT columns");
+        if (d.unique) unique_keys.push_back({d.name});
     }
+    unique_keys.insert(unique_keys.end(), s.unique_keys.begin(), s.unique_keys.end());
+
+    auto check_types = [&](const std::vector<std::string>& key) {
+        for (const auto& name : key)
+            for (const auto& d : s.cols)
+                if (d.name == name && d.type != TypeId::INT && d.type != TypeId::TEXT)
+                    throw DbError("PRIMARY KEY / UNIQUE is only supported on INT and TEXT columns");
+    };
+    check_types(pk);
+    for (const auto& key : unique_keys) check_types(key);
+
+    // Index names as in PostgreSQL: t_pkey, t_a_key, t_a_b_key. A UNIQUE constraint
+    // on exactly the same columns as the primary key or an earlier one adds nothing.
+    std::vector<std::pair<std::string, std::vector<std::string>>> indexes;
+    if (!pk.empty()) indexes.emplace_back(s.name + "_pkey", pk);
+    for (const auto& key : unique_keys) {
+        bool redundant = false;
+        for (const auto& [n, cols_of] : indexes) redundant = redundant || cols_of == key;
+        if (redundant) continue;
+        std::string name = s.name;
+        for (const auto& c : key) name += "_" + c;
+        indexes.emplace_back(name + "_key", key);
+    }
+
     catalog_->CreateTable(s.name, cols);
     // Indexes and foreign keys need the table to exist (a foreign key may refer
     // to the table itself), so a failure here takes the new table back out.
     try {
-        for (const auto& d : s.cols) {
-            if (d.primary_key)
-                catalog_->CreateIndex(s.name + "_pkey", s.name, d.name, true);
-            else if (d.unique)
-                catalog_->CreateIndex(s.name + "_" + d.name + "_key", s.name, d.name, true);
-        }
+        for (const auto& [name, key] : indexes) catalog_->CreateIndex(name, s.name, key, true);
         for (const auto& d : s.cols) {
             if (!d.references) continue;
             ForeignKey fk = *d.references;
@@ -133,7 +156,7 @@ void Database::AddForeignKey(const std::string& table, ForeignKey fk) {
 }
 
 QueryResult Database::RunCreateIndex(const CreateIndexStmt& s) {
-    catalog_->CreateIndex(s.name, s.table, s.column, s.unique);
+    catalog_->CreateIndex(s.name, s.table, s.columns, s.unique);
     return {{}, {}, "CREATE INDEX"};
 }
 
@@ -236,10 +259,27 @@ QueryResult Database::RunAlterTable(const AlterTableStmt& s) {
     return {{}, {}, "ALTER TABLE"};
 }
 
+QueryResult Database::RunCreateView(const CreateViewStmt& s) {
+    // Plan (without running) the query once, so a view that could never work is
+    // rejected now: unknown tables or columns, a wrong number of column names,
+    // duplicate column names, or (with OR REPLACE) a view that would read itself.
+    // A name clash is reported first, before any error in the query.
+    if (catalog_->GetTable(s.name)) throw DbError("a table named \"" + s.name + "\" already exists");
+    if (!s.or_replace && catalog_->GetView(s.name)) throw DbError("view \"" + s.name + "\" already exists");
+    Schema out;
+    planner_->PlanView(s.name, s.columns, *s.select, &out);
+    catalog_->CreateView(s.name, s.columns, s.sql, s.or_replace);
+    return {{}, {}, "CREATE VIEW"};
+}
+
 QueryResult Database::RunDrop(const DropStmt& s) {
     if (s.index) {
         catalog_->DropIndex(s.name);
         return {{}, {}, "DROP INDEX"};
+    }
+    if (s.view) {
+        catalog_->DropView(s.name);
+        return {{}, {}, "DROP VIEW"};
     }
     catalog_->DropTable(s.name);
     return {{}, {}, "DROP TABLE"};
@@ -278,7 +318,7 @@ QueryResult Database::RunInsert(const InsertStmt& s) {
         Schema empty;
         for (const auto& exprs : s.rows) {
             Row r;
-            for (const auto& e : exprs) r.push_back(Evaluate(*BindExpr(planner_->ResolveSubqueries(e), empty), {}));
+            for (const auto& e : exprs) r.push_back(Evaluate(*BindExpr(planner_->ResolveSubqueries(e, t), empty), {}));
             source.push_back(std::move(r));
         }
     }
@@ -356,7 +396,7 @@ QueryResult Database::RunUpdate(const UpdateStmt& s) {
             if (prev.first == static_cast<size_t>(idx))
                 throw DbError("multiple assignments to same column \"" + col + "\"");
         if (ContainsAggregate(*e)) throw DbError("aggregate functions are not allowed in UPDATE");
-        sets.emplace_back(static_cast<size_t>(idx), BindExpr(planner_->ResolveSubqueries(e), schema));
+        sets.emplace_back(static_cast<size_t>(idx), planner_->PlanRowExpr(t, e));  // may be correlated
     }
 
     auto scan = planner_->PlanTableScan(t, s.where);
@@ -385,14 +425,25 @@ QueryResult Database::Populate(const std::string& table, int64_t n, uint32_t see
                                   "india", "juliet", "kilo", "lima", "mike", "november", "oscar", "papa"};
 
     // Columns with a unique index (and the first INT column) get sequential ids;
-    // unique TEXT columns get "<column>_<n>", skipping values that are taken.
+    // unique TEXT columns get "<column>_<n>", skipping values that are taken. A
+    // multi-column unique index needs just one sequential column (preferably an
+    // INT one: it starts above every existing value, so no key can be taken).
     std::vector<bool> sequential(schema.Size(), false);
     std::vector<IndexInfo*> unique_idx(schema.Size(), nullptr);
-    for (IndexInfo* idx : catalog_->IndexesOf(table))
-        if (idx->unique) {
-            sequential[static_cast<size_t>(idx->col_idx)] = true;
-            unique_idx[static_cast<size_t>(idx->col_idx)] = idx;
+    for (IndexInfo* idx : catalog_->IndexesOf(table)) {
+        if (!idx->unique) continue;
+        auto col = static_cast<size_t>(idx->col_idxs[0]);
+        if (idx->Composite()) {
+            for (int c : idx->col_idxs)
+                if (schema.At(static_cast<size_t>(c)).type == TypeId::INT) {
+                    col = static_cast<size_t>(c);
+                    break;
+                }
+        } else {
+            unique_idx[col] = idx;
         }
+        sequential[col] = true;
+    }
     if (!schema.Columns().empty() && schema.At(0).type == TypeId::INT) sequential[0] = true;
     // Foreign key columns (unless unique) get keys picked from the referenced
     // table as it is now, or NULL if it is empty.
@@ -448,7 +499,7 @@ QueryResult Database::Populate(const std::string& table, int64_t n, uint32_t see
                         Value v;
                         do {
                             v = Value::Text(schema.At(i).name + "_" + std::to_string(next_id[i]++));
-                        } while (catalog_->KeyTaken(unique_idx[i], v));
+                        } while (unique_idx[i] && catalog_->KeyTaken(unique_idx[i], v));
                         r.push_back(std::move(v));
                     } else {
                         r.push_back(Value::Text(std::string(words[rng() % 16]) + "_" + std::to_string(rng() % 1000)));

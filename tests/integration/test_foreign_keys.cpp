@@ -45,7 +45,7 @@ protected:
     void ExpectIndexesConsistent(const std::string& table) {
         TableInfo* t = db->GetCatalog().RequireTable(table);
         for (IndexInfo* idx : db->GetCatalog().IndexesOf(table)) {
-            int64_t non_null = Scalar("SELECT COUNT(" + idx->column + ") FROM " + table);
+            int64_t non_null = Scalar("SELECT COUNT(" + idx->columns[0] + ") FROM " + table);
             EXPECT_EQ(static_cast<int64_t>(idx->tree->CheckAndCount()), non_null) << idx->name;
         }
         EXPECT_EQ(t->row_count, Scalar("SELECT COUNT(*) FROM " + table)) << "row_count statistic drifted";
@@ -445,6 +445,43 @@ TEST_F(ForeignKeyTest, RandomizedStatementsKeepEveryInvariant) {
     EXPECT_GT(cascades, 10);  // deletes in p really did reach into c
     for (const char* t : {"p", "c", "g"}) EXPECT_GT(Scalar(std::string("SELECT COUNT(*) FROM ") + t), 0) << t;
     for (const char* t : {"p", "c", "g"}) ExpectIndexesConsistent(t);
+}
+
+// ---- foreign keys together with composite keys ----
+
+TEST_F(ForeignKeyTest, CannotReferenceACompositeKey) {
+    Exec("CREATE TABLE p (a INT, b INT, PRIMARY KEY (a, b), UNIQUE (a, b))");
+    EXPECT_NE(Err("CREATE TABLE c (x INT REFERENCES p)").find("must reference a single column"), std::string::npos);
+    EXPECT_NE(Err("CREATE TABLE c (x INT REFERENCES p (a))").find("no unique constraint on column \"a\""),
+              std::string::npos)
+        << "a is only unique together with b";
+    EXPECT_EQ(db->GetCatalog().GetTable("c"), nullptr);
+    Exec("CREATE UNIQUE INDEX p_a ON p (a)");
+    Exec("CREATE TABLE c (x INT REFERENCES p (a))");
+    EXPECT_NE(Err("DROP INDEX p_a").find("requires it"), std::string::npos);
+    Exec("DROP INDEX p_pkey");  // a multi-column index: no foreign key depends on it
+}
+
+TEST_F(ForeignKeyTest, ActionsFindChildrenThroughACompositeIndex) {
+    // The referencing column leads the child's composite primary key, so the
+    // actions find the children by that index (and enforce it as they go).
+    Exec("CREATE TABLE ord (id INT PRIMARY KEY);"
+         "CREATE TABLE line (ord_id INT REFERENCES ord ON DELETE CASCADE ON UPDATE CASCADE, n INT, item TEXT,"
+         "                   PRIMARY KEY (ord_id, n));"
+         "INSERT INTO ord VALUES (1), (2), (3);"
+         "INSERT INTO line VALUES (1, 1, 'a'), (1, 2, 'b'), (2, 1, 'c'), (3, 1, 'd'), (3, 2, 'e')");
+    ASSERT_TRUE(db->GetCatalog().IndexOn("line", "ord_id")->Composite());
+    Exec("UPDATE ord SET id = 10 WHERE id = 1");
+    EXPECT_EQ(Col("SELECT item FROM line WHERE ord_id = 10 ORDER BY n"), "a,b");
+    Exec("DELETE FROM ord WHERE id = 3");
+    EXPECT_EQ(Col("SELECT item FROM line ORDER BY item"), "a,b,c");
+    // Moving order 2 onto order 10 would give line (10, 1) twice.
+    Exec("DELETE FROM ord WHERE id = 10; INSERT INTO ord VALUES (10); INSERT INTO line VALUES (10, 1, 'x')");
+    EXPECT_NE(Err("UPDATE ord SET id = 99 WHERE id = 2; UPDATE line SET ord_id = 10 WHERE ord_id = 99")
+                  .find("duplicate key value violates unique constraint \"line_pkey\": (ord_id, n)=(10, 1)"),
+              std::string::npos);
+    ExpectNoOrphans("line", "ord_id", "ord", "id");
+    for (const char* t : {"ord", "line"}) ExpectIndexesConsistent(t);
 }
 
 }  // namespace
