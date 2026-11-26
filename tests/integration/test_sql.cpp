@@ -715,6 +715,125 @@ TEST_F(SqlTest, ColumnsMayBeTargetedOnlyOnce) {
     EXPECT_EQ(rows[0][1].AsInt(), 2);
 }
 
+// The error message of a statement that must fail.
+std::string ErrorOf(Database& db, const std::string& sql) {
+    try {
+        db.Execute(sql);
+    } catch (const DbError& e) {
+        return e.what();
+    }
+    ADD_FAILURE() << "no error from: " << sql;
+    return "";
+}
+
+TEST_F(SqlTest, ViewsBehaveLikeTheirQuery) {
+    SeedCompany();
+    EXPECT_EQ(Msg("CREATE VIEW well_paid AS SELECT id, name, dept_id FROM emp WHERE salary >= 70"), "CREATE VIEW");
+    EXPECT_EQ(Q("SELECT name FROM well_paid ORDER BY name").size(), 3u);
+    // Columns qualified by the view name or an alias, joins, aggregates over a view.
+    auto rows = Q("SELECT d.name, COUNT(*) FROM well_paid w JOIN dept d ON d.id = w.dept_id "
+                  "GROUP BY d.name ORDER BY d.name");
+    ASSERT_EQ(rows.size(), 2u);
+    EXPECT_EQ(rows[0][0].AsText(), "eng");
+    EXPECT_EQ(rows[0][1].AsInt(), 2);
+    EXPECT_EQ(rows[1][1].AsInt(), 1);
+    EXPECT_EQ(Scalar("SELECT COUNT(*) FROM well_paid WHERE well_paid.dept_id = 1"), 2);
+    // The same view twice in one query, and in a subquery.
+    EXPECT_EQ(Scalar("SELECT COUNT(*) FROM well_paid a, well_paid b WHERE a.id < b.id"), 3);
+    EXPECT_EQ(Scalar("SELECT COUNT(*) FROM emp WHERE id NOT IN (SELECT id FROM well_paid)"), 2);
+    EXPECT_EQ(Scalar("SELECT COUNT(*) FROM emp e WHERE EXISTS (SELECT 1 FROM well_paid w WHERE w.id = e.id)"), 3);
+
+    // A view reads the data as it is when queried, not when it was created.
+    db->Execute("INSERT INTO emp VALUES (6, 'fay', 2, 90.0)");
+    EXPECT_EQ(Scalar("SELECT COUNT(*) FROM well_paid"), 4);
+
+    // Views as the source of writes into tables.
+    db->Execute("CREATE TABLE archive (id INT, name TEXT)");
+    EXPECT_EQ(Msg("INSERT INTO archive SELECT id, name FROM well_paid"), "INSERT 4");
+    EXPECT_EQ(Msg("DELETE FROM emp WHERE id IN (SELECT id FROM well_paid WHERE dept_id = 2)"), "DELETE 2");
+    EXPECT_EQ(Scalar("SELECT COUNT(*) FROM well_paid"), 2);
+}
+
+TEST_F(SqlTest, ViewsWithColumnNamesSetOperationsAndNesting) {
+    SeedCompany();
+    db->Execute("CREATE VIEW dept_pay (dept, staff, total) AS "
+                "SELECT dept_id, COUNT(*), SUM(salary) FROM emp WHERE dept_id IS NOT NULL GROUP BY dept_id");
+    auto r = db->Execute("SELECT * FROM dept_pay ORDER BY dept").back();
+    EXPECT_EQ(r.columns, (std::vector<std::string>{"dept", "staff", "total"}));
+    ASSERT_EQ(r.rows.size(), 2u);
+    EXPECT_DOUBLE_EQ(r.rows[0][2].AsDouble(), 180.0);
+
+    // A view over a view, with ORDER BY / LIMIT inside.
+    db->Execute("CREATE VIEW top_dept AS SELECT dept FROM dept_pay ORDER BY total DESC LIMIT 1");
+    EXPECT_EQ(Scalar("SELECT dept FROM top_dept"), 1);
+    EXPECT_EQ(Q("SELECT name FROM dept WHERE id = (SELECT dept FROM top_dept)")[0][0].AsText(), "eng");
+
+    // Set operations and correlated subqueries inside a view.
+    db->Execute("CREATE VIEW all_names AS SELECT name FROM emp UNION SELECT name FROM dept");
+    EXPECT_EQ(Scalar("SELECT COUNT(*) FROM all_names"), 8);
+    db->Execute("CREATE VIEW best AS SELECT name FROM emp e "
+                "WHERE salary = (SELECT MAX(salary) FROM emp x WHERE x.dept_id = e.dept_id)");
+    auto best = Q("SELECT name FROM best ORDER BY name");
+    ASSERT_EQ(best.size(), 2u);
+    EXPECT_EQ(best[0][0].AsText(), "ann");
+    EXPECT_EQ(best[1][0].AsText(), "dan");
+
+    // OR REPLACE redefines a view; views that use it see the new definition.
+    db->Execute("CREATE OR REPLACE VIEW dept_pay (dept, staff, total) AS "
+                "SELECT dept_id, COUNT(*), SUM(salary) FROM emp WHERE dept_id = 2 GROUP BY dept_id");
+    EXPECT_EQ(Scalar("SELECT dept FROM top_dept"), 2);
+    EXPECT_EQ(Msg("DROP VIEW top_dept"), "DROP VIEW");
+    EXPECT_THROW(db->Execute("SELECT * FROM top_dept"), DbError);
+}
+
+TEST_F(SqlTest, InvalidViewsAreRejectedWhenCreated) {
+    SeedCompany();
+    db->Execute("CREATE VIEW v AS SELECT id FROM emp");
+    EXPECT_NE(ErrorOf(*db, "CREATE VIEW w AS SELECT * FROM nope").find("\"nope\" does not exist"), std::string::npos);
+    EXPECT_THROW(db->Execute("CREATE VIEW w AS SELECT nope FROM emp"), DbError);
+    EXPECT_NE(ErrorOf(*db, "CREATE VIEW w (a) AS SELECT id, name FROM emp").find("names 1 columns"), std::string::npos);
+    EXPECT_NE(ErrorOf(*db, "CREATE VIEW w AS SELECT e.id, d.id FROM emp e, dept d").find("more than one column"),
+              std::string::npos);
+    EXPECT_NE(ErrorOf(*db, "CREATE VIEW v AS SELECT 1").find("already exists"), std::string::npos);
+    EXPECT_NE(ErrorOf(*db, "CREATE VIEW emp AS SELECT 1").find("already exists"), std::string::npos);
+    // A view can never come to read itself, directly or through other views.
+    EXPECT_NE(ErrorOf(*db, "CREATE OR REPLACE VIEW v AS SELECT id FROM v").find("refers to itself"), std::string::npos);
+    db->Execute("CREATE VIEW w AS SELECT id FROM v");
+    EXPECT_NE(ErrorOf(*db, "CREATE OR REPLACE VIEW v AS SELECT id FROM w").find("refers to itself"), std::string::npos);
+    EXPECT_EQ(Scalar("SELECT COUNT(*) FROM w"), 5) << "the failed statements changed nothing";
+    EXPECT_EQ(db->GetCatalog().Views().size(), 2u);
+}
+
+TEST_F(SqlTest, ViewsAreReadOnly) {
+    SeedCompany();
+    db->Execute("CREATE VIEW v AS SELECT id, name FROM emp");
+    for (const char* sql : {"INSERT INTO v VALUES (9, 'x')", "UPDATE v SET name = 'x'", "DELETE FROM v",
+                            "ALTER TABLE v ADD COLUMN c INT", "CREATE INDEX v_id ON v (id)", "DROP TABLE v"})
+        EXPECT_NE(ErrorOf(*db, sql).find("\"v\" is a view, not a table"), std::string::npos) << sql;
+    EXPECT_NE(ErrorOf(*db, "DROP VIEW emp").find("is a table, not a view"), std::string::npos);
+    EXPECT_EQ(Scalar("SELECT COUNT(*) FROM v"), 5);
+}
+
+TEST_F(SqlTest, ViewsSeeSchemaChangesWhenQueried) {
+    SeedCompany();
+    db->Execute("CREATE VIEW v AS SELECT * FROM dept");
+    db->Execute("CREATE VIEW paid AS SELECT name FROM emp WHERE salary > 60");
+    db->Execute("ALTER TABLE dept ADD COLUMN budget INT DEFAULT 5");
+    EXPECT_EQ(db->Execute("SELECT * FROM v").back().columns.size(), 3u) << "* is expanded when the view is used";
+
+    db->Execute("CREATE TABLE other (salary INT); INSERT INTO other VALUES (1)");
+    db->Execute("ALTER TABLE emp DROP COLUMN salary");
+    EXPECT_NE(ErrorOf(*db, "SELECT * FROM paid").find("view \"paid\": column \"salary\" does not exist"),
+              std::string::npos);
+    // Inside a subquery the view still must not pick up the outer query's column of that name.
+    EXPECT_THROW(db->Execute("SELECT * FROM other WHERE EXISTS (SELECT 1 FROM paid)"), DbError);
+
+    db->Execute("DROP TABLE dept");
+    EXPECT_NE(ErrorOf(*db, "SELECT * FROM v").find("view \"v\": table \"dept\" does not exist"), std::string::npos);
+    db->Execute("CREATE TABLE dept (id INT)");
+    EXPECT_EQ(db->Execute("SELECT * FROM v").back().columns.size(), 1u) << "late binding: the new table is used";
+}
+
 TEST_F(SqlTest, ErrorsDoNotBreakTheSession) {
     SeedCompany();
     EXPECT_THROW(db->Execute("SELEC 1"), DbError);

@@ -113,16 +113,25 @@ std::vector<Token> Tokenize(const std::string& sql) {
                 ++i;
             }
         }
+        t.end = i;
         out.push_back(std::move(t));
     }
     Token end;
     end.type = TokenType::END;
-    end.pos = n;
+    end.pos = end.end = n;
     out.push_back(end);
     return out;
 }
 
-Parser::Parser(const std::string& sql) : toks_(Tokenize(sql)) {}
+Parser::Parser(const std::string& sql) : sql_(sql), toks_(Tokenize(sql)) {}
+
+SelectStmt Parser::ParseQuery(const std::string& sql) {
+    Parser p(sql);
+    if (!p.CheckKw("select")) p.Error("expected SELECT");
+    SelectStmt s = p.ParseSelect();
+    if (p.Peek().type != TokenType::END) p.Error("unexpected text after the query");
+    return s;
+}
 
 const Token& Parser::Peek(size_t k) const {
     size_t i = std::min(pos_ + k, toks_.size() - 1);
@@ -195,19 +204,26 @@ std::vector<Statement> Parser::ParseAll() {
 
 Statement Parser::ParseStatement() {
     if (AcceptKw("create")) {
+        // VIEW and REPLACE are matched in context only (not reserved words).
+        if (AcceptKw("or")) {
+            ExpectKw("replace");
+            ExpectKw("view");
+            return ParseCreateView(true);
+        }
+        if (AcceptKw("view")) return ParseCreateView(false);
         bool unique = AcceptKw("unique");
         if (!unique && AcceptKw("table")) return ParseCreateTable();
-        ExpectKw("index");
+        if (!AcceptKw("index")) Error(unique ? "expected INDEX" : "expected TABLE, INDEX or VIEW");
         return ParseCreateIndex(unique);
     }
     if (AcceptKw("drop")) {
         DropStmt d;
-        if (AcceptKw("table")) {
-            d.index = false;
-        } else {
-            ExpectKw("index");
+        if (AcceptKw("index"))
             d.index = true;
-        }
+        else if (AcceptKw("view"))
+            d.view = true;
+        else if (!AcceptKw("table"))
+            Error("expected TABLE, INDEX or VIEW");
         d.name = ExpectIdent();
         return d;
     }
@@ -338,6 +354,26 @@ CreateTableStmt Parser::ParseCreateTable() {
         if (!found) throw DbError("primary key column \"" + table_pk + "\" does not exist");
     }
     return c;
+}
+
+// After CREATE [OR REPLACE] VIEW:  name [(col, ...)] AS SELECT ...
+CreateViewStmt Parser::ParseCreateView(bool or_replace) {
+    CreateViewStmt v;
+    v.or_replace = or_replace;
+    v.name = ExpectIdent();
+    if (AcceptSym("(")) {
+        do {
+            v.columns.push_back(ExpectIdent());
+        } while (AcceptSym(","));
+        ExpectSym(")");
+    }
+    ExpectKw("as");
+    if (!CheckKw("select")) Error("expected SELECT");
+    size_t start = Peek().pos;
+    v.select = std::make_shared<SelectStmt>(ParseSelect());
+    // The query's own text, from SELECT to its last token (comments in between are kept).
+    v.sql = sql_.substr(start, toks_[pos_ - 1].end - start);
+    return v;
 }
 
 CreateIndexStmt Parser::ParseCreateIndex(bool unique) {

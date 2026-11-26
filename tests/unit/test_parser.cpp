@@ -392,5 +392,49 @@ TEST(Parser, LargeInListIsABalancedTree) {
     EXPECT_LE(ParseExpr("x NOT IN (" + list + ")")->height, 21);
 }
 
+TEST(Parser, CreateView) {
+    auto v = ParseOne<CreateViewStmt>("create view v as select a, 'x;y' from t where a > 1");
+    EXPECT_EQ(v.name, "v");
+    EXPECT_FALSE(v.or_replace);
+    EXPECT_TRUE(v.columns.empty());
+    ASSERT_NE(v.select, nullptr);
+    EXPECT_EQ(v.select->from.at(0).name, "t");
+    EXPECT_EQ(v.sql, "select a, 'x;y' from t where a > 1") << "the query's text exactly as written";
+
+    auto r = ParseOne<CreateViewStmt>("CREATE OR REPLACE VIEW \"V\" (x, y) AS\n  SELECT 1, 2 UNION SELECT 3, 4 -- note\n");
+    EXPECT_TRUE(r.or_replace);
+    EXPECT_EQ(r.name, "V");
+    EXPECT_EQ(r.columns, (std::vector<std::string>{"x", "y"}));
+    ASSERT_NE(r.select->set_lhs, nullptr);
+    EXPECT_EQ(r.sql, "SELECT 1, 2 UNION SELECT 3, 4") << "a trailing comment is not part of the query";
+
+    // The stored text parses back into the same query.
+    SelectStmt again = Parser::ParseQuery(r.sql);
+    EXPECT_NE(again.set_lhs, nullptr);
+    EXPECT_THROW(Parser::ParseQuery("SELECT 1; SELECT 2"), DbError);
+    EXPECT_THROW(Parser::ParseQuery("DELETE FROM t"), DbError);
+
+    // "view" and "replace" are not reserved: they still work as names.
+    auto t = ParseOne<CreateTableStmt>("CREATE TABLE view (replace INT)");
+    EXPECT_EQ(t.name, "view");
+    EXPECT_EQ(t.cols.at(0).name, "replace");
+}
+
+TEST(Parser, CreateViewSyntaxErrors) {
+    for (const char* sql : {"CREATE VIEW v SELECT 1", "CREATE VIEW v AS DELETE FROM t", "CREATE VIEW AS SELECT 1",
+                            "CREATE VIEW v () AS SELECT 1", "CREATE OR VIEW v AS SELECT 1",
+                            "CREATE OR REPLACE TABLE t (a INT)", "CREATE UNIQUE VIEW v AS SELECT 1"})
+        EXPECT_THROW(Parser(sql).ParseAll(), DbError) << sql;
+}
+
+TEST(Parser, DropView) {
+    auto d = ParseOne<DropStmt>("DROP VIEW v");
+    EXPECT_TRUE(d.view);
+    EXPECT_FALSE(d.index);
+    EXPECT_EQ(d.name, "v");
+    EXPECT_FALSE(ParseOne<DropStmt>("DROP TABLE t").view);
+    EXPECT_THROW(Parser("DROP SEQUENCE s").ParseAll(), DbError);
+}
+
 }  // namespace
 }  // namespace minidb

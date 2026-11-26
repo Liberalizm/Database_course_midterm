@@ -6,6 +6,8 @@
 #include <functional>
 #include <map>
 
+#include "parser.h"
+
 namespace minidb {
 
 namespace {
@@ -422,6 +424,43 @@ ExecPtr Planner::PlanSetOp(const SelectStmt& stmt) {
     return root;
 }
 
+ExecPtr Planner::PlanView(const std::string& name, const std::vector<std::string>& columns, const SelectStmt& query,
+                          Schema* out) {
+    if (std::find(view_stack_.begin(), view_stack_.end(), name) != view_stack_.end())
+        throw DbError("view \"" + name + "\" refers to itself");
+    if (view_stack_.size() >= kMaxViewDepth)
+        throw DbError("views are nested more than " + std::to_string(kMaxViewDepth) + " levels deep");
+    // The view's query is planned as a query of its own: outer scopes are hidden,
+    // so a column it no longer finds (after ALTER TABLE) is an error instead of
+    // silently turning into a reference to the query that uses the view.
+    struct Restore {
+        Planner* p;
+        std::vector<Scope*> scopes;
+        ~Restore() {
+            p->scopes_ = std::move(scopes);
+            p->view_stack_.pop_back();
+        }
+    } restore{this, std::move(scopes_)};
+    scopes_.clear();
+    view_stack_.push_back(name);
+
+    ExecPtr plan = PlanSelect(query);
+    std::vector<Column> cols = plan->OutSchema().Columns();
+    if (!columns.empty()) {
+        if (columns.size() != cols.size())
+            throw DbError("view \"" + name + "\" names " + std::to_string(columns.size()) +
+                          " columns but its query returns " + std::to_string(cols.size()));
+        for (size_t i = 0; i < cols.size(); ++i) cols[i].name = columns[i];
+    }
+    for (size_t i = 0; i < cols.size(); ++i)
+        for (size_t j = 0; j < i; ++j)
+            if (cols[i].name == cols[j].name)
+                throw DbError("view \"" + name + "\" has more than one column named \"" + cols[i].name +
+                              "\" (give them different aliases)");
+    *out = Schema(std::move(cols));
+    return plan;
+}
+
 ExecPtr Planner::PlanSelect(const SelectStmt& stmt) {
     if (stmt.set_lhs) return PlanSetOp(stmt);
     // ---------- 1. resolve FROM ----------
@@ -441,6 +480,20 @@ ExecPtr Planner::PlanSelect(const SelectStmt& stmt) {
                     if (out.At(i).name == out.At(j).name)
                         throw DbError("subquery \"" + alias + "\" has more than one column named \"" + out.At(i).name +
                                       "\" (give them different aliases)");
+            srcs.push_back({nullptr, alias, out.WithQualifier(alias)});
+            derived.push_back(std::move(plan));
+            continue;
+        }
+        if (const ViewInfo* v = catalog_->GetView(ref.name)) {
+            // A view is expanded into a derived table: its stored query is parsed
+            // and planned again here, so it sees the tables as they are now.
+            Schema out;
+            ExecPtr plan;
+            try {
+                plan = PlanView(v->name, v->columns, Parser::ParseQuery(v->sql), &out);
+            } catch (const DbError& e) {
+                throw DbError("view \"" + v->name + "\": " + e.what());
+            }
             srcs.push_back({nullptr, alias, out.WithQualifier(alias)});
             derived.push_back(std::move(plan));
             continue;

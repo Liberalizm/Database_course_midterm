@@ -35,7 +35,7 @@ SQL summary and the meta commands (`.tables`, `.schema t`, `.indexes`,
 | Area | Supported |
 |---|---|
 | Types | `INT` (64-bit), `DOUBLE`, `TEXT`, `BOOL`, `NULL` |
-| DDL | `CREATE TABLE` with `PRIMARY KEY`, `UNIQUE`, `NOT NULL`, `DEFAULT`; `CREATE [UNIQUE] INDEX`; `DROP TABLE / INDEX`; `ALTER TABLE ADD / DROP / RENAME [COLUMN]`, `RENAME TO` |
+| DDL | `CREATE TABLE` with `PRIMARY KEY`, `UNIQUE`, `NOT NULL`, `DEFAULT`; `CREATE [UNIQUE] INDEX`; `CREATE [OR REPLACE] VIEW v [(cols)] AS SELECT ...`; `DROP TABLE / INDEX / VIEW`; `ALTER TABLE ADD / DROP / RENAME [COLUMN]`, `RENAME TO` |
 | DML | `INSERT ... VALUES / SELECT`, `UPDATE`, `DELETE` — each statement is atomic |
 | Queries | `SELECT [DISTINCT]`, `WHERE`, `[INNER] JOIN`, `LEFT [OUTER] JOIN`, `CROSS JOIN` / comma joins, `GROUP BY`, `HAVING`, `ORDER BY` (names, aliases, positions), `LIMIT` / `OFFSET` |
 | Set operations | `UNION`, `INTERSECT`, `EXCEPT`, each with or without `ALL` |
@@ -65,6 +65,17 @@ SELECT id FROM dept EXCEPT SELECT dept_id FROM emp;
 -- Schema changes
 ALTER TABLE emp ADD COLUMN email TEXT UNIQUE;
 ALTER TABLE emp RENAME COLUMN salary TO pay;
+```
+
+Views (see [`tests/e2e/views`](tests/e2e/views/1.sql)) are stored queries
+that can be used wherever a table can be read:
+
+```sql
+CREATE VIEW staff AS
+  SELECT e.name, d.name AS dept, e.salary FROM emp e LEFT JOIN dept d ON d.id = e.dept_id;
+CREATE VIEW payroll (dept, people, total) AS
+  SELECT dept, COUNT(*), SUM(salary) FROM staff GROUP BY dept;
+SELECT * FROM payroll WHERE total > 60;
 ```
 
 ## Architecture
@@ -111,6 +122,15 @@ written. Uncorrelated subqueries are executed once during planning and
 replaced by their result; a correlated one keeps its plan and is re-run for
 every outer row, with the outer values passed in as parameters.
 
+**Views.** The catalog stores a view's query as text. Every statement that
+reads the view parses and plans that text again and uses the plan like a
+subquery in `FROM`, so the view always shows the current rows and the current
+tables (a `SELECT *` view picks up new columns). `CREATE VIEW` plans the query
+once to reject a view that could never work: unknown tables or columns,
+duplicate column names, or a view that would read itself, directly or through
+other views. The tables under a view can still be changed or dropped later,
+as in SQLite; the view then reports the error when it is queried.
+
 **Execution.** Operators follow the Volcano model (`Init()` / `Next(row)`),
 so rows stream through the plan. `EXPLAIN ANALYZE` shows estimated vs.
 actual row counts per operator.
@@ -129,7 +149,10 @@ the middle of a statement can leave it partially written.
   cannot repair it.
 - Database files from before page checksums (pages of exactly 4096 bytes)
   cannot be opened.
-- No `RIGHT` / `FULL` joins, foreign keys or views; `DEFAULT` must be a constant.
+- No `RIGHT` / `FULL` joins or foreign keys; `DEFAULT` must be a constant.
+- Views are read-only (no `INSERT` / `UPDATE` / `DELETE` through a view) and
+  are not flattened into the query that uses them, so conditions on a view's
+  columns are applied after the view's rows are produced.
 - Indexes on `INT` and `TEXT` columns only; one column per index.
 - B+ tree nodes are not merged after deletes.
 

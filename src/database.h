@@ -40,6 +40,7 @@ private:
     QueryResult Run(const Statement& stmt);
     QueryResult RunCreateTable(const CreateTableStmt& s);
     QueryResult RunCreateIndex(const CreateIndexStmt& s);
+    QueryResult RunCreateView(const CreateViewStmt& s);
     QueryResult RunDrop(const DropStmt& s);
     QueryResult RunAlterTable(const AlterTableStmt& s);
     std::optional<Value> EvalDefault(const ColumnDef& d);

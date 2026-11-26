@@ -30,7 +30,8 @@ tests/
     ├── basic/               queries, joins, aggregates, EXPLAIN
     ├── advanced/            LEFT JOIN, functions, subqueries, set ops, TEXT keys, ALTER TABLE
     ├── errors/              error messages; the shell keeps going after errors
-    └── persistence/         3 separate shell processes on the same file
+    ├── persistence/         3 separate shell processes on the same file
+    └── views/               CREATE / DROP VIEW, views over views, kept across a restart
 ```
 
 Isolation techniques:

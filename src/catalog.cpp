@@ -213,6 +213,15 @@ std::string Catalog::Serialize() const {
             WriteValue(w, *c.default_value);
         }
     }
+    // Views: [count u32] then (name, sql, [column count u32], column names) each.
+    // Appended last as well, so older files (without views) still load.
+    w.U32(static_cast<uint32_t>(views_.size()));
+    for (auto& [name, v] : views_) {
+        w.Str(v->name);
+        w.Str(v->sql);
+        w.U32(static_cast<uint32_t>(v->columns.size()));
+        for (const auto& c : v->columns) w.Str(c);
+    }
     return std::move(w.buf);
 }
 
@@ -291,10 +300,23 @@ void Catalog::Load() {
             t->schema = Schema(std::move(cols));
         }
     }
+    if (r.pos < data.size()) {  // absent in files from before views existed
+        uint32_t nv = r.U32();
+        for (uint32_t i = 0; i < nv; ++i) {
+            auto v = std::make_unique<ViewInfo>();
+            v->name = r.Str();
+            v->sql = r.Str();
+            uint32_t nc = r.U32();
+            for (uint32_t j = 0; j < nc; ++j) v->columns.push_back(r.Str());
+            if (tables_.count(v->name) || views_.count(v->name)) throw DbError("catalog is corrupt (duplicate view)");
+            views_[v->name] = std::move(v);
+        }
+    }
 }
 
 TableInfo* Catalog::CreateTable(const std::string& name, std::vector<Column> cols) {
     if (tables_.count(name)) throw DbError("table \"" + name + "\" already exists");
+    if (views_.count(name)) throw DbError("a view named \"" + name + "\" already exists");
     if (cols.empty()) throw DbError("a table must have at least one column");
     std::set<std::string> seen;
     for (auto& c : cols) {
@@ -318,8 +340,43 @@ TableInfo* Catalog::GetTable(const std::string& name) {
 
 TableInfo* Catalog::RequireTable(const std::string& name) {
     TableInfo* t = GetTable(name);
-    if (!t) throw DbError("table \"" + name + "\" does not exist");
+    if (!t) {
+        // Views are read-only: INSERT / UPDATE / DELETE / ALTER / CREATE INDEX /
+        // DROP TABLE on one all end up here.
+        if (views_.count(name)) throw DbError("\"" + name + "\" is a view, not a table");
+        throw DbError("table \"" + name + "\" does not exist");
+    }
     return t;
+}
+
+void Catalog::CreateView(const std::string& name, std::vector<std::string> columns, std::string sql, bool replace) {
+    if (tables_.count(name)) throw DbError("a table named \"" + name + "\" already exists");
+    if (views_.count(name) && !replace) throw DbError("view \"" + name + "\" already exists");
+    std::set<std::string> seen;
+    for (const auto& c : columns)
+        if (!seen.insert(c).second) throw DbError("column \"" + c + "\" specified more than once");
+    auto v = std::make_unique<ViewInfo>();
+    v->name = name;
+    v->columns = std::move(columns);
+    v->sql = std::move(sql);
+    views_[name] = std::move(v);
+}
+
+ViewInfo* Catalog::GetView(const std::string& name) {
+    auto it = views_.find(name);
+    return it == views_.end() ? nullptr : it->second.get();
+}
+
+void Catalog::DropView(const std::string& name) {
+    if (views_.erase(name)) return;
+    if (tables_.count(name)) throw DbError("\"" + name + "\" is a table, not a view (use DROP TABLE)");
+    throw DbError("view \"" + name + "\" does not exist");
+}
+
+std::vector<ViewInfo*> Catalog::Views() {
+    std::vector<ViewInfo*> out;
+    for (auto& [n, v] : views_) out.push_back(v.get());
+    return out;
 }
 
 void Catalog::DropTable(const std::string& name) {
@@ -345,6 +402,7 @@ void Catalog::FreePages(const std::vector<page_id_t>& pages) {
 void Catalog::RenameTable(const std::string& name, const std::string& new_name) {
     TableInfo* t = RequireTable(name);
     if (tables_.count(new_name)) throw DbError("table \"" + new_name + "\" already exists");
+    if (views_.count(new_name)) throw DbError("a view named \"" + new_name + "\" already exists");
     std::vector<Column> cols = t->schema.Columns();
     for (auto& c : cols) c.table = new_name;
     t->schema = Schema(std::move(cols));

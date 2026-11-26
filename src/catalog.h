@@ -40,15 +40,33 @@ struct IndexInfo {
     int64_t KeyOf(const Value& v) const { return hashed ? HashTextKey(v.AsText()) : v.AsInt(); }
 };
 
+// A view is a stored query. Only its text is kept: the planner parses and plans
+// it again wherever the view is used, so it always reads the current data (and
+// the current tables: a view whose tables were dropped or changed reports the
+// error when it is queried, as in SQLite).
+struct ViewInfo {
+    std::string name;
+    std::vector<std::string> columns;  // names given in CREATE VIEW v (a, b); empty: the query's own
+    std::string sql;                   // the SELECT, as written
+};
+
 // The catalog itself is persisted in a chain of pages starting at page 0.
+// Tables and views share one namespace.
 class Catalog {
 public:
     explicit Catalog(BufferPoolManager* bpm);
 
     TableInfo* CreateTable(const std::string& name, std::vector<Column> cols);
     TableInfo* GetTable(const std::string& name);
+    // Throws if there is no such table (with a dedicated message for a view).
     TableInfo* RequireTable(const std::string& name);
     void DropTable(const std::string& name);
+
+    // `replace`: an existing view of that name is redefined (CREATE OR REPLACE).
+    void CreateView(const std::string& name, std::vector<std::string> columns, std::string sql, bool replace);
+    ViewInfo* GetView(const std::string& name);
+    void DropView(const std::string& name);
+    std::vector<ViewInfo*> Views();
 
     // ALTER TABLE support. Renames only change metadata. RewriteTable gives the
     // table a new column list: every row goes through `convert` into a fresh
@@ -82,6 +100,7 @@ private:
     BufferPoolManager* bpm_;
     std::map<std::string, std::unique_ptr<TableInfo>> tables_;
     std::map<std::string, std::unique_ptr<IndexInfo>> indexes_;
+    std::map<std::string, std::unique_ptr<ViewInfo>> views_;
 };
 
 }  // namespace minidb

@@ -166,7 +166,8 @@ struct CreateIndexStmt {
 };
 
 struct DropStmt {
-    bool index = false;
+    bool index = false;  // DROP INDEX
+    bool view = false;   // DROP VIEW (neither: DROP TABLE)
     std::string name;
 };
 
@@ -250,7 +251,18 @@ struct AlterTableStmt {
     std::string new_name;  // RENAME_COLUMN, RENAME_TABLE
 };
 
+// CREATE [OR REPLACE] VIEW name [(col, ...)] AS SELECT ...
+// The catalog keeps the query as text (`sql`, as written); every statement that
+// reads the view parses and plans it again, like a subquery in FROM.
+struct CreateViewStmt {
+    std::string name;
+    std::vector<std::string> columns;  // optional names for the output columns
+    std::shared_ptr<SelectStmt> select;
+    std::string sql;
+    bool or_replace = false;
+};
+
 using Statement = std::variant<CreateTableStmt, CreateIndexStmt, DropStmt, InsertStmt, SelectStmt, DeleteStmt,
-                               UpdateStmt, ExplainStmt, AlterTableStmt>;
+                               UpdateStmt, ExplainStmt, AlterTableStmt, CreateViewStmt>;
 
 }  // namespace minidb

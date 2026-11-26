@@ -26,6 +26,15 @@ public:
 
     ExecPtr PlanSelect(const SelectStmt& stmt);
 
+    // Plans the query of view `name` (renaming its output columns to `columns`
+    // when given) and stores the view's output schema in *out. The query is
+    // planned on its own, never seeing the columns of a query that uses the view.
+    // Throws if it is invalid, if it refers to view `name` itself (directly or
+    // through other views), or if two output columns share a name. CREATE VIEW
+    // uses it to validate a definition; the planner to expand a view in FROM.
+    ExecPtr PlanView(const std::string& name, const std::vector<std::string>& columns, const SelectStmt& query,
+                     Schema* out);
+
     // Access path for single-table DML (DELETE / UPDATE ... WHERE ...).
     std::unique_ptr<ScanExecutor> PlanTableScan(TableInfo* table, const ExprPtr& where);
 
@@ -55,6 +64,11 @@ private:
     };
     std::vector<Scope*> scopes_;
     bool ResolvesInEnclosingQuery(const Expr& col) const;
+
+    // The views being expanded right now (outermost first), to detect a view
+    // that reaches itself, and to bound the nesting (each level recurses).
+    std::vector<std::string> view_stack_;
+    static constexpr size_t kMaxViewDepth = 64;
 
     std::unique_ptr<ScanExecutor> BuildAccessPath(const Source& src, const std::vector<ExprPtr>& conjuncts);
     ExecPtr PlanSetOp(const SelectStmt& stmt);  // UNION / INTERSECT / EXCEPT

@@ -18,6 +18,7 @@ SQL (end every statement with ';'):
   CREATE TABLE t (id INT PRIMARY KEY, name TEXT NOT NULL DEFAULT '?', score DOUBLE, ok BOOL);
   CREATE [UNIQUE] INDEX idx ON t (col);        DROP TABLE t;  DROP INDEX idx;
   ALTER TABLE t ADD [COLUMN] c TYPE [UNIQUE] | DROP [COLUMN] c | RENAME [COLUMN] a TO b | RENAME TO u;
+  CREATE [OR REPLACE] VIEW v [(a, b)] AS SELECT ...;   DROP VIEW v;   (views are read-only)
   INSERT INTO t VALUES (1, 'a', 2.5, true), (2, 'b', NULL, false);
   INSERT INTO t (id, name) SELECT ...;
   SELECT [DISTINCT] cols | * FROM a [[LEFT] JOIN b ON ...] [, c] WHERE ...
@@ -33,7 +34,7 @@ SQL (end every statement with ';'):
   Aggregates: COUNT(*) COUNT(x) SUM AVG MIN MAX, each also with DISTINCT: COUNT(DISTINCT x)
 
 Meta commands:
-  .tables               list tables          .schema <table>    show columns and indexes
+  .tables               tables and views     .schema <name>     a table's columns and indexes, a view's query
   .indexes              list indexes         .stats             buffer pool / disk statistics
   .populate <t> <n>     insert n random rows .read <file>       run a script (SQL + meta commands)
   .timer on|off         show query time      .checkpoint        flush everything to disk
@@ -167,6 +168,7 @@ bool Shell::RunMeta(const std::string& line) {
         } else if (cmd == ".tables") {
             for (TableInfo* t : db_.GetCatalog().Tables())
                 out_ << "  " << t->name << "  (" << t->row_count << " rows, " << t->heap->PageCount() << " pages)\n";
+            for (ViewInfo* v : db_.GetCatalog().Views()) out_ << "  " << v->name << "  (view)\n";
         } else if (cmd == ".indexes") {
             for (IndexInfo* i : db_.GetCatalog().Indexes())
                 out_ << "  " << i->name << " ON " << i->table << "(" << i->column << ")" << (i->unique ? " UNIQUE" : "")
@@ -174,6 +176,12 @@ bool Shell::RunMeta(const std::string& line) {
         } else if (cmd == ".schema") {
             std::string name;
             in >> name;
+            if (const ViewInfo* v = db_.GetCatalog().GetView(name)) {
+                out_ << "View \"" << v->name << "\"\n  CREATE VIEW " << v->name;
+                for (size_t i = 0; i < v->columns.size(); ++i) out_ << (i ? ", " : " (") << v->columns[i];
+                out_ << (v->columns.empty() ? "" : ")") << " AS " << v->sql << ";\n";
+                return true;
+            }
             TableInfo* t = db_.GetCatalog().RequireTable(name);
             out_ << "Table \"" << t->name << "\"\n";
             for (const auto& c : t->schema.Columns()) {
