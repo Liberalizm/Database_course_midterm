@@ -57,6 +57,7 @@ public:
         page_id_t leaf_;
         int pos_;
         IndexKey cur_;
+        size_t hops_ = 0;  // leaves stepped over; more than the file has pages = a cycle
     };
 
     Iterator Begin() const;                  // smallest entry

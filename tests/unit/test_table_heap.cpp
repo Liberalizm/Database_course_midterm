@@ -154,5 +154,20 @@ TEST_F(TableHeapTest, RandomOperationsMatchReferenceModel) {
     EXPECT_EQ(bpm.PinnedFrames(), 0u);
 }
 
+TEST_F(TableHeapTest, CycleInPageChainIsAnErrorNotAHang) {
+    for (int i = 0; i < 200; ++i) heap.Insert(std::string(100, 'x'));
+    ASSERT_GT(heap.PageCount(), 2u);
+    auto pages = heap.Pages();
+    {
+        PageGuard g = PageGuard::Fetch(&bpm, pages.back());
+        TablePage(g.Data()).SetNextPageId(pages[1]);  // last page -> second page
+        g.MarkDirty();
+    }
+    EXPECT_THROW(ScanAll(), DbError);
+    EXPECT_THROW(heap.Pages(), DbError);
+    EXPECT_THROW(TableHeap(&bpm, first), DbError) << "reopening the table";
+    EXPECT_EQ(bpm.PinnedFrames(), 0u);
+}
+
 }  // namespace
 }  // namespace minidb

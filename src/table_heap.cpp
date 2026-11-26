@@ -5,11 +5,13 @@ namespace minidb {
 TableHeap::TableHeap(BufferPoolManager* bpm, page_id_t first_page)
     : bpm_(bpm), first_(first_page), last_(first_page) {
     page_id_t p = first_;
+    size_t hops = 0;
     while (p != INVALID_PAGE_ID) {
         PageGuard g = PageGuard::Fetch(bpm_, p);
         last_ = p;
         ++page_count_;
         p = TablePage(g.Data()).NextPageId();
+        if (++hops > static_cast<size_t>(bpm_->Disk()->NumPages())) throw DbError("table is corrupt (cycle in the page chain)");
     }
 }
 
@@ -93,10 +95,12 @@ RID TableHeap::Update(RID rid, const std::string& tuple) {
 
 std::vector<page_id_t> TableHeap::Pages() const {
     std::vector<page_id_t> out;
+    size_t hops = 0;
     for (page_id_t p = first_; p != INVALID_PAGE_ID;) {
         out.push_back(p);
         PageGuard g = PageGuard::Fetch(bpm_, p);
         p = TablePage(g.Data()).NextPageId();
+        if (++hops > static_cast<size_t>(bpm_->Disk()->NumPages())) throw DbError("table is corrupt (cycle in the page chain)");
     }
     return out;
 }
@@ -105,6 +109,7 @@ bool TableHeap::Iterator::Next(RID* rid, std::string* data) {
     while (page_ != INVALID_PAGE_ID) {
         PageGuard g = PageGuard::Fetch(bpm_, page_);
         TablePage tp(g.Data());
+        if (slot_ == 0) tp.CheckIntegrity();  // once per page
         while (slot_ < tp.NumSlots()) {
             uint16_t s = slot_++;
             if (tp.Get(s, data)) {
@@ -113,6 +118,7 @@ bool TableHeap::Iterator::Next(RID* rid, std::string* data) {
             }
         }
         page_ = tp.NextPageId();
+        if (++hops_ > static_cast<size_t>(bpm_->Disk()->NumPages())) throw DbError("table is corrupt (cycle in the page chain)");
         slot_ = 0;
     }
     return false;

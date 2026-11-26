@@ -1,5 +1,9 @@
 // Integration tests: durability — data written by one Database instance must be
 // readable by the next one opening the same file.
+#include <fstream>
+#include <iterator>
+#include <random>
+
 #include "database.h"
 #include "test_util.h"
 
@@ -90,6 +94,59 @@ TEST(Persistence, DroppedTablesDoNotGrowTheFileForever) {
         if (cycle == 0) after_first_cycle = db.Disk().NumPages();
         EXPECT_EQ(db.Disk().NumPages(), after_first_cycle) << "cycle " << cycle << " should only reuse freed pages";
     }
+}
+
+// A damaged database file must produce errors, never crash or hang. Flips bytes in
+// the structural parts of pages (headers, slot arrays, node headers) and runs a
+// mix of reads and writes; any crash takes down this test process.
+TEST(Persistence, CorruptedFileNeverCrashesOrHangs) {
+    TempFile f;
+    {
+        Database db(f.path(), 32);
+        db.Execute("CREATE TABLE t (id INT PRIMARY KEY, g INT, s TEXT); CREATE INDEX tg ON t (g)");
+        db.Populate("t", 3000);
+    }
+    std::vector<char> pristine;
+    {
+        std::ifstream in(f.path(), std::ios::binary);
+        pristine.assign(std::istreambuf_iterator<char>(in), {});
+    }
+    const size_t pages = pristine.size() / PAGE_SIZE;
+    ASSERT_GT(pages, 20u);
+    const char* queries[] = {"SELECT COUNT(*) FROM t",
+                             "SELECT COUNT(*) FROM t WHERE id = 500",
+                             "SELECT COUNT(*) FROM t WHERE g = 5",
+                             "SELECT MAX(s) FROM t",
+                             "UPDATE t SET g = g + 1 WHERE id < 100",
+                             "DELETE FROM t WHERE id > 2900",
+                             "INSERT INTO t VALUES (99999, 1, 'x')"};
+    int errors = 0;
+    for (uint32_t seed = 1; seed <= 120; ++seed) {
+        std::mt19937 rng(seed);
+        std::vector<char> bytes = pristine;
+        int flips = 1 + static_cast<int>(rng() % 6);
+        for (int k = 0; k < flips; ++k) {
+            size_t page = 1 + rng() % (pages - 1);  // page 0 (catalog) is tested elsewhere
+            bytes[page * PAGE_SIZE + rng() % 96] = static_cast<char>(rng() % 256);
+        }
+        {
+            std::ofstream out(f.path(), std::ios::binary | std::ios::trunc);
+            out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+        }
+        try {
+            Database db(f.path(), 16);
+            for (const char* q : queries) {
+                try {
+                    db.Execute(q);
+                } catch (const DbError&) {
+                    ++errors;
+                }
+            }
+        } catch (const DbError&) {
+            ++errors;  // refusing to open a damaged file is fine too
+        }
+    }
+    EXPECT_GT(errors, 0) << "the damage should have been noticed at least sometimes";
 }
 
 }  // namespace

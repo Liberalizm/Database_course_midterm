@@ -226,5 +226,49 @@ TEST_F(BPlusTreeTest, RandomOperationsMatchReferenceModel) {
     }
 }
 
+TEST_F(BPlusTreeTest, CorruptNodeHeaderIsAnErrorNotACrash) {
+    BPlusTree t(&bpm, INVALID_PAGE_ID, 4, 4);
+    for (int i = 0; i < 100; ++i) t.Insert(i, RID{i, 0});
+    {
+        PageGuard g = PageGuard::Fetch(&bpm, t.Root());
+        WriteAs<uint16_t>(g.Data() + 2, 30000);  // entry count far beyond the page
+        g.MarkDirty();
+    }
+    EXPECT_THROW(t.LowerBound(5), DbError);
+    EXPECT_THROW(t.Insert(1000, RID{1, 1}), DbError);
+    {
+        PageGuard g = PageGuard::Fetch(&bpm, t.Root());
+        WriteAs<uint16_t>(g.Data() + 2, 2);
+        g.Data()[0] = 7;  // neither leaf (1) nor internal (0)
+        g.MarkDirty();
+    }
+    EXPECT_THROW(t.ContainsKey(5), DbError);
+    EXPECT_EQ(bpm.PinnedFrames(), 0u) << "errors must not leak pins";
+}
+
+TEST_F(BPlusTreeTest, CycleInLeafChainIsAnErrorNotAHang) {
+    BPlusTree t(&bpm, INVALID_PAGE_ID, 4, 4);
+    for (int i = 0; i < 100; ++i) t.Insert(i, RID{i, 0});
+    // Find the last leaf by walking the chain, then point it back to the start.
+    std::vector<page_id_t> leaves;
+    for (page_id_t p : t.Pages()) {
+        PageGuard g = PageGuard::Fetch(&bpm, p);
+        if (g.Data()[0] == 1) leaves.push_back(p);
+    }
+    for (page_id_t p : leaves) {
+        PageGuard g = PageGuard::Fetch(&bpm, p);
+        if (ReadAs<page_id_t>(g.Data() + 4) == INVALID_PAGE_ID) {
+            WriteAs<page_id_t>(g.Data() + 4, leaves.front());
+            g.MarkDirty();
+        }
+    }
+    auto walk = [&] {
+        for (auto it = t.Begin(); it.Valid(); it.Next()) {
+        }
+    };
+    EXPECT_THROW(walk(), DbError);
+    EXPECT_EQ(bpm.PinnedFrames(), 0u);
+}
+
 }  // namespace
 }  // namespace minidb

@@ -133,5 +133,54 @@ TEST_F(TablePageTest, NextPagePointer) {
     EXPECT_EQ(page.NextPageId(), 17);
 }
 
+// ---- damaged pages must raise errors, never read or write outside the page ----
+
+TEST_F(TablePageTest, CorruptHeaderIsDetected) {
+    Put("abc");
+    WriteAs<uint16_t>(buf + 4, 5000);  // num_slots: slot array would extend past the page
+    std::string out;
+    EXPECT_THROW(page.Get(0, &out), DbError);
+    EXPECT_THROW(Put("x"), DbError);
+    EXPECT_THROW(page.Delete(0), DbError);
+    EXPECT_THROW(page.CheckIntegrity(), DbError);
+}
+
+TEST_F(TablePageTest, CorruptFreeEndIsDetected) {
+    Put("abc");
+    WriteAs<uint16_t>(buf + 6, 2);  // free_end inside the header
+    EXPECT_THROW(page.CheckIntegrity(), DbError);
+    EXPECT_THROW(page.Update(0, "abcd", 4), DbError);
+}
+
+TEST_F(TablePageTest, SlotPointingOutsideThePageIsDetected) {
+    Put("abc");
+    Put("defg");
+    WriteAs<uint16_t>(buf + TablePage::HEADER + 2, 60000);  // slot 0 length
+    std::string out;
+    EXPECT_THROW(page.Get(0, &out), DbError);
+    EXPECT_THROW(page.Update(0, "z", 1), DbError);
+    EXPECT_TRUE(page.Get(1, &out)) << "other slots stay readable";
+    EXPECT_EQ(out, "defg");
+}
+
+TEST_F(TablePageTest, OverlappingSlotsAreDetectedBeforeCompaction) {
+    Put(std::string(100, 'a'));
+    Put(std::string(100, 'b'));
+    // Make slot 1 cover both tuples: the live lengths now exceed the data area.
+    uint16_t off1 = ReadAs<uint16_t>(buf + TablePage::HEADER + TablePage::SLOT);
+    WriteAs<uint16_t>(buf + TablePage::HEADER + TablePage::SLOT + 2, static_cast<uint16_t>(PAGE_SIZE - off1));
+    EXPECT_THROW(page.CheckIntegrity(), DbError);
+    EXPECT_THROW(page.Compact(), DbError);
+}
+
+TEST_F(TablePageTest, HealthyPagesPassTheChecks) {
+    for (int i = 0; i < 30; ++i) Put(std::string(1 + i * 3, 'x'));
+    for (uint16_t i = 0; i < 30; i += 3) page.Delete(i);
+    page.Update(1, std::string(200, 'y').data(), 200);
+    EXPECT_NO_THROW(page.CheckIntegrity());
+    page.Compact();
+    EXPECT_NO_THROW(page.CheckIntegrity());
+}
+
 }  // namespace
 }  // namespace minidb

@@ -38,6 +38,7 @@ public:
         BufferPoolManager* bpm_;
         page_id_t page_;
         uint16_t slot_ = 0;
+        size_t hops_ = 0;  // pages visited; more than the file has = a cycle
     };
     Iterator Begin() const { return Iterator(bpm_, first_); }
 
