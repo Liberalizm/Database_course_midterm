@@ -182,6 +182,8 @@ struct TableRef {
     // padded with NULLs when no row of this table satisfies `on`. Inner-join ON
     // conditions are simply merged into WHERE, but a LEFT JOIN's must stay here.
     bool left_join = false;
+    // "(SELECT ...) alias": a subquery in FROM (derived table) instead of a stored table.
+    std::shared_ptr<SelectStmt> subquery;
     ExprPtr on;
 };
 

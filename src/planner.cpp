@@ -373,12 +373,28 @@ ExecPtr Planner::PlanSelect(const SelectStmt& stmt) {
     if (stmt.set_lhs) return PlanSetOp(stmt);
     // ---------- 1. resolve FROM ----------
     std::vector<Source> srcs;
+    std::vector<ExecPtr> derived;  // plan of each subquery in FROM (null for stored tables)
     for (const auto& ref : stmt.from) {
-        TableInfo* t = catalog_->RequireTable(ref.name);
         std::string alias = ref.alias.empty() ? ref.name : ref.alias;
         for (const auto& s : srcs)
             if (s.alias == alias) throw DbError("table name \"" + alias + "\" specified more than once");
+        if (ref.subquery) {
+            // Derived table: planned (and later run) on its own; uncorrelated like
+            // every subquery here. Its output columns become alias.column.
+            ExecPtr plan = PlanSelect(*ref.subquery);
+            const Schema& out = plan->OutSchema();
+            for (size_t i = 0; i < out.Size(); ++i)
+                for (size_t j = 0; j < i; ++j)
+                    if (out.At(i).name == out.At(j).name)
+                        throw DbError("subquery \"" + alias + "\" has more than one column named \"" + out.At(i).name +
+                                      "\" (give them different aliases)");
+            srcs.push_back({nullptr, alias, out.WithQualifier(alias)});
+            derived.push_back(std::move(plan));
+            continue;
+        }
+        TableInfo* t = catalog_->RequireTable(ref.name);
         srcs.push_back({t, alias, t->schema.WithQualifier(alias)});
+        derived.push_back(nullptr);
     }
 
     // ---------- 2. ORDER BY may refer to select aliases or positions ----------
@@ -456,7 +472,23 @@ ExecPtr Planner::PlanSelect(const SelectStmt& stmt) {
 
     // ---------- 5. access paths ----------
     std::vector<ExecPtr> base(srcs.size());
-    for (size_t i = 0; i < srcs.size(); ++i) base[i] = BuildAccessPath(srcs[i], per_table[i]);
+    for (size_t i = 0; i < srcs.size(); ++i) {
+        if (srcs[i].table) {
+            base[i] = BuildAccessPath(srcs[i], per_table[i]);
+            continue;
+        }
+        double est = derived[i]->est_rows, cost = derived[i]->est_cost;
+        ExecPtr node = std::make_unique<SubqueryScanExecutor>(std::move(derived[i]), srcs[i].schema, srcs[i].alias);
+        node->est_rows = est;
+        node->est_cost = cost;
+        if (!per_table[i].empty()) {  // conditions on the subquery alone filter its rows
+            ExprPtr pred = BindExpr(MakeConjunction(per_table[i]), node->OutSchema());
+            node = std::make_unique<FilterExecutor>(std::move(node), pred);
+            node->est_rows = std::max(1.0, est * SelectivityOf(per_table[i]));
+            node->est_cost = cost + est * CPU_TUPLE_COST;
+        }
+        base[i] = std::move(node);
+    }
 
     // ---------- 6. join ordering + join algorithm ----------
     ExecPtr root;
@@ -709,7 +741,7 @@ ExecPtr Planner::PlanSelect(const SelectStmt& stmt) {
             for (const auto& s : srcs) {
                 if (!it.star_table.empty() && s.alias != it.star_table) continue;
                 any = true;
-                for (const auto& c : s.table->schema.Columns()) {
+                for (const auto& c : s.schema.Columns()) {
                     proj.push_back(BindExpr(Expr::Col(s.alias, c.name), root->OutSchema()));
                     names.push_back(c.name);
                 }

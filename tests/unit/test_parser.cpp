@@ -170,6 +170,20 @@ TEST(Parser, Subqueries) {
     EXPECT_THROW(ParseExpr("(SELECT 1"), DbError);
 }
 
+TEST(Parser, DerivedTablesInFrom) {
+    auto s = ParseOne<SelectStmt>("SELECT * FROM (SELECT a FROM t) AS x JOIN (SELECT b FROM u UNION SELECT 1) y ON x.a = y.b");
+    ASSERT_EQ(s.from.size(), 2u);
+    ASSERT_TRUE(s.from[0].subquery);
+    EXPECT_EQ(s.from[0].alias, "x");
+    EXPECT_EQ(s.from[0].subquery->from.at(0).name, "t");
+    ASSERT_TRUE(s.from[1].subquery);
+    EXPECT_TRUE(s.from[1].subquery->set_lhs) << "a compound query inside FROM";
+    EXPECT_EQ(s.from[1].alias, "y");
+    EXPECT_FALSE(ParseOne<SelectStmt>("SELECT * FROM t").from[0].subquery);
+    EXPECT_THROW(Parser("SELECT * FROM (SELECT 1)").ParseAll(), DbError) << "alias required";
+    EXPECT_THROW(Parser("SELECT * FROM (t) x").ParseAll(), DbError);
+}
+
 TEST(Parser, SetOperationsAndPrecedence) {
     auto s = ParseOne<SelectStmt>("SELECT a FROM t UNION ALL SELECT b FROM u ORDER BY 1 LIMIT 5");
     ASSERT_TRUE(s.set_lhs && s.set_rhs);

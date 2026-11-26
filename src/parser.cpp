@@ -363,6 +363,17 @@ SelectStmt Parser::ParseSelectCore() {
     if (AcceptKw("from")) {
         auto parse_ref = [&]() {
             TableRef r;
+            if (AcceptSym("(")) {  // derived table: (SELECT ...) [AS] alias
+                if (!CheckKw("select")) Error("expected SELECT");
+                r.subquery = std::make_shared<SelectStmt>(ParseSelect());
+                ExpectSym(")");
+                AcceptKw("as");
+                if (!IsAliasToken()) Error("subquery in FROM must have an alias");
+                r.alias = Advance().text;
+                r.name = r.alias;
+                s.from.push_back(r);
+                return;
+            }
             r.name = ExpectIdent();
             if (AcceptKw("as"))
                 r.alias = ExpectIdent();

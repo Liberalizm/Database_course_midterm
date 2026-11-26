@@ -436,6 +436,39 @@ TEST_F(SqlTest, UnionIntersectExcept) {
     EXPECT_THROW(db->Execute("SELECT id FROM emp UNION SELECT id FROM dept ORDER BY 2"), DbError);
 }
 
+TEST_F(SqlTest, SubqueriesInFrom) {
+    SeedCompany();
+    // Filter on an aggregate through a derived table.
+    auto big = Q("SELECT g.dept_id, g.n FROM (SELECT dept_id, COUNT(*) AS n FROM emp GROUP BY dept_id) g "
+                 "WHERE g.n > 1 ORDER BY g.dept_id");
+    ASSERT_EQ(big.size(), 2u);
+    EXPECT_EQ(big[0][1].AsInt(), 2);
+    // Aggregate over an aggregate.
+    EXPECT_EQ(Scalar("SELECT MAX(n) FROM (SELECT dept_id, COUNT(*) AS n FROM emp GROUP BY dept_id) g"), 2);
+    // Joins, including LEFT JOIN against a derived table.
+    auto totals = Q("SELECT d.name, s.total FROM dept d LEFT JOIN "
+                    "(SELECT dept_id, SUM(salary) AS total FROM emp GROUP BY dept_id) s ON s.dept_id = d.id "
+                    "ORDER BY d.id");
+    ASSERT_EQ(totals.size(), 3u);
+    EXPECT_DOUBLE_EQ(totals[0][1].AsDouble(), 180.0);
+    EXPECT_TRUE(totals[2][1].IsNull()) << "the empty department";
+    // SELECT * uses the subquery's column names; nesting and set operations work.
+    auto star = db->Execute("SELECT * FROM (SELECT name AS who, salary FROM emp WHERE id = 1) t").back();
+    ASSERT_EQ(star.columns.size(), 2u);
+    EXPECT_EQ(star.columns[0], "who");
+    EXPECT_EQ(Scalar("SELECT COUNT(*) FROM (SELECT * FROM (SELECT id FROM emp UNION SELECT id FROM dept) u "
+                     "WHERE u.id > 2) v"),
+              3);
+    // Inside DML subqueries.
+    EXPECT_EQ(Msg("DELETE FROM emp WHERE id IN (SELECT s.id FROM (SELECT id, salary FROM emp) s WHERE s.salary < 60)"),
+              "DELETE 1");
+    // Errors.
+    EXPECT_THROW(db->Execute("SELECT * FROM (SELECT e.id, d.id FROM emp e JOIN dept d ON e.dept_id = d.id) z"), DbError)
+        << "duplicate column names";
+    EXPECT_THROW(db->Execute("SELECT * FROM (SELECT id FROM emp) a, (SELECT id FROM dept) a"), DbError);
+    EXPECT_THROW(db->Execute("SELECT nope FROM (SELECT id FROM emp) a"), DbError);
+}
+
 TEST_F(SqlTest, QuotedIdentifiersAreNeverKeywords) {
     db->Execute("CREATE TABLE \"select\" (\"left\" INT, \"right\" TEXT, \"null\" INT)");
     db->Execute("INSERT INTO \"select\" (\"left\", \"right\", \"null\") VALUES (1, 'r', 7)");

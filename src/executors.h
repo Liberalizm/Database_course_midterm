@@ -304,4 +304,24 @@ private:
     std::unordered_set<std::string> emitted_;                // without ALL: rows already returned
 };
 
+// A subquery in FROM: passes the subquery's rows through unchanged, under a
+// schema whose columns are qualified with the subquery's alias.
+class SubqueryScanExecutor : public Executor {
+public:
+    SubqueryScanExecutor(ExecPtr child, Schema schema, std::string alias)
+        : child_(std::move(child)), alias_(std::move(alias)) {
+        schema_ = std::move(schema);
+    }
+    std::string Describe() const override { return "Subquery Scan on " + alias_; }
+    std::vector<const Executor*> Children() const override { return {child_.get()}; }
+
+protected:
+    void InitImpl() override { child_->Init(); }
+    bool NextImpl(Row* out) override { return child_->Next(out); }
+
+private:
+    ExecPtr child_;
+    std::string alias_;
+};
+
 }  // namespace minidb
