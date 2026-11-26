@@ -200,5 +200,21 @@ TEST(Expression, ToString) {
     EXPECT_EQ(Expr::Agg(AggFunc::MAX, Expr::Col("", "x"), false)->ToString(), "max(x)");
 }
 
+TEST(Expression, TreeHeightIsTrackedAndCapped) {
+    EXPECT_EQ(C(I(1))->height, 1);
+    auto e = Bin(BinOp::ADD, C(I(1)), Bin(BinOp::MUL, C(I(2)), C(I(3))));
+    EXPECT_EQ(e->height, 3);
+    EXPECT_EQ(Expr::Unary(UnaryOp::NEG, e)->height, 4);
+    EXPECT_EQ(Expr::IsNull(e, false)->height, 4);
+
+    // Building iteratively (as the parser does for a + b + c ...) stops at the limit,
+    // so no pass over an expression can ever recurse deeper than kMaxExprHeight.
+    ExprPtr chain = C(I(0));
+    for (int i = 1; i < kMaxExprHeight; ++i) chain = Bin(BinOp::ADD, chain, C(I(1)));
+    EXPECT_EQ(chain->height, kMaxExprHeight);
+    EXPECT_EQ(Eval(chain).AsInt(), kMaxExprHeight - 1) << "evaluating a tree at the limit is safe";
+    EXPECT_THROW(Bin(BinOp::ADD, chain, C(I(1))), DbError);
+}
+
 }  // namespace
 }  // namespace minidb

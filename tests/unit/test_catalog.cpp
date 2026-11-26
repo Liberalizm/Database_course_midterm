@@ -233,5 +233,54 @@ TEST_F(CatalogTest, CatalogGrowthDoesNotHandOutItsOwnPages) {
     EXPECT_EQ(rows, 3000u) << "heap pages were overwritten by the catalog";
 }
 
+// A crash right after creating a database (before any Save/flush) used to leave
+// an all-zero page 0 behind, and the file could never be opened again.
+TEST_F(CatalogTest, NewDatabaseIsDurableBeforeAnyStatement) {
+    std::string copy = file.path() + ".crash";
+    std::filesystem::copy_file(file.path(), copy, std::filesystem::copy_options::overwrite_existing);
+    {
+        DiskManager d(copy);
+        BufferPoolManager b(16, &d);
+        EXPECT_NO_THROW(Catalog c(&b));
+    }
+    std::remove(copy.c_str());
+}
+
+TEST_F(CatalogTest, AllZeroSinglePageFileOpensAsEmptyDatabase) {
+    cat.reset();
+    bpm.reset();
+    disk.reset();
+    {
+        DiskManager d(file.path());
+        char zeros[PAGE_SIZE] = {};
+        d.WritePage(0, zeros);
+    }
+    disk = std::make_unique<DiskManager>(file.path());
+    bpm = std::make_unique<BufferPoolManager>(32, disk.get());
+    cat = std::make_unique<Catalog>(bpm.get());
+    EXPECT_TRUE(cat->Tables().empty());
+    cat->CreateTable("t", {Col("a", TypeId::INT)});
+    Reopen();
+    EXPECT_NE(cat->GetTable("t"), nullptr) << "the repaired file works normally";
+}
+
+TEST_F(CatalogTest, ZeroedCatalogWithOtherPagesIsStillCorrupt) {
+    cat->CreateTable("t", {Col("a", TypeId::INT)});
+    cat->Save();
+    bpm->FlushAll();
+    cat.reset();
+    bpm.reset();
+    disk.reset();
+    {
+        DiskManager d(file.path());
+        ASSERT_GT(d.NumPages(), 1);
+        char zeros[PAGE_SIZE] = {};
+        d.WritePage(0, zeros);
+    }
+    disk = std::make_unique<DiskManager>(file.path());
+    bpm = std::make_unique<BufferPoolManager>(32, disk.get());
+    EXPECT_THROW(Catalog c(bpm.get()), DbError) << "data exists: never silently reset it";
+}
+
 }  // namespace
 }  // namespace minidb

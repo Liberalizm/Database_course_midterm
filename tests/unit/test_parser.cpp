@@ -200,5 +200,36 @@ TEST(Parser, ErrorMessageNamesTheOffendingToken) {
     }
 }
 
+// Input nested deeper than the stack can take must be a syntax error, never a crash.
+std::string Repeat(const std::string& s, int n) {
+    std::string out;
+    for (int i = 0; i < n; ++i) out += s;
+    return out;
+}
+
+TEST(Parser, DeepNestingIsRejectedNotACrash) {
+    EXPECT_EQ(ParseExpr(Repeat("(", 200) + "1" + Repeat(")", 200))->value.AsInt(), 1);
+    EXPECT_THROW(ParseExpr(Repeat("(", 100000) + "1" + Repeat(")", 100000)), DbError);
+    EXPECT_THROW(ParseExpr(Repeat("- ", 100000) + "1"), DbError);
+    EXPECT_THROW(ParseExpr(Repeat("+ ", 100000) + "1"), DbError);
+    EXPECT_THROW(ParseExpr(Repeat("NOT ", 100000) + "TRUE"), DbError);
+    EXPECT_EQ(ParseExpr(Repeat("- ", 100) + "1")->value.AsInt(), 1) << "moderate nesting is fine";
+}
+
+TEST(Parser, LongOperatorChainsAreLimitedByTreeHeight) {
+    std::string ok = "1";
+    for (int i = 2; i <= kMaxExprHeight; ++i) ok += " + " + std::to_string(i);  // 1000 terms, 999 "+" nodes
+    EXPECT_EQ(ParseExpr(ok)->height, kMaxExprHeight);
+    EXPECT_THROW(ParseExpr(ok + " + 1"), DbError);
+}
+
+TEST(Parser, LargeInListIsABalancedTree) {
+    std::string list;
+    for (int i = 0; i < 50000; ++i) list += (i ? "," : "") + std::to_string(i);
+    auto e = ParseExpr("x IN (" + list + ")");
+    EXPECT_LE(e->height, 20) << "50000 values -> ~log2(50000) = 16 levels of OR, not 50000";
+    EXPECT_LE(ParseExpr("x NOT IN (" + list + ")")->height, 21);
+}
+
 }  // namespace
 }  // namespace minidb

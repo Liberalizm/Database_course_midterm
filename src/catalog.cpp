@@ -73,9 +73,29 @@ Catalog::Catalog(BufferPoolManager* bpm) : bpm_(bpm) {
         g.MarkDirty();
         g.Release();
         Save();
+        // Persist the empty catalog right away. Otherwise a crash before the first
+        // write statement leaves an all-zero page 0, and the file can't be opened.
+        bpm_->FlushPage(CATALOG_PAGE_ID);
+    } else if (bpm_->Disk()->NumPages() == 1 && IsUninitializedCatalogPage()) {
+        // Such a file can still exist (it was created by a version without the
+        // flush above): it never held any data, so it is simply an empty database.
+        {
+            PageGuard g = PageGuard::Fetch(bpm_, CATALOG_PAGE_ID);
+            WriteAs<page_id_t>(g.Data(), INVALID_PAGE_ID);
+            g.MarkDirty();
+        }
+        Save();
+        bpm_->FlushPage(CATALOG_PAGE_ID);
     } else {
         Load();
     }
+}
+
+bool Catalog::IsUninitializedCatalogPage() {
+    PageGuard g = PageGuard::Fetch(bpm_, CATALOG_PAGE_ID);
+    for (size_t i = 0; i < PAGE_SIZE; ++i)
+        if (g.Data()[i] != 0) return false;
+    return true;
 }
 
 void Catalog::Save() {

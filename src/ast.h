@@ -16,6 +16,11 @@ enum class UnaryOp { NOT, NEG };
 enum class AggFunc { COUNT, SUM, AVG, MIN, MAX };
 
 struct Expr;
+
+// Every pass over an expression (binding, evaluation, printing, even the
+// destructor) is recursive, so a tree that is too tall would overflow the
+// stack and kill the process. The factories below refuse to build one.
+constexpr int kMaxExprHeight = 1000;
 using ExprPtr = std::shared_ptr<Expr>;
 
 struct Expr {
@@ -30,8 +35,19 @@ struct Expr {
     AggFunc agg = AggFunc::COUNT;
     bool agg_star = false;       // COUNT(*)
     ExprPtr left, right;         // children (UNARY / IS_NULL / AGG use `left`)
+    int height = 1;              // 1 for leaves, 1 + tallest child otherwise
 
     std::string ToString() const;
+
+    // Recomputes `height` from the children; throws if the limit is exceeded.
+    void FixHeight() {
+        int h = 0;
+        if (left) h = left->height;
+        if (right && right->height > h) h = right->height;
+        height = h + 1;
+        if (height > kMaxExprHeight)
+            throw DbError("expression is too deeply nested (more than " + std::to_string(kMaxExprHeight) + " levels)");
+    }
 
     static ExprPtr Const(Value v) {
         auto e = std::make_shared<Expr>();
@@ -52,6 +68,7 @@ struct Expr {
         e->op = op;
         e->left = std::move(l);
         e->right = std::move(r);
+        e->FixHeight();
         return e;
     }
     static ExprPtr Unary(UnaryOp op, ExprPtr x) {
@@ -59,6 +76,7 @@ struct Expr {
         e->kind = ExprKind::UNARY;
         e->uop = op;
         e->left = std::move(x);
+        e->FixHeight();
         return e;
     }
     static ExprPtr IsNull(ExprPtr x, bool negated) {
@@ -66,6 +84,7 @@ struct Expr {
         e->kind = ExprKind::IS_NULL;
         e->negated = negated;
         e->left = std::move(x);
+        e->FixHeight();
         return e;
     }
     static ExprPtr Agg(AggFunc f, ExprPtr arg, bool star) {
@@ -74,6 +93,7 @@ struct Expr {
         e->agg = f;
         e->agg_star = star;
         e->left = std::move(arg);
+        e->FixHeight();
         return e;
     }
 };

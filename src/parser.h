@@ -56,8 +56,20 @@ private:
     int64_t ExpectInteger();
     [[noreturn]] void Error(const std::string& msg) const;
 
+    // Recursive descent uses ~10 stack frames per nesting level, so input like
+    // "((((...))))" or "- - - ... 1" must be cut off before the stack runs out.
+    static constexpr int kMaxNesting = 256;
+    struct NestingGuard {
+        explicit NestingGuard(Parser* p);
+        ~NestingGuard() { --p_->depth_; }
+        NestingGuard(const NestingGuard&) = delete;
+        NestingGuard& operator=(const NestingGuard&) = delete;
+        Parser* p_;
+    };
+
     std::vector<Token> toks_;
     size_t pos_ = 0;
+    int depth_ = 0;
 };
 
 }  // namespace minidb

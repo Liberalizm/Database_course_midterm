@@ -432,7 +432,17 @@ UpdateStmt Parser::ParseUpdate() {
 
 // ---- expressions (lowest to highest precedence) ----
 
-ExprPtr Parser::ParseExpr() { return ParseOr(); }
+Parser::NestingGuard::NestingGuard(Parser* p) : p_(p) {
+    if (++p_->depth_ > kMaxNesting) {
+        --p_->depth_;
+        p_->Error("expression is too deeply nested");
+    }
+}
+
+ExprPtr Parser::ParseExpr() {
+    NestingGuard guard(this);
+    return ParseOr();
+}
 
 ExprPtr Parser::ParseOr() {
     ExprPtr l = ParseAnd();
@@ -447,7 +457,10 @@ ExprPtr Parser::ParseAnd() {
 }
 
 ExprPtr Parser::ParseNot() {
-    if (AcceptKw("not")) return Expr::Unary(UnaryOp::NOT, ParseNot());
+    if (AcceptKw("not")) {
+        NestingGuard guard(this);
+        return Expr::Unary(UnaryOp::NOT, ParseNot());
+    }
     return ParseComparison();
 }
 
@@ -476,13 +489,21 @@ ExprPtr Parser::ParseComparison() {
     }
     if (AcceptKw("in")) {  // x IN (a, b, c)  ==>  x = a OR x = b OR x = c
         ExpectSym("(");
-        ExprPtr e;
+        std::vector<ExprPtr> terms;
         do {
-            ExprPtr eq = Expr::Binary(BinOp::EQ, l, ParseExpr());
-            e = e ? Expr::Binary(BinOp::OR, e, eq) : eq;
+            terms.push_back(Expr::Binary(BinOp::EQ, l, ParseExpr()));
         } while (AcceptSym(","));
         ExpectSym(")");
-        return neg ? Expr::Unary(UnaryOp::NOT, e) : e;
+        // OR the terms together as a balanced tree (pairing neighbours round by
+        // round), so a list of N values is only log2(N) levels deep, not N.
+        while (terms.size() > 1) {
+            std::vector<ExprPtr> next;
+            for (size_t i = 0; i + 1 < terms.size(); i += 2)
+                next.push_back(Expr::Binary(BinOp::OR, terms[i], terms[i + 1]));
+            if (terms.size() % 2) next.push_back(terms.back());
+            terms = std::move(next);
+        }
+        return neg ? Expr::Unary(UnaryOp::NOT, terms[0]) : terms[0];
     }
     if (AcceptKw("like")) {
         ExprPtr e = Expr::Binary(BinOp::LIKE, l, ParseAdditive());
@@ -520,6 +541,7 @@ ExprPtr Parser::ParseMultiplicative() {
 
 ExprPtr Parser::ParseUnary() {
     if (AcceptSym("-")) {
+        NestingGuard guard(this);
         // INT64_MIN is the one integer whose magnitude does not fit as a positive literal.
         if (Peek().type == TokenType::INTEGER && Peek().text == "9223372036854775808") {
             Advance();
@@ -532,7 +554,10 @@ ExprPtr Parser::ParseUnary() {
             return Expr::Const(Value::Double(-x->value.AsDouble()));
         return Expr::Unary(UnaryOp::NEG, x);
     }
-    if (AcceptSym("+")) return ParseUnary();
+    if (AcceptSym("+")) {
+        NestingGuard guard(this);
+        return ParseUnary();
+    }
     return ParsePrimary();
 }
 

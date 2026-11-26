@@ -50,6 +50,7 @@ public:
 
 private:
     void Load();
+    bool IsUninitializedCatalogPage();
     std::string Serialize() const;
     void FreePages(const std::vector<page_id_t>& pages);
 
