@@ -187,7 +187,7 @@ TEST_F(BPlusTreeTest, RandomOperationsMatchReferenceModel) {
         std::set<IndexKey> ref;
         std::mt19937 rng(seed);
         auto random_entry = [&] {
-            return IndexKey{static_cast<int64_t>(rng() % 60) - 30, RID{static_cast<page_id_t>(rng() % 8), rng() % 4}};
+            return IndexKey{static_cast<int64_t>(rng() % 60) - 30, RID{static_cast<page_id_t>(rng() % 8), static_cast<uint32_t>(rng() % 4)}};
         };
         for (int step = 0; step < 4000; ++step) {
             IndexKey k = random_entry();

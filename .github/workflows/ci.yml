@@ -50,6 +50,7 @@ jobs:
 
       - name: Configure
         run: |
+          cmake --version
           if [ -n "${{ matrix.cxx }}" ]; then
             export CC="${{ matrix.cc }}" CXX="${{ matrix.cxx }}"
           fi

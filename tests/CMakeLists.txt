@@ -29,7 +29,7 @@ function(minidb_add_test target label)
     target_include_directories(${target} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
     minidb_set_warnings(${target})
     gtest_discover_tests(${target}
-            DISCOVERY_MODE PRE_TEST
+            DISCOVERY_MODE POST_BUILD  # the default; with PRE_TEST the Windows (multi-config) CI job found no tests
             DISCOVERY_TIMEOUT 60
             PROPERTIES LABELS "${label}" TIMEOUT 300)
 endfunction()
