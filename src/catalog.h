@@ -158,6 +158,9 @@ public:
     std::vector<IndexInfo*> Indexes();
 
     void Save();
+    // Throws the in-memory catalog away and reads it again from page 0 (after a
+    // rollback). Every TableInfo* / IndexInfo* handed out before is invalid.
+    void Reload();
 
 private:
     void Load();

@@ -42,6 +42,7 @@ endfunction()
 # ---- unit tests: one binary per component, grouped into two layers ----
 set(MINIDB_STORAGE_COMPONENTS
         checksum
+        wal
         disk_manager
         lru_replacer
         buffer_pool

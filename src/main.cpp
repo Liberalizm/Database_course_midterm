@@ -38,6 +38,8 @@ int main(int argc, char** argv) {
 
     try {
         Database db(path, frames);
+        if (uint64_t n = db.Disk().RecoveredCommits(); n > 0)
+            std::cerr << "note: recovered " << n << " committed statement(s) from the write-ahead log\n";
         Shell shell(db, std::cout);
         bool interactive = ISATTY(FILENO(stdin));
         if (interactive) {

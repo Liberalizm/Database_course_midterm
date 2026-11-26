@@ -21,7 +21,9 @@ struct QueryResult {
 
 class Database {
 public:
-    explicit Database(const std::string& path, size_t pool_frames = 256);
+    // Opening a database recovers its write-ahead log first (see wal.h).
+    explicit Database(const std::string& path, size_t pool_frames = 256, DiskOptions disk_options = {});
+    // Clean shutdown: checkpoints and removes the log.
     ~Database();
 
     // Executes one or more ';'-separated statements; returns one result per statement.
@@ -30,7 +32,9 @@ public:
     // Fills a table with `n` rows of synthetic data (for experimenting with the planner).
     QueryResult Populate(const std::string& table, int64_t n, uint32_t seed = 42);
 
-    void Checkpoint();  // persist catalog + flush all dirty pages
+    // Copies all committed pages from the write-ahead log into the database file
+    // and empties the log. (Also happens automatically as the log grows.)
+    void Checkpoint();
 
     Catalog& GetCatalog() { return *catalog_; }
     BufferPoolManager& Bpm() { return *bpm_; }
@@ -49,6 +53,13 @@ private:
     QueryResult RunDelete(const DeleteStmt& s);
     QueryResult RunUpdate(const UpdateStmt& s);
     QueryResult RunExplain(const ExplainStmt& s);
+    void PopulateRows(const std::string& table, int64_t n, uint32_t seed);
+
+    // Transactions: each modifying statement (and each Populate) is one.
+    // Commit writes the catalog and all dirty pages to the log and makes them
+    // durable; Rollback discards everything since the last commit.
+    void Commit();
+    void Rollback();
 
     // Each modifying statement is atomic: its changes are collected in a WriteSet
     // (write_set.h), which runs the foreign key actions and checks every

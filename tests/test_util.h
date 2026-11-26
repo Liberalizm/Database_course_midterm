@@ -33,17 +33,54 @@ public:
         path_ = (std::filesystem::temp_directory_path() /
                  ("minidb_" + name + "_" + process_tag + "_" + std::to_string(counter++) + ".db"))
                     .string();
-        std::remove(path_.c_str());
+        Remove();
     }
-    ~TempFile() { std::remove(path_.c_str()); }
+    ~TempFile() { Remove(); }
     TempFile(const TempFile&) = delete;
     TempFile& operator=(const TempFile&) = delete;
 
     const std::string& path() const { return path_; }
+    // The database's write-ahead log, next to it (see DiskManager::LogPathFor).
+    std::string wal_path() const { return path_ + ".wal"; }
 
 private:
+    void Remove() const {
+        std::remove(path_.c_str());
+        std::remove(wal_path().c_str());
+    }
+
     std::string path_;
 };
+
+// What a crash would leave behind: copies a live database's file and its
+// write-ahead log (if there is one) to `dst` / `dst`.wal, while it is open.
+inline void CopyCrashImage(const std::string& src, const std::string& dst) {
+    namespace fs = std::filesystem;
+    fs::copy_file(src, dst, fs::copy_options::overwrite_existing);
+    std::remove((dst + ".wal").c_str());
+    if (fs::exists(src + ".wal")) fs::copy_file(src + ".wal", dst + ".wal", fs::copy_options::overwrite_existing);
+}
+
+inline std::vector<char> ReadFileBytes(const std::string& path) {
+    std::vector<char> bytes;
+    if (std::FILE* f = std::fopen(path.c_str(), "rb")) {
+        char buf[1 << 16];
+        size_t n;
+        while ((n = std::fread(buf, 1, sizeof buf, f)) > 0) bytes.insert(bytes.end(), buf, buf + n);
+        std::fclose(f);
+    }
+    return bytes;
+}
+
+inline void WriteFileBytes(const std::string& path, const char* data, size_t n) {
+    std::FILE* f = std::fopen(path.c_str(), "wb");
+    ASSERT_NE(f, nullptr) << path;
+    if (n > 0) std::fwrite(data, 1, n, f);
+    std::fclose(f);
+}
+inline void WriteFileBytes(const std::string& path, const std::vector<char>& bytes) {
+    WriteFileBytes(path, bytes.data(), bytes.size());
+}
 
 inline Column Col(const std::string& name, TypeId type, const std::string& table = "") {
     Column c{};
