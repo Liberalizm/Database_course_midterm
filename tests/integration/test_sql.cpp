@@ -38,6 +38,7 @@ protected:
         for (IndexInfo* idx : db->GetCatalog().IndexesOf(table)) {
             int64_t non_null = Scalar("SELECT COUNT(" + idx->columns[0] + ") FROM " + table);
             EXPECT_EQ(static_cast<int64_t>(idx->tree->CheckAndCount()), non_null) << idx->name;
+            EXPECT_EQ(static_cast<int64_t>(idx->tree->CheckStructure()), non_null) << idx->name;
         }
         EXPECT_EQ(t->row_count, Scalar("SELECT COUNT(*) FROM " + table)) << "row_count statistic drifted";
     }
@@ -1185,6 +1186,45 @@ TEST_F(SqlTest, MultiColumnIndexesMatchSequentialScans) {
     }
     EXPECT_GT(index_scans, 50) << "the multi-column indexes were actually used";
     EXPECT_EQ(Scalar("SELECT COUNT(*) FROM r"), Scalar("SELECT COUNT(*) FROM plain"));
+}
+
+TEST_F(SqlTest, DeletedRowsShrinkTheIndexesAndTheirPagesAreReused) {
+    db->Execute("CREATE TABLE big (id INT PRIMARY KEY, tag TEXT, n INT)");
+    db->Execute("CREATE INDEX big_n ON big (n)");
+    db->Populate("big", 20000);
+    TableInfo* t = db->GetCatalog().RequireTable("big");
+    auto index_pages = [&] {
+        size_t n = 0;
+        for (IndexInfo* idx : db->GetCatalog().IndexesOf("big")) n += idx->tree->Pages().size();
+        return n;
+    };
+    const size_t full = index_pages();
+    EXPECT_EQ(Msg("DELETE FROM big WHERE id > 1000"), "DELETE 19000");
+    ExpectIndexesConsistent("big");
+    EXPECT_LT(index_pages() * 5, full) << "the trees shrank along with the table";
+    EXPECT_EQ(Q("SELECT id FROM big WHERE id = 1000").size(), 1u);
+    EXPECT_EQ(Q("SELECT id FROM big WHERE id = 1001").size(), 0u);
+
+    // The freed index pages (and heap pages) are reused: refilling does not grow the file.
+    const page_id_t file_pages = db->Disk().NumPages();
+    db->Execute("DELETE FROM big");
+    EXPECT_EQ(index_pages(), 2u) << "one empty root leaf per index";
+    db->Populate("big", 1000);
+    EXPECT_LE(db->Disk().NumPages(), file_pages);
+    ExpectIndexesConsistent("big");
+    EXPECT_EQ(t->row_count, 1000);
+}
+
+TEST_F(SqlTest, RolledBackDeleteRestoresTheRebalancedIndex) {
+    db->Execute("CREATE TABLE r (id INT PRIMARY KEY)");
+    db->Populate("r", 5000);
+    db->Execute("BEGIN; DELETE FROM r WHERE id % 10 <> 0; ROLLBACK");
+    ExpectIndexesConsistent("r");
+    EXPECT_EQ(Scalar("SELECT COUNT(*) FROM r WHERE id BETWEEN 1 AND 5000"), 5000);
+    db.reset();
+    db = std::make_unique<Database>(file.path(), 64);
+    ExpectIndexesConsistent("r");
+    EXPECT_EQ(Scalar("SELECT COUNT(*) FROM r"), 5000);
 }
 
 }  // namespace

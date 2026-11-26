@@ -243,6 +243,12 @@ Statement Parser::ParseStatement() {
         e.select = std::make_shared<SelectStmt>(ParseSelect());
         return e;
     }
+    if (AcceptKw("analyze")) {
+        AnalyzeStmt a;
+        AcceptKw("table");
+        if (Peek().type == TokenType::IDENT) a.table = ExpectIdent();
+        return a;
+    }
     if (Statement t; ParseTransaction(&t)) return t;
     Error("unknown statement");
 }
@@ -305,6 +311,10 @@ TypeId Parser::ParseType() {
         type = TypeId::TEXT;
     else if (t == "bool" || t == "boolean")
         type = TypeId::BOOL;
+    else if (t == "date")
+        type = TypeId::DATE;
+    else if (t == "timestamp" || t == "datetime")
+        type = TypeId::TIMESTAMP;
     else
         throw DbError("unknown type \"" + t + "\"");
     if (AcceptSym("(")) {  // VARCHAR(20), NUMERIC(10,2): accepted, size ignored
@@ -904,7 +914,9 @@ ExprPtr Parser::ParseFunctionCall() {
     };
     static const Fn fns[] = {{"abs", 1, 1},   {"round", 1, 2},     {"length", 1, 1}, {"upper", 1, 1},
                              {"lower", 1, 1}, {"substr", 2, 3},    {"coalesce", 1, 64},
-                             {"nullif", 2, 2}};
+                             {"nullif", 2, 2},     {"year", 1, 1},     {"month", 1, 1},
+                             {"day", 1, 1},    {"hour", 1, 1},      {"minute", 1, 1}, {"second", 1, 1},
+                             {"date", 1, 1}};
     for (const Fn& fn : fns) {
         if (name != fn.name) continue;
         std::vector<ExprPtr> args;
@@ -1016,6 +1028,22 @@ ExprPtr Parser::ParsePrimary() {
                 auto sub = std::make_shared<SelectStmt>(ParseSelect());
                 ExpectSym(")");
                 return Expr::Subquery(SubqueryKind::EXISTS, std::move(sub));
+            }
+            // Typed literals: DATE '2024-01-31', TIMESTAMP '2024-01-31 12:00:00'.
+            if (!t.quoted && (t.text == "date" || t.text == "timestamp") && Peek(1).type == TokenType::STRING) {
+                bool is_date = Advance().text == "date";
+                std::string s = Advance().text;
+                return Expr::Const(is_date ? Value::Date(ParseDate(s)) : Value::Timestamp(ParseTimestamp(s)));
+            }
+            if (!t.quoted && t.text == "cast" && Peek(1).type == TokenType::SYMBOL && Peek(1).text == "(") {
+                NestingGuard guard(this);
+                Advance();
+                ExpectSym("(");
+                ExprPtr x = ParseExpr();
+                ExpectKw("as");
+                TypeId type = ParseType();
+                ExpectSym(")");
+                return Expr::Func("cast", {x, Expr::Const(Value::Int(static_cast<int64_t>(type)))});
             }
             if (!t.quoted && Peek(1).type == TokenType::SYMBOL && Peek(1).text == "(") return ParseFunctionCall();
             std::string first = ExpectIdent();

@@ -57,6 +57,7 @@ set(MINIDB_QUERY_COMPONENTS
         expression
         executors
         planner
+        statistics
         shell)
 foreach (component IN LISTS MINIDB_STORAGE_COMPONENTS)
     minidb_add_test(test_${component} "unit;storage;${component}" unit/test_${component}.cpp)
@@ -75,7 +76,7 @@ foreach (f IN LISTS MINIDB_UNIT_FILES)
 endforeach ()
 
 # ---- integration tests ----
-minidb_add_test(test_integration "integration" integration/test_sql.cpp integration/test_persistence.cpp
+minidb_add_test(test_integration "integration" integration/test_sql.cpp integration/test_persistence.cpp integration/test_temporal.cpp integration/test_planner_stats.cpp integration/test_concurrency.cpp
         integration/test_foreign_keys.cpp
         integration/test_transactions.cpp)
 

@@ -86,7 +86,7 @@ TEST_F(BPlusTreeTest, LowerBoundFindsAllDuplicatesAcrossLeaves) {
     EXPECT_EQ(n, 50);
 }
 
-TEST_F(BPlusTreeTest, RemoveIsExactAndLazy) {
+TEST_F(BPlusTreeTest, RemoveIsExact) {
     BPlusTree t(&bpm, INVALID_PAGE_ID, 4, 4);
     for (int i = 0; i < 1000; ++i) t.Insert(i, RID{i, 0});
     for (int i = 0; i < 1000; i += 2) EXPECT_TRUE(t.Remove(i, RID{i, 0}));
@@ -201,6 +201,7 @@ TEST_F(BPlusTreeTest, RandomOperationsMatchReferenceModel) {
             if (step % 97 != 0) continue;
 
             ASSERT_EQ(t.CheckAndCount(), ref.size());
+            ASSERT_EQ(t.CheckStructure(), ref.size()) << "seed " << seed << " step " << step;
             std::vector<IndexKey> all;
             for (auto it = t.Begin(); it.Valid(); it.Next()) all.push_back(it.Entry());
             ASSERT_TRUE(std::equal(all.begin(), all.end(), ref.begin(), ref.end())) << "seed " << seed;
@@ -325,6 +326,7 @@ TEST_F(BPlusTreeTest, WideTreeRandomOperationsMatchReferenceModel) {
                 ASSERT_EQ(t.Remove(k), ref.erase(k) == 1) << "seed " << seed << " step " << step;
             if (step % 89 != 0) continue;
             ASSERT_EQ(t.CheckAndCount(), ref.size());
+            ASSERT_EQ(t.CheckStructure(), ref.size()) << "seed " << seed << " step " << step;
             for (int64_t q = -7; q <= 7; ++q) {
                 for (int64_t q2 = -6; q2 <= 6; q2 += 3) {
                     auto it = t.LowerBound(q, q2);
@@ -363,6 +365,93 @@ TEST_F(BPlusTreeTest, LayoutMismatchIsDetected) {
     EXPECT_THROW(narrow_as_wide.CheckAndCount(), DbError);
     EXPECT_EQ(wide.CheckAndCount(), 50u);
     EXPECT_EQ(bpm.PinnedFrames(), 0u);
+}
+
+// ---- rebalancing on delete ----
+
+TEST_F(BPlusTreeTest, DeletingEverythingShrinksTheTreeToOneLeaf) {
+    for (int fanout : {4, 5, 7}) {
+        BPlusTree t(&bpm, INVALID_PAGE_ID, fanout, fanout);
+        for (int i = 0; i < 2000; ++i) t.Insert(i, RID{i, 0});
+        const size_t pages_before = t.Pages().size();
+        const size_t free_before = bpm.FreePages().size();
+        EXPECT_GE(t.Height(), 4);
+        for (int i = 0; i < 2000; ++i) {
+            ASSERT_TRUE(t.Remove(i, RID{i, 0}));
+            if (i % 101 == 0) {
+                ASSERT_EQ(t.CheckStructure(), static_cast<size_t>(1999 - i)) << "after removing " << i;
+            }
+        }
+        EXPECT_EQ(t.Height(), 1) << "fanout " << fanout;
+        EXPECT_EQ(t.Pages().size(), 1u);
+        EXPECT_EQ(bpm.FreePages().size() - free_before, pages_before - 1) << "every other node was freed";
+        EXPECT_FALSE(t.Begin().Valid());
+        EXPECT_EQ(bpm.PinnedFrames(), 0u);
+    }
+}
+
+TEST_F(BPlusTreeTest, DeletingFromTheMiddleAndBothEndsKeepsTheTreeBalanced) {
+    BPlusTree t(&bpm, INVALID_PAGE_ID, 4, 4);
+    std::set<int64_t> live;
+    for (int i = 0; i < 1500; ++i) {
+        t.Insert(i, RID{i, 0});
+        live.insert(i);
+    }
+    auto remove = [&](int i) {
+        ASSERT_TRUE(t.Remove(i, RID{i, 0}));
+        live.erase(i);
+    };
+    for (int i = 500; i < 1000; ++i) remove(i);   // a hole in the middle
+    for (int i = 0; i < 200; ++i) remove(i);      // the left edge (no left siblings)
+    for (int i = 1499; i >= 1300; --i) remove(i);  // the right edge (no right siblings)
+    EXPECT_EQ(t.CheckStructure(), live.size());
+    std::vector<int64_t> keys = Keys(t);
+    EXPECT_TRUE(std::equal(keys.begin(), keys.end(), live.begin(), live.end()));
+    EXPECT_EQ(t.LowerBound(500).Entry().key, 1000);
+    int64_t mx = 0;
+    ASSERT_TRUE(t.MaxKey(&mx));
+    EXPECT_EQ(mx, 1299);
+}
+
+TEST_F(BPlusTreeTest, FreedNodesAreReusedInsteadOfGrowingTheFile) {
+    BPlusTree t(&bpm, INVALID_PAGE_ID, 4, 4);
+    for (int round = 0; round < 3; ++round) {
+        for (int i = 0; i < 1000; ++i) t.Insert(i, RID{i, 0});
+        for (int i = 0; i < 1000; ++i) t.Remove(i, RID{i, 0});
+    }
+    const page_id_t pages_after_3_rounds = disk.NumPages();
+    for (int i = 0; i < 1000; ++i) t.Insert(i, RID{i, 0});
+    for (int i = 0; i < 1000; ++i) t.Remove(i, RID{i, 0});
+    EXPECT_EQ(disk.NumPages(), pages_after_3_rounds);
+    EXPECT_EQ(t.CheckStructure(), 0u);
+}
+
+TEST_F(BPlusTreeTest, ManyDuplicatesOfOneKeyRebalance) {
+    BPlusTree t(&bpm, INVALID_PAGE_ID, 5, 4, true);
+    for (int i = 0; i < 800; ++i) t.Insert(IndexKey{7, RID{i, 0}, i % 3});
+    for (int i = 0; i < 800; i += 2) ASSERT_TRUE(t.Remove(IndexKey{7, RID{i, 0}, i % 3}));
+    EXPECT_EQ(t.CheckStructure(), 400u);
+    size_t n = 0;
+    for (auto it = t.LowerBound(7); it.Valid(); it.Next()) ++n;
+    EXPECT_EQ(n, 400u);
+    EXPECT_TRUE(t.ContainsKey(7));
+}
+
+TEST_F(BPlusTreeTest, RebalancedTreeSurvivesAReload) {
+    page_id_t root;
+    {
+        BPlusTree t(&bpm, INVALID_PAGE_ID, 6, 5);
+        for (int i = 0; i < 3000; ++i) t.Insert(i * 7 % 3000, RID{i, 0});
+        for (int i = 0; i < 3000; ++i) {
+            if (i % 5 != 0) t.Remove(i * 7 % 3000, RID{i, 0});
+        }
+        root = t.Root();
+        bpm.FlushAll();
+    }
+    BufferPoolManager fresh(16, &disk);
+    BPlusTree t(&fresh, root, 6, 5);
+    EXPECT_EQ(t.CheckStructure(), 600u);
+    EXPECT_EQ(fresh.PinnedFrames(), 0u);
 }
 
 }  // namespace

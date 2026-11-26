@@ -1,6 +1,7 @@
 // bplus_tree.h - disk-based B+ tree index on 64-bit integer keys.
 #pragma once
 
+#include <algorithm>
 #include <climits>
 #include <vector>
 
@@ -57,7 +58,9 @@ public:
     int LeafCapacity() const { return wide_ ? WIDE_LEAF_CAPACITY : LEAF_CAPACITY; }
 
     bool Insert(const IndexKey& k);  // false if the exact entry already exists
-    bool Remove(const IndexKey& k);  // false if not found (no rebalancing: lazy delete)
+    // false if not found. A node left less than half full borrows from or is
+    // merged with a sibling, so the tree shrinks as entries are deleted.
+    bool Remove(const IndexKey& k);
     bool Insert(int64_t key, RID rid) { return Insert(IndexKey{key, rid}); }
     bool Remove(int64_t key, RID rid) { return Remove(IndexKey{key, rid}); }
 
@@ -94,10 +97,17 @@ public:
 
     // Debug: verify sortedness of the leaf chain and return number of entries.
     size_t CheckAndCount() const;
+    // Debug: verify the whole structure (key ranges, equal leaf depth, minimum
+    // fill of non-root nodes, the leaf chain) and return the number of entries.
+    size_t CheckStructure() const;
 
 private:
     page_id_t FindLeaf(const IndexKey& k, std::vector<page_id_t>* path) const;
     void InsertIntoParent(std::vector<page_id_t>& path, page_id_t left, const IndexKey& sep, page_id_t right);
+    void Rebalance(std::vector<page_id_t>& path, page_id_t node);
+    // Fewest entries (leaf) / children (internal) a non-root node keeps.
+    int LeafMin() const { return std::max(1, (leaf_max_ - 1) / 2); }
+    int InternalMin() const { return std::max(2, (internal_max_ - 1) / 2); }
 
     BufferPoolManager* bpm_;
     page_id_t root_;

@@ -17,6 +17,13 @@ Database::Database(const std::string& path, size_t pool_frames, DiskOptions disk
 }
 
 Database::~Database() {
+    {
+        // Nobody may use a database that is being destroyed; whatever a connection
+        // left open is rolled back below.
+        std::lock_guard<std::mutex> lk(mu_);
+        owner_ = nullptr;
+        depth_ = 0;
+    }
     try {
         if (in_txn_ && broken_.empty()) {
             Undo([this] { disk_->Rollback(); });  // never commit implicitly
@@ -69,6 +76,7 @@ void Database::CheckUsable() const {
 }
 
 void Database::Checkpoint() {
+    SessionGuard guard(this, &default_session_);
     CheckUsable();
     // A checkpoint copies committed pages only; inside a transaction it would
     // have to commit first.
@@ -186,12 +194,62 @@ QueryResult Database::RunTransaction(const TransactionStmt& s) {
 
 // ---- statements ----
 
-std::vector<QueryResult> Database::Execute(const std::string& sql) {
+std::vector<QueryResult> Database::Execute(const std::string& sql) { return ExecuteAs(&default_session_, sql); }
+
+std::vector<QueryResult> Database::ExecuteAs(const void* session, const std::string& sql) {
     Parser parser(sql);
     std::vector<Statement> stmts = parser.ParseAll();
+    SessionGuard guard(this, session);
     std::vector<QueryResult> results;
     for (const auto& s : stmts) results.push_back(Run(s));
     return results;
+}
+
+void Database::SetBusyTimeout(std::chrono::milliseconds t) {
+    std::lock_guard<std::mutex> lk(mu_);
+    busy_timeout_ = t;
+}
+
+Database::SessionGuard::SessionGuard(Database* db, const void* session) : db_(db), session_(session) {
+    std::unique_lock<std::mutex> lk(db->mu_);
+    if (!db->released_.wait_for(lk, db->busy_timeout_,
+                                [&] { return db->owner_ == nullptr || db->owner_ == session; }))
+        throw DbError("database is locked: another connection is using it (or has a transaction open)");
+    db->owner_ = session;
+    ++db->depth_;
+}
+
+Database::SessionGuard::~SessionGuard() {
+    {
+        std::lock_guard<std::mutex> lk(db_->mu_);
+        // An open transaction keeps the database for its session.
+        if (--db_->depth_ == 0 && !db_->in_txn_) db_->owner_ = nullptr;
+    }
+    db_->released_.notify_all();
+}
+
+void Database::CloseSession(const void* session) {
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (owner_ != session) return;  // nothing open
+    }
+    SessionGuard guard(this, session);
+    if (in_txn_ && broken_.empty()) {
+        Undo([this] { disk_->Rollback(); });
+        EndTransaction();
+    }
+}
+
+Connection::~Connection() {
+    try {
+        db_->CloseSession(this);
+    } catch (...) {  // the database reports the failure to its next user
+    }
+}
+
+bool Connection::InTransaction() {
+    std::lock_guard<std::mutex> lk(db_->mu_);
+    return db_->owner_ == this && db_->in_txn_;
 }
 
 QueryResult Database::Run(const Statement& stmt) {
@@ -210,6 +268,14 @@ QueryResult Database::Run(const Statement& stmt) {
         if (auto* s = std::get_if<UpdateStmt>(&stmt)) return RunUpdate(*s);
         if (auto* s = std::get_if<AlterTableStmt>(&stmt)) return RunAlterTable(*s);
         if (auto* s = std::get_if<CreateViewStmt>(&stmt)) return RunCreateView(*s);
+        if (auto* s = std::get_if<AnalyzeStmt>(&stmt)) {
+            if (!s->table.empty()) {
+                catalog_->Analyze(catalog_->RequireTable(s->table));
+            } else {
+                for (TableInfo* t : catalog_->Tables()) catalog_->Analyze(t);
+            }
+            return QueryResult{{}, {}, "ANALYZE"};
+        }
         throw DbError("internal: unknown statement");
     });
 }
@@ -255,8 +321,8 @@ QueryResult Database::RunCreateTable(const CreateTableStmt& s) {
     auto check_types = [&](const std::vector<std::string>& key) {
         for (const auto& name : key)
             for (const auto& d : s.cols)
-                if (d.name == name && d.type != TypeId::INT && d.type != TypeId::TEXT)
-                    throw DbError("PRIMARY KEY / UNIQUE is only supported on INT and TEXT columns");
+                if (d.name == name && !IsIndexable(d.type))
+                    throw DbError("PRIMARY KEY / UNIQUE is only supported on INT, TEXT, DATE and TIMESTAMP columns");
     };
     check_types(pk);
     for (const auto& key : unique_keys) check_types(key);
@@ -317,8 +383,8 @@ QueryResult Database::RunAlterTable(const AlterTableStmt& s) {
             const ColumnDef& d = s.column;
             if (t->schema.Find("", d.name) >= 0)
                 throw DbError("column \"" + d.name + "\" of relation \"" + s.table + "\" already exists");
-            if ((d.primary_key || d.unique) && d.type != TypeId::INT && d.type != TypeId::TEXT)
-                throw DbError("PRIMARY KEY / UNIQUE is only supported on INT and TEXT columns");
+            if ((d.primary_key || d.unique) && !IsIndexable(d.type))
+                throw DbError("PRIMARY KEY / UNIQUE is only supported on INT, TEXT, DATE and TIMESTAMP columns");
             // Existing rows get the DEFAULT (or NULL), so NOT NULL needs a non-NULL
             // DEFAULT unless the table is empty, and a UNIQUE column cannot give the
             // same DEFAULT to several rows.
@@ -565,6 +631,7 @@ QueryResult Database::RunUpdate(const UpdateStmt& s) {
 }
 
 QueryResult Database::Populate(const std::string& table, int64_t n, uint32_t seed) {
+    SessionGuard guard(this, &default_session_);
     CheckUsable();
     return Modify([&]() -> QueryResult {
         PopulateRows(table, n, seed);
@@ -659,6 +726,11 @@ void Database::PopulateRows(const std::string& table, int64_t n, uint32_t seed) 
                     } else {
                         r.push_back(Value::Text(std::string(words[rng() % 16]) + "_" + std::to_string(rng() % 1000)));
                     }
+                    break;
+                case TypeId::DATE: r.push_back(Value::Date(DaysFromCivil(2020, 1, 1) + static_cast<int64_t>(rng() % 3650))); break;
+                case TypeId::TIMESTAMP:
+                    r.push_back(Value::Timestamp(DaysFromCivil(2020, 1, 1) * kSecondsPerDay +
+                                                 static_cast<int64_t>(rng() % (3650 * kSecondsPerDay))));
                     break;
                 case TypeId::NULL_T: r.push_back(Value::Null()); break;
             }

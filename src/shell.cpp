@@ -29,12 +29,14 @@ SQL (end every statement with ';'):
          GROUP BY ... HAVING ... ORDER BY ... [DESC] LIMIT n OFFSET m;
   SELECT ... UNION [ALL] | INTERSECT [ALL] | EXCEPT [ALL] SELECT ... [ORDER BY col|n] [LIMIT n];
   UPDATE t SET col = expr WHERE ...;           DELETE FROM t WHERE ...;
-  EXPLAIN [ANALYZE] SELECT ...;
+  EXPLAIN [ANALYZE] SELECT ...;   ANALYZE [t];  (column statistics for the planner)
   BEGIN;  ...  COMMIT; | ROLLBACK;            (without BEGIN, every statement commits on its own)
   SAVEPOINT s;  ROLLBACK TO [SAVEPOINT] s;  RELEASE [SAVEPOINT] s;
   Operators: = <> < <= > >= AND OR NOT + - * / % || LIKE BETWEEN IN IS [NOT] NULL
   CASE [x] WHEN ... THEN ... [ELSE ...] END
-  Functions: ABS ROUND LENGTH UPPER LOWER SUBSTR COALESCE NULLIF
+  Types: INT DOUBLE TEXT BOOL DATE TIMESTAMP   literals: DATE '2024-01-31'  TIMESTAMP '2024-01-31 12:00:00'
+  Functions: ABS ROUND LENGTH UPPER LOWER SUBSTR COALESCE NULLIF  CAST(x AS type)
+             DATE(x) YEAR MONTH DAY HOUR MINUTE SECOND   date +/- days, timestamp +/- seconds, d1 - d2
   Subqueries (may refer to the outer row): (SELECT ...)  x [NOT] IN (SELECT ...)  [NOT] EXISTS (SELECT ...)
                              FROM (SELECT ...) alias
   Aggregates: COUNT(*) COUNT(x) SUM AVG MIN MAX, each also with DISTINCT: COUNT(DISTINCT x)
@@ -202,7 +204,7 @@ bool Shell::RunMeta(const std::string& line) {
                 out_ << "  " << c.name << "  " << TypeName(c.type) << (c.not_null ? "  NOT NULL" : "");
                 if (c.default_value) {
                     const Value& d = *c.default_value;
-                    out_ << "  DEFAULT " << (d.Type() == TypeId::TEXT ? "'" + d.AsText() + "'" : d.ToString());
+                    out_ << "  DEFAULT " << d.ToSqlLiteral();
                 }
                 out_ << "\n";
             }
@@ -213,6 +215,15 @@ bool Shell::RunMeta(const std::string& line) {
                 out_ << "  constraint " << fk->name << " " << fk->ToString() << "\n";
             for (ForeignKey* fk : db_.GetCatalog().ForeignKeysTo(name))
                 out_ << "  referenced by " << fk->table << "(" << fk->column << ") via " << fk->name << "\n";
+            if (t->stats.size() == t->schema.Size()) {  // ANALYZE
+                out_ << "  statistics (" << t->stats[0].rows << " rows when analyzed):";
+                for (size_t i = 0; i < t->stats.size(); ++i) {
+                    const ColumnStats& s = t->stats[i];
+                    out_ << (i ? "," : "") << " " << t->schema.At(i).name << " " << s.distinct << " distinct";
+                    if (s.nulls) out_ << " " << s.nulls << " null";
+                }
+                out_ << "\n";
+            }
         } else if (cmd == ".stats") {
             auto& b = db_.Bpm();
             auto& d = db_.Disk();

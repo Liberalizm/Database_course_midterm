@@ -37,7 +37,7 @@ Type `.help` in the shell for the SQL summary and the meta commands
 
 | Area | Supported |
 |---|---|
-| Types | `INT` (64-bit), `DOUBLE`, `TEXT`, `BOOL`, `NULL` |
+| Types | `INT` (64-bit), `DOUBLE`, `TEXT`, `BOOL`, `DATE`, `TIMESTAMP` (second precision, no time zone, years 1-9999), `NULL`; literals `DATE '2024-01-31'`, `TIMESTAMP '2024-01-31 12:00:00'`, and text in a date context (`d >= '2024-01-01'`) |
 | DDL | `CREATE TABLE` with `PRIMARY KEY`, `UNIQUE`, `NOT NULL`, `DEFAULT`, `REFERENCES` / `FOREIGN KEY`, and composite `PRIMARY KEY (a, b)` / `UNIQUE (a, b)` table constraints; `CREATE [UNIQUE] INDEX` on one or more columns; `CREATE [OR REPLACE] VIEW v [(cols)] AS SELECT ...`; `DROP TABLE / INDEX / VIEW`; `ALTER TABLE ADD / DROP / RENAME [COLUMN]`, `RENAME TO`, `ADD [CONSTRAINT n] FOREIGN KEY`, `DROP CONSTRAINT` |
 | Foreign keys | single-column, to a `PRIMARY KEY` or `UNIQUE` column (the primary key if none is named); `ON DELETE` / `ON UPDATE` `NO ACTION` (default), `RESTRICT`, `CASCADE`, `SET NULL`, `SET DEFAULT`; self-references; checked at the end of each statement |
 | DML | `INSERT ... VALUES / SELECT`, `UPDATE`, `DELETE` — each statement is atomic |
@@ -46,9 +46,9 @@ Type `.help` in the shell for the SQL summary and the meta commands
 | Set operations | `UNION`, `INTERSECT`, `EXCEPT`, each with or without `ALL` |
 | Subqueries | scalar `(SELECT ...)`, `x [NOT] IN (SELECT ...)`, `[NOT] EXISTS (...)`, derived tables `FROM (SELECT ...) alias`; correlated subqueries (referring to the outer row) in `WHERE` (also of `UPDATE` / `DELETE`), `HAVING`, the select list and `UPDATE ... SET` (the row being updated); subqueries in `INSERT ... VALUES` may be correlated within themselves |
 | Expressions | arithmetic (overflow-checked), comparisons, `AND / OR / NOT` with three-valued logic, `LIKE`, `BETWEEN`, `IN (list)`, `IS [NOT] NULL`, `||`, `CASE` |
-| Functions | `ABS`, `ROUND`, `LENGTH`, `UPPER`, `LOWER`, `SUBSTR`, `COALESCE`, `NULLIF` |
+| Functions | `ABS`, `ROUND`, `LENGTH`, `UPPER`, `LOWER`, `SUBSTR`, `COALESCE`, `NULLIF`, `CAST(x AS type)`, `DATE(x)`, `YEAR`, `MONTH`, `DAY`, `HOUR`, `MINUTE`, `SECOND`; date `+`/`-` days, timestamp `+`/`-` seconds, `d1 - d2` (days) |
 | Aggregates | `COUNT(*)`, `COUNT / SUM / AVG / MIN / MAX`, each also with `DISTINCT` |
-| Tools | `EXPLAIN` and `EXPLAIN ANALYZE` |
+| Tools | `EXPLAIN`, `EXPLAIN ANALYZE`, `ANALYZE [table]` (column statistics for the planner) |
 
 Examples (all of them run as an end-to-end test, see
 [`tests/e2e/advanced`](tests/e2e/advanced/1.sql)):
@@ -132,10 +132,13 @@ slots are also validated on access, so a bad page that somehow has a valid
 checksum still produces an error rather than a crash.
 
 **Indexes.** A B+ tree whose entries are (key, RID) pairs, which makes
-non-unique indexes natural. `INT` columns are indexed by value (equality and
+non-unique indexes natural. `INT`, `DATE` and `TIMESTAMP` columns are indexed by value (equality and
 range scans); `TEXT` columns by a 64-bit FNV-1a hash (equality only). Hashes
 can collide, so uniqueness checks compare the real values and index scans
-re-check the condition. Deletes are lazy (nodes are never merged).
+re-check the condition. A delete that leaves a node less than half full
+borrows entries from a sibling or merges the two; the freed page goes to the
+free-page list, and a root left with one child is replaced by it, so an index
+shrinks with its table.
 
 A multi-column index — also behind `PRIMARY KEY (a, b)` and `UNIQUE (a, b)` —
 uses a "wide" tree with a second 64-bit key part: entries are
@@ -159,7 +162,21 @@ written; either side of an outer hash join can be the hashed one, since the
 executor can emit unmatched rows of its build input as well as of its probe
 input. Uncorrelated subqueries are executed once during planning and
 replaced by their result; a correlated one keeps its plan and is re-run for
-every outer row, with the outer values passed in as parameters.
+every outer row, with the outer values passed in as parameters. A condition
+such as `inner.col = outer.col` on an indexed column becomes an index scan
+whose bounds are filled in from the outer row on every run (and the
+condition is still re-checked), so `EXISTS` / scalar subqueries over a large
+indexed table stay cheap.
+
+**Statistics.** `ANALYZE [table]` records for every column the number of
+NULLs and of distinct values, the most common values with their counts, and
+an equi-depth histogram (32 buckets; tables over 30000 rows are sampled for
+these two). They are kept in the catalog and used for the selectivity of
+`=`, `<>`, ranges (`BETWEEN` and `a > x AND a < y` as one range), `IS NULL`
+and `IN`, for equi-join sizes (1 / the larger distinct count) and for the
+number of groups. Without `ANALYZE` the planner falls back to min/max from
+the index and fixed guesses. Changing a table's columns drops its statistics;
+row changes do not, so run `ANALYZE` again after large changes.
 
 **Views.** The catalog stores a view's query as text. Every statement that
 reads the view parses and plans that text again and uses the plan like a
@@ -235,10 +252,31 @@ machine (Windows): 1000 single-row `INSERT`s take ~2 s as autocommit vs
 (or `DiskOptions{.sync = false}`) skips the fsyncs: commits stay atomic if the
 process crashes, but not if the machine loses power.
 
+**Concurrency.** While a database is open its file is locked (`LockFileEx` /
+`flock`), so a second process (or a second `Database` on the same file) is
+refused with "database ... is locked" instead of corrupting it. Inside one
+process, any number of `Connection`s can share a `Database` from different
+threads:
+
+```cpp
+Database db("shop.db");
+Connection a(&db), b(&db);           // e.g. one per thread
+a.Execute("BEGIN; UPDATE acct SET balance = balance - 5 WHERE id = 1");
+b.Execute("SELECT SUM(balance) FROM acct");  // waits until a commits
+```
+
+Statements run one at a time, and an open transaction holds the whole
+database until it commits or rolls back (like SQLite's rollback-journal mode):
+other connections wait, up to a busy timeout (`SetBusyTimeout`, default 5 s),
+then fail with "database is locked". Every schedule is therefore
+serializable and no connection ever sees uncommitted data. A connection that
+is closed with a transaction open rolls it back.
+
 ## Limitations
 
-- One connection at a time: no concurrency control, and no file locking to
-  stop two processes from opening the same database file.
+- Concurrency is coarse: one writer or reader at a time (a database-level
+  lock), so connections never run in parallel. Only one process can have a
+  database open.
 - A transaction's changes stay in the log until it commits, so a very large
   transaction makes the log (not the database file) large until the next
   checkpoint.
@@ -252,16 +290,15 @@ process crashes, but not if the machine loses power.
   columns are applied after the view's rows are produced.
 - Joins are left-deep: no parenthesized joins, and a `RIGHT` / `FULL JOIN`
   cannot follow a comma-separated `FROM` list (write `CROSS JOIN` instead).
-- Indexes on `INT` and `TEXT` columns only. A multi-column index is not used
+- Indexes on `INT`, `TEXT`, `DATE` and `TIMESTAMP` columns only. A multi-column index is not used
   for a range on a column after the second, or on a `TEXT` column.
 - Foreign keys are single-column (they cannot reference a composite
   key), and `RESTRICT` behaves like `NO ACTION` (both are checked at the
   end of the statement).
-- B+ tree nodes are not merged after deletes.
 
 ## Tests
 
-About 500 tests in three layers — unit tests per component, integration
+About 560 tests in three layers — unit tests per component, integration
 tests through the `Database` API, and end-to-end tests that run the shell
 binary against golden output — plus randomized differential and
 file-corruption tests. See [docs/TESTING.md](docs/TESTING.md).

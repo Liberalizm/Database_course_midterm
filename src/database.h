@@ -1,8 +1,11 @@
 // database.h - top-level facade: owns all layers and executes SQL statements.
 #pragma once
 
+#include <chrono>
+#include <condition_variable>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -38,6 +41,19 @@ struct QueryResult {
 //
 // Inside a transaction every statement also runs under a savepoint of its own,
 // so a failing statement is undone without ending the transaction.
+//
+// Concurrency. The database file is locked while it is open, so another
+// process (or a second Database on the same file) is refused instead of
+// corrupting it. Within a process, any number of Connections (see below) can
+// share one Database from any threads. Their statements run one at a time,
+// and an open transaction holds the whole database until it commits or rolls
+// back: other connections wait for it (up to the busy timeout, then their
+// statement fails with "database is locked"). Locking the whole database for
+// the duration of a transaction makes every schedule serializable, and no
+// connection ever sees another's uncommitted changes. Database::Execute itself
+// runs on a built-in default connection.
+class Connection;
+
 class Database {
 public:
     // Opening a database recovers its write-ahead log first.
@@ -48,6 +64,10 @@ public:
 
     // Executes one or more ';'-separated statements; returns one result per statement.
     std::vector<QueryResult> Execute(const std::string& sql);
+
+    // How long a statement waits for another connection's transaction to end
+    // before it fails with "database is locked" (default 5 s).
+    void SetBusyTimeout(std::chrono::milliseconds t);
 
     // Fills a table with `n` rows of synthetic data (for experimenting with the planner).
     // Inside a transaction it becomes part of it, like any other statement.
@@ -67,6 +87,34 @@ public:
     DiskManager& Disk() { return *disk_; }
 
 private:
+    friend class Connection;
+
+    // Exclusive use of the database by one session (a Connection, or the default
+    // session of Execute / Populate / Checkpoint) for the guard's lifetime. While
+    // that session has a transaction open it keeps the database after the guard
+    // is gone. Throws "database is locked" after the busy timeout.
+    class SessionGuard {
+    public:
+        SessionGuard(Database* db, const void* session);
+        ~SessionGuard();
+        SessionGuard(const SessionGuard&) = delete;
+        SessionGuard& operator=(const SessionGuard&) = delete;
+
+    private:
+        Database* db_;
+        const void* session_;
+    };
+    std::vector<QueryResult> ExecuteAs(const void* session, const std::string& sql);
+    // A connection goes away: its open transaction (if any) is rolled back.
+    void CloseSession(const void* session);
+
+    std::mutex mu_;  // guards owner_ and depth_
+    std::condition_variable released_;
+    const void* owner_ = nullptr;  // the session using the database, if any
+    int depth_ = 0;                // nested guards of the owner
+    std::chrono::milliseconds busy_timeout_{5000};
+    const char default_session_ = 0;
+
     QueryResult Run(const Statement& stmt);
     QueryResult RunTransaction(const TransactionStmt& s);
     QueryResult RunCreateTable(const CreateTableStmt& s);
@@ -111,6 +159,24 @@ private:
     bool in_txn_ = false;                  // inside BEGIN ... COMMIT / ROLLBACK
     std::vector<std::string> savepoints_;  // open SAVEPOINTs, outermost first
     std::string broken_;                   // set if a rollback failed: why
+};
+
+// One user of a shared Database: its statements and transactions are its own.
+// Destroying a connection rolls back its open transaction. A Connection must
+// not be used by two threads at once, and must not outlive its Database.
+class Connection {
+public:
+    explicit Connection(Database* db) : db_(db) {}
+    ~Connection();
+    Connection(const Connection&) = delete;
+    Connection& operator=(const Connection&) = delete;
+
+    std::vector<QueryResult> Execute(const std::string& sql) { return db_->ExecuteAs(this, sql); }
+    // Whether this connection has a transaction open (BEGIN without COMMIT).
+    bool InTransaction();
+
+private:
+    Database* db_;
 };
 
 }  // namespace minidb

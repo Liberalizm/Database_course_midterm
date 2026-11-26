@@ -17,16 +17,88 @@ constexpr double CPU_TUPLE_COST = 0.01;  // processing one tuple
 constexpr double RANDOM_PAGE_COST = 2.0;  // random heap page fetch through an index
 constexpr double HASH_TUPLE_COST = 0.02;  // building / probing a hash table
 
-// Heuristic selectivity of a predicate (fraction of rows that pass).
-double Selectivity(const Expr& e) {
+// Column statistics of a canonical column reference, or nullptr (not a column,
+// or its table was never analyzed). See Planner::StatsLookupFor.
+using StatsLookup = std::function<const ColumnStats*(const Expr& column)>;
+
+const ColumnStats* StatsOf(const StatsLookup& stats, const Expr& e) {
+    return stats && e.kind == ExprKind::COLUMN ? stats(e) : nullptr;
+}
+
+bool IsComparison(BinOp op) {
+    return op == BinOp::EQ || op == BinOp::NE || op == BinOp::LT || op == BinOp::LE || op == BinOp::GT ||
+           op == BinOp::GE;
+}
+
+BinOp Flip(BinOp op);
+
+// `e` is  column <op> constant  (or the reverse) on an analyzed column: returns
+// the column's statistics, with *op written as if the column were on the left.
+const ColumnStats* ColumnVsConst(const Expr& e, const StatsLookup& stats, const Value** v, BinOp* op) {
+    if (e.kind != ExprKind::BINARY || !IsComparison(e.op)) return nullptr;
+    const Expr* c = e.left.get();
+    const Expr* k = e.right.get();
+    BinOp o = e.op;
+    if (c->kind != ExprKind::COLUMN) {
+        std::swap(c, k);
+        o = Flip(o);
+    }
+    if (k->kind != ExprKind::CONST) return nullptr;
+    const ColumnStats* cs = StatsOf(stats, *c);
+    if (!cs) return nullptr;
+    *v = &k->value;
+    *op = o;
+    return cs;
+}
+
+// Fraction of rows with column <op> v, from statistics (nullopt: not estimable).
+std::optional<double> StatsSelectivity(const ColumnStats& cs, BinOp op, const Value& v) {
+    if (v.IsNull()) return 0.0;  // a comparison with NULL is never true
+    const double non_null = 1.0 - cs.NullFrac();
+    std::optional<double> r;
+    switch (op) {
+        case BinOp::EQ: r = cs.EqFrac(v); break;
+        case BinOp::NE:
+            if (auto eq = cs.EqFrac(v)) r = non_null - *eq;
+            break;
+        case BinOp::LT: r = cs.LessFrac(v, false); break;
+        case BinOp::LE: r = cs.LessFrac(v, true); break;
+        case BinOp::GT:
+            if (auto le = cs.LessFrac(v, true)) r = non_null - *le;
+            break;
+        case BinOp::GE:
+            if (auto lt = cs.LessFrac(v, false)) r = non_null - *lt;
+            break;
+        default: break;
+    }
+    if (r) r = std::clamp(*r, 0.0, 1.0);
+    return r;
+}
+
+double SelectivityOf(const std::vector<ExprPtr>& es, const StatsLookup& stats = nullptr);
+
+// Selectivity of a predicate (fraction of rows that pass): from column
+// statistics where they exist, otherwise fixed heuristics.
+double Selectivity(const Expr& e, const StatsLookup& stats = nullptr) {
     switch (e.kind) {
-        case ExprKind::BINARY:
+        case ExprKind::BINARY: {
+            if (e.op == BinOp::AND) return SelectivityOf({e.left, e.right}, stats);
+            if (e.op == BinOp::OR) {
+                double a = Selectivity(*e.left, stats), b = Selectivity(*e.right, stats);
+                return a + b - a * b;
+            }
+            const Value* v;
+            BinOp op;
+            if (const ColumnStats* cs = ColumnVsConst(e, stats, &v, &op))
+                if (auto s = StatsSelectivity(*cs, op, *v)) return *s;
+            if (e.op == BinOp::EQ) {
+                const ColumnStats* l = StatsOf(stats, *e.left);
+                const ColumnStats* r = StatsOf(stats, *e.right);
+                if (l && r && l->distinct > 0 && r->distinct > 0)  // column = column
+                    return 1.0 / static_cast<double>(std::max(l->distinct, r->distinct));
+                if (l || r) return (l ? l : r)->AvgEqFrac();  // column = some other value
+            }
             switch (e.op) {
-                case BinOp::AND: return Selectivity(*e.left) * Selectivity(*e.right);
-                case BinOp::OR: {
-                    double a = Selectivity(*e.left), b = Selectivity(*e.right);
-                    return a + b - a * b;
-                }
                 case BinOp::EQ: return 0.05;
                 case BinOp::NE: return 0.95;
                 case BinOp::LT:
@@ -36,16 +108,54 @@ double Selectivity(const Expr& e) {
                 case BinOp::LIKE: return 0.1;
                 default: return 0.5;
             }
-        case ExprKind::UNARY: return e.uop == UnaryOp::NOT ? 1.0 - Selectivity(*e.left) : 0.5;
-        case ExprKind::IS_NULL: return e.negated ? 0.95 : 0.05;
+        }
+        case ExprKind::UNARY: return e.uop == UnaryOp::NOT ? 1.0 - Selectivity(*e.left, stats) : 0.5;
+        case ExprKind::IS_NULL:
+            if (const ColumnStats* cs = StatsOf(stats, *e.left)) return e.negated ? 1.0 - cs->NullFrac() : cs->NullFrac();
+            return e.negated ? 0.95 : 0.05;
+        case ExprKind::IN_SET:
+            if (const ColumnStats* cs = StatsOf(stats, *e.left)) {
+                double in = std::min(1.0 - cs->NullFrac(), static_cast<double>(e.in_set->size()) * cs->AvgEqFrac());
+                return e.negated ? std::max(0.0, 1.0 - cs->NullFrac() - in) : in;
+            }
+            return 0.5;
         case ExprKind::CONST: return (e.value.Type() == TypeId::BOOL && e.value.AsBool()) ? 1.0 : 0.0;
         default: return 0.5;
     }
 }
 
-double SelectivityOf(const std::vector<ExprPtr>& es) {
+// Product of the conjuncts' selectivities, except that range conditions on the
+// same analyzed column (a > 5 AND a <= 9, BETWEEN) are combined into one range
+// instead of being treated as independent.
+double SelectivityOf(const std::vector<ExprPtr>& es, const StatsLookup& stats) {
+    struct Range {
+        const ColumnStats* cs;
+        std::optional<double> below_lo, below_hi;  // fraction below the lower / upper bound
+    };
+    std::map<std::string, Range> ranges;
     double s = 1.0;
-    for (const auto& e : es) s *= Selectivity(*e);
+    for (const auto& e : es) {
+        const Value* v;
+        BinOp op;
+        const ColumnStats* cs = ColumnVsConst(*e, stats, &v, &op);
+        if (cs && !v->IsNull() && op != BinOp::EQ && op != BinOp::NE) {
+            auto below = cs->LessFrac(*v, op == BinOp::GT || op == BinOp::LE);
+            if (below) {
+                const Expr& col = e->left->kind == ExprKind::COLUMN ? *e->left : *e->right;
+                Range& r = ranges.emplace(col.ToString(), Range{cs, {}, {}}).first->second;
+                if (op == BinOp::GT || op == BinOp::GE)
+                    r.below_lo = std::max(r.below_lo.value_or(0.0), *below);
+                else
+                    r.below_hi = std::min(r.below_hi.value_or(1.0), *below);
+                continue;
+            }
+        }
+        s *= Selectivity(*e, stats);
+    }
+    for (const auto& [name, r] : ranges) {
+        double hi = r.below_hi.value_or(1.0 - r.cs->NullFrac());
+        s *= std::max(0.0, hi - r.below_lo.value_or(0.0));
+    }
     return s;
 }
 
@@ -78,7 +188,7 @@ bool MatchKeyPredicate(const Expr& e, const std::string& alias, const std::strin
     if (c->table != alias || c->column != column) return false;
     if (k->value.Type() != type) return false;
     if (type == TypeId::TEXT && o != BinOp::EQ) return false;
-    if (type != TypeId::TEXT && type != TypeId::INT) return false;
+    if (!IsIndexable(type)) return false;
     *op = o;
     *constant = &k->value;
     return true;
@@ -315,17 +425,50 @@ void Planner::ReferencedTables(const Expr& e, const std::vector<Source>& srcs, s
     for (const auto& a : e.args) ReferencedTables(*a, srcs, out);
 }
 
+// Whether `e` depends only on the outer row of a correlated subquery: built
+// from PARAMs (at least one) and constants, so it has one value per run.
+static bool OnlyOuterValues(const Expr& e, bool* has_param) {
+    switch (e.kind) {
+        case ExprKind::PARAM: *has_param = true; return true;
+        case ExprKind::CONST: return true;
+        case ExprKind::BINARY:
+        case ExprKind::UNARY:
+        case ExprKind::FUNC: break;
+        default: return false;  // columns, aggregates, subqueries, ...
+    }
+    if (e.left && !OnlyOuterValues(*e.left, has_param)) return false;
+    if (e.right && !OnlyOuterValues(*e.right, has_param)) return false;
+    for (const auto& a : e.args)
+        if (!OnlyOuterValues(*a, has_param)) return false;
+    return true;
+}
+
+std::function<const ColumnStats*(const Expr&)> Planner::StatsLookupFor(const std::vector<Source>* srcs) {
+    return [srcs](const Expr& col) -> const ColumnStats* {
+        if (col.kind != ExprKind::COLUMN || col.prebound) return nullptr;
+        for (const Source& s : *srcs) {
+            if (!s.table || s.alias != col.table || s.table->stats.size() != s.table->schema.Size()) continue;
+            int i = s.table->schema.Find("", col.column);
+            return i < 0 ? nullptr : &s.table->stats[static_cast<size_t>(i)];
+        }
+        return nullptr;
+    };
+}
+
 std::unique_ptr<ScanExecutor> Planner::BuildAccessPath(const Source& src, const std::vector<ExprPtr>& conjuncts) {
     TableInfo* t = src.table;
+    const std::vector<Source> self{src};
+    const StatsLookup stats = StatsLookupFor(&self);
     const double rows = std::max(1.0, static_cast<double>(t->row_count));
     const double pages = std::max(1.0, static_cast<double>(t->heap->PageCount()));
 
     // Option 1: full sequential scan.
     double best_cost = pages + rows * CPU_TUPLE_COST;
-    double best_rows = rows * SelectivityOf(conjuncts);
+    double best_rows = rows * SelectivityOf(conjuncts, stats);
     IndexInfo* best_idx = nullptr;
     std::optional<IndexBound> best_lo, best_hi;
     std::vector<size_t> best_answered;
+    std::vector<IndexScanExecutor::ParamBound> best_params;
 
     // Option 2..n: an index scan for every usable index. A multi-column index is
     // searched on its leading column, and once that is fixed by an equality, also
@@ -343,6 +486,8 @@ std::unique_ptr<ScanExecutor> Planner::BuildAccessPath(const Source& src, const 
         double domain = have_stats ? static_cast<double>(kmax) - static_cast<double>(kmin) + 1.0 : 0.0;
 
         double matched;
+        bool exactly_one = false;  // a unique index, every key column fixed
+        std::vector<IndexScanExecutor::ParamBound> params;  // bounds from the outer row
         std::vector<size_t> used;      // conjuncts the scan bounds come from (for estimates)
         std::vector<size_t> answered;  // ... of which the scan alone guarantees (no re-check)
         if (k0.eq_conj) {
@@ -380,9 +525,10 @@ std::unique_ptr<ScanExecutor> Planner::BuildAccessPath(const Source& src, const 
                     narrow = std::pow(0.05, static_cast<double>(rest.size()));
                 }
             }
-            if (idx->unique && full_key)
+            if (idx->unique && full_key) {
                 matched = 1.0;
-            else if (have_stats)
+                exactly_one = true;
+            } else if (have_stats)
                 matched = (eq_val < kmin || eq_val > kmax) ? 1.0 : std::max(1.0, rows / domain * narrow);
             else
                 matched = std::max(1.0, rows * 0.05 * narrow);
@@ -401,7 +547,41 @@ std::unique_ptr<ScanExecutor> Planner::BuildAccessPath(const Source& src, const 
                 matched = std::max(1.0, rows * ((lo && hi) ? 0.1 : 0.3));
             }
         } else {
-            continue;
+            // In a correlated subquery: the leading column compared with a value
+            // of the outer row (inner.col = outer.col). The bounds are filled in
+            // whenever the subquery runs again; the conditions stay in the filter.
+            for (size_t i = 0; i < conjuncts.size(); ++i) {
+                const Expr& e = *conjuncts[i];
+                if (e.kind != ExprKind::BINARY || !IsComparison(e.op) || e.op == BinOp::NE) continue;
+                const bool col_left = e.left->kind == ExprKind::COLUMN;
+                const Expr& c = col_left ? *e.left : *e.right;
+                const ExprPtr& x = col_left ? e.right : e.left;
+                const BinOp o = col_left ? e.op : Flip(e.op);
+                if (c.kind != ExprKind::COLUMN || c.table != src.alias || c.column != idx->columns[0]) continue;
+                bool has_param = false;
+                if (!OnlyOuterValues(*x, &has_param) || !has_param) continue;
+                if (idx->hashed && o != BinOp::EQ) continue;
+                params.push_back({o, BindExpr(x, Schema{})});
+                used.push_back(i);
+            }
+            if (params.empty()) continue;
+            const bool eq = std::any_of(params.begin(), params.end(),
+                                        [](const IndexScanExecutor::ParamBound& b) { return b.op == BinOp::EQ; });
+            if (eq && idx->unique && !idx->Composite()) {
+                matched = 1.0;
+                exactly_one = true;
+            } else if (eq) {
+                matched = have_stats ? std::max(1.0, rows / domain) : std::max(1.0, rows * 0.05);
+            } else {
+                matched = std::max(1.0, rows * 0.3);
+            }
+        }
+        // With statistics on the leading column (ANALYZE), they replace the
+        // uniform-distribution guess above.
+        if (!exactly_one && stats(*Expr::Col(src.alias, idx->columns[0]))) {
+            std::vector<ExprPtr> used_conds;
+            for (size_t i : used) used_conds.push_back(conjuncts[i]);
+            matched = std::max(1.0, rows * SelectivityOf(used_conds, stats));
         }
         // Only conditions on an INT leading column are answered exactly. A TEXT one
         // is looked up by hash, and key2 can be a hash or stand for a NULL, so
@@ -423,7 +603,8 @@ std::unique_ptr<ScanExecutor> Planner::BuildAccessPath(const Source& src, const 
             best_lo = lo;
             best_hi = hi;
             best_answered = answered;
-            best_rows = matched * SelectivityOf(rest);
+            best_params = params;
+            best_rows = matched * SelectivityOf(rest, stats);
         }
     }
 
@@ -436,9 +617,14 @@ std::unique_ptr<ScanExecutor> Planner::BuildAccessPath(const Source& src, const 
     ExprPtr bound = pred ? BindExpr(pred, src.schema) : nullptr;
 
     std::unique_ptr<ScanExecutor> scan;
-    if (best_idx)
-        scan = std::make_unique<IndexScanExecutor>(t, best_idx, src.alias, src.schema, best_lo, best_hi, bound);
-    else
+    if (best_idx) {
+        auto index_scan =
+            std::make_unique<IndexScanExecutor>(t, best_idx, src.alias, src.schema, best_lo, best_hi, bound);
+        if (!best_params.empty())
+            index_scan->SetParamBounds(std::move(best_params),
+                                       t->schema.At(static_cast<size_t>(best_idx->col_idxs[0])).type);
+        scan = std::move(index_scan);
+    } else
         scan = std::make_unique<SeqScanExecutor>(t, src.alias, src.schema, bound);
     scan->est_rows = std::max(1.0, best_rows);
     scan->est_cost = best_cost;
@@ -680,6 +866,8 @@ ExecPtr Planner::PlanSelect(const SelectStmt& stmt) {
         }
     }
 
+    const StatsLookup stats = StatsLookupFor(&srcs);
+
     // ---------- 5. access paths ----------
     std::vector<ExecPtr> base(srcs.size());
     for (size_t i = 0; i < srcs.size(); ++i) {
@@ -694,7 +882,7 @@ ExecPtr Planner::PlanSelect(const SelectStmt& stmt) {
         if (!per_table[i].empty()) {  // conditions on the subquery alone filter its rows
             ExprPtr pred = BindExpr(MakeConjunction(per_table[i]), node->OutSchema());
             node = std::make_unique<FilterExecutor>(std::move(node), pred);
-            node->est_rows = std::max(1.0, est * SelectivityOf(per_table[i]));
+            node->est_rows = std::max(1.0, est * SelectivityOf(per_table[i], stats));
             node->est_cost = cost + est * CPU_TUPLE_COST;
         }
         base[i] = std::move(node);
@@ -705,7 +893,7 @@ ExecPtr Planner::PlanSelect(const SelectStmt& stmt) {
     std::set<int> joined;
     auto add_filter = [&](ExecPtr node, const std::vector<ExprPtr>& conds) {
         if (conds.empty()) return node;
-        double est = node->est_rows * SelectivityOf(conds), cost = node->est_cost;
+        double est = node->est_rows * SelectivityOf(conds, stats), cost = node->est_cost;
         ExprPtr pred = BindExpr(MakeConjunction(conds), node->OutSchema());
         auto f = std::make_unique<FilterExecutor>(std::move(node), pred);
         f->est_rows = std::max(1.0, est);
@@ -765,7 +953,23 @@ ExecPtr Planner::PlanSelect(const SelectStmt& stmt) {
             // Hash join; the smaller input becomes the build (hashed) side. Either
             // side of an outer join can be the preserved one: the executor's join
             // type is relative to (probe, build), so it flips when `left` is built.
-            out_rows = l_rows * r_rows / std::max(l_rows, r_rows) * SelectivityOf(residual);
+            // Each key pair keeps 1 / max(distinct values on either side) of the
+            // cross product. Without statistics: as if every left row matched once.
+            double keep = 1.0 / std::max(l_rows, r_rows);
+            bool analyzed = false;
+            double key_keep = 1.0;
+            for (size_t i = 0; i < lkeys.size(); ++i) {
+                const ColumnStats* ls = StatsOf(stats, *lkeys[i]);
+                const ColumnStats* rs = StatsOf(stats, *rkeys[i]);
+                if (!ls && !rs) continue;
+                analyzed = true;
+                double nd = 1.0;
+                if (ls) nd = std::max(nd, std::min(static_cast<double>(ls->distinct), l_rows));
+                if (rs) nd = std::max(nd, std::min(static_cast<double>(rs->distinct), r_rows));
+                key_keep /= nd;
+            }
+            if (analyzed) keep = key_keep;
+            out_rows = l_rows * r_rows * keep * SelectivityOf(residual, stats);
             cost = l_cost + r_cost + (l_rows + r_rows) * HASH_TUPLE_COST;
             std::string text;
             for (size_t i = 0; i < cond_text.size(); ++i) text += (i ? " AND " : "") + cond_text[i];
@@ -787,7 +991,7 @@ ExecPtr Planner::PlanSelect(const SelectStmt& stmt) {
             join = std::make_unique<HashJoinExecutor>(std::move(probe), std::move(build), pk, bk, res, text,
                                                       hash_type);
         } else {
-            out_rows = l_rows * r_rows * SelectivityOf(residual);
+            out_rows = l_rows * r_rows * SelectivityOf(residual, stats);
             cost = l_cost + l_rows * r_cost + l_rows * r_rows * CPU_TUPLE_COST;
             Schema combined = Schema::Concat(left->OutSchema(), right->OutSchema());
             ExprPtr pred = residual.empty() ? nullptr : BindExpr(MakeConjunction(residual), combined);
@@ -928,7 +1132,23 @@ ExecPtr Planner::PlanSelect(const SelectStmt& stmt) {
         }
         double in_rows = root->est_rows, in_cost = root->est_cost;
         auto agg = std::make_unique<AggregateExecutor>(std::move(root), bound_groups, group_keys, aggs);
-        agg->est_rows = group_by.empty() ? 1.0 : std::max(1.0, in_rows * 0.1);
+        // Groups: the product of the grouped columns' distinct counts (NULL is a
+        // group too) when all are analyzed columns, else a tenth of the input.
+        double groups = in_rows * 0.1;
+        if (!group_by.empty()) {
+            double prod = 1.0;
+            bool all = true;
+            for (const auto& g : group_by) {
+                const ColumnStats* cs = StatsOf(stats, *g);
+                if (!cs) {
+                    all = false;
+                    break;
+                }
+                prod *= static_cast<double>(cs->distinct + (cs->nulls > 0 ? 1 : 0));
+            }
+            if (all) groups = std::min(in_rows, prod);
+        }
+        agg->est_rows = group_by.empty() ? 1.0 : std::max(1.0, groups);
         agg->est_cost = in_cost + in_rows * HASH_TUPLE_COST;
         root = std::move(agg);
         if (having) {

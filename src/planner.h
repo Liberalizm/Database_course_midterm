@@ -8,6 +8,7 @@
 //   * hash join build side      - the smaller (estimated) input is hashed
 #pragma once
 
+#include <functional>
 #include <map>
 #include <memory>
 #include <set>
@@ -89,6 +90,8 @@ private:
     // already processed left operand of IN.
     ExprPtr RunSubquery(const Expr& node, ExprPtr left, const std::vector<Source>* srcs);
     static void ReferencedTables(const Expr& e, const std::vector<Source>& srcs, std::set<int>* out);
+    // Statistics (ANALYZE) of a column of one of `srcs`, for the estimates.
+    static std::function<const ColumnStats*(const Expr&)> StatsLookupFor(const std::vector<Source>* srcs);
 
     Catalog* catalog_;
 };

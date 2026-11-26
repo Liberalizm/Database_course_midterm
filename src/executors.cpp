@@ -55,10 +55,53 @@ IndexScanExecutor::IndexScanExecutor(TableInfo* table, IndexInfo* index, std::st
                                      std::optional<IndexBound> lo, std::optional<IndexBound> hi, ExprPtr pred)
     : table_(table), index_(index), alias_(std::move(alias)), lo_(lo), hi_(hi), pred_(std::move(pred)) {
     schema_ = std::move(schema);
+    static_lo_ = lo;
+    static_hi_ = hi;
+}
+
+void IndexScanExecutor::SetParamBounds(std::vector<ParamBound> bounds, TypeId key_type) {
+    param_bounds_ = std::move(bounds);
+    key_type_ = key_type;
 }
 
 void IndexScanExecutor::InitImpl() {
     done_ = false;
+    if (!param_bounds_.empty()) {
+        lo_ = static_lo_;
+        hi_ = static_hi_;
+        for (const ParamBound& b : param_bounds_) {
+            Value v = Evaluate(*b.value, {});
+            if (v.IsNull()) {  // a comparison with NULL is never true
+                done_ = true;
+                return;
+            }
+            // The nearest key value k of the column's type. If k differs from v
+            // (2.5 for an INT column), "=" matches nothing, and a range is bounded
+            // at k, inclusive exactly when k lies on the matching side of v.
+            std::optional<int64_t> key;
+            int cmp = 0;  // k compared with v
+            try {
+                Value k = v.CastTo(key_type_);
+                cmp = k.Compare(v);
+                key = IndexKeyPart(k);
+            } catch (const DbError&) {  // incomparable: the filter reports it
+            }
+            if (!key) continue;
+            if (cmp != 0 && b.op == BinOp::EQ) {
+                done_ = true;
+                return;
+            }
+            const bool lower = b.op == BinOp::EQ || b.op == BinOp::GT || b.op == BinOp::GE;
+            const bool upper = b.op == BinOp::EQ || b.op == BinOp::LT || b.op == BinOp::LE;
+            bool incl;
+            if (cmp == 0)
+                incl = b.op == BinOp::EQ || b.op == BinOp::GE || b.op == BinOp::LE;
+            else
+                incl = lower ? cmp > 0 : cmp < 0;
+            if (lower && (!lo_ || *key > lo_->value || (*key == lo_->value && !incl))) lo_ = IndexBound{*key, incl};
+            if (upper && (!hi_ || *key < hi_->value || (*key == hi_->value && !incl))) hi_ = IndexBound{*key, incl};
+        }
+    }
     if (!lo_) {
         it_.emplace(index_->tree->Begin());
         return;
@@ -125,9 +168,19 @@ std::string IndexScanExecutor::Describe() const {
     auto side = [&](const IndexBound& b) {
         return b.has2 ? "(" + col + ", " + col2 + ")" : col;
     };
-    auto value = [](const IndexBound& b) {
-        return b.has2 ? "(" + std::to_string(b.value) + ", " + std::to_string(b.value2) + ")"
-                      : std::to_string(b.value);
+    // A DATE / TIMESTAMP key is shown as a literal of its type, not as a number.
+    auto key_text = [&](int64_t k, size_t col_pos, bool hashed) {
+        TypeId t = table_->schema.At(static_cast<size_t>(index_->col_idxs[col_pos])).type;
+        if (hashed || !IsTemporal(t)) return std::to_string(k);
+        try {
+            return (t == TypeId::DATE ? Value::Date(k) : Value::Timestamp(k)).ToSqlLiteral();
+        } catch (const DbError&) {  // a sentinel bound outside the calendar
+            return std::to_string(k);
+        }
+    };
+    auto value = [&](const IndexBound& b) {
+        std::string v = key_text(b.value, 0, index_->hashed);
+        return b.has2 ? "(" + v + ", " + key_text(b.value2, 1, index_->Key2Hashed()) + ")" : v;
     };
     if (lo_ && hi_ && lo_->inclusive && hi_->inclusive && lo_->value == hi_->value && lo_->has2 == hi_->has2 &&
         (!lo_->has2 || lo_->value2 == hi_->value2)) {
@@ -135,6 +188,11 @@ std::string IndexScanExecutor::Describe() const {
     } else {
         if (lo_) conds.push_back(side(*lo_) + (lo_->inclusive ? " >= " : " > ") + value(*lo_));
         if (hi_) conds.push_back(side(*hi_) + (hi_->inclusive ? " <= " : " < ") + value(*hi_));
+    }
+    if (!param_bounds_.empty()) {  // bounds from the outer row (see SetParamBounds)
+        conds.clear();
+        for (const ParamBound& b : param_bounds_)
+            conds.push_back(col + " " + BinOpSymbol(b.op) + " " + b.value->ToString());
     }
     if (!conds.empty()) s += "  Index Cond: " + Join(conds, " AND ");
     if (pred_) s += "  Filter: " + pred_->ToString();

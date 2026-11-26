@@ -76,6 +76,8 @@ void WriteValue(Writer& w, const Value& v) {
         }
         case TypeId::BOOL: w.U8(v.AsBool() ? 1 : 0); break;
         case TypeId::TEXT: w.Str(v.AsText()); break;
+        case TypeId::DATE: w.I64(v.AsDays()); break;
+        case TypeId::TIMESTAMP: w.I64(v.AsSeconds()); break;
         case TypeId::NULL_T: break;
     }
 }
@@ -91,6 +93,8 @@ Value ReadValue(Reader& r) {
         }
         case TypeId::BOOL: return Value::Bool(r.U8() != 0);
         case TypeId::TEXT: return Value::Text(r.Str());
+        case TypeId::DATE: return Value::Date(r.I64());
+        case TypeId::TIMESTAMP: return Value::Timestamp(r.I64());
         case TypeId::NULL_T: return Value::Null();
     }
     throw DbError("catalog is corrupt (bad value type)");
@@ -246,6 +250,29 @@ std::string Catalog::Serialize() const {
         w.U8(static_cast<uint8_t>(fk->on_delete));
         w.U8(static_cast<uint8_t>(fk->on_update));
     }
+    // Column statistics (ANALYZE): [count u32] then (table, rows i64, [ncols u32],
+    // per column: nulls i64, distinct i64, [nmcv u32] (value, count i64) each,
+    // [nhist u32] values). Appended last as well.
+    uint32_t nstats = 0;
+    for (auto& [name, t] : tables_) nstats += t->stats.empty() ? 0 : 1;
+    w.U32(nstats);
+    for (auto& [name, t] : tables_) {
+        if (t->stats.empty()) continue;
+        w.Str(t->name);
+        w.I64(t->stats[0].rows);
+        w.U32(static_cast<uint32_t>(t->stats.size()));
+        for (const ColumnStats& s : t->stats) {
+            w.I64(s.nulls);
+            w.I64(s.distinct);
+            w.U32(static_cast<uint32_t>(s.mcv.size()));
+            for (size_t i = 0; i < s.mcv.size(); ++i) {
+                WriteValue(w, s.mcv[i]);
+                w.I64(s.mcv_counts[i]);
+            }
+            w.U32(static_cast<uint32_t>(s.histogram.size()));
+            for (const Value& v : s.histogram) WriteValue(w, v);
+        }
+    }
     return std::move(w.buf);
 }
 
@@ -284,7 +311,9 @@ void Catalog::Load() {
         for (uint32_t j = 0; j < nc; ++j) {
             Column c;
             c.name = r.Str();
-            c.type = static_cast<TypeId>(r.U8());
+            uint8_t type = r.U8();
+            if (type == 0 || type > kMaxTypeId) throw DbError("catalog is corrupt (bad column type)");
+            c.type = static_cast<TypeId>(type);
             c.not_null = r.U8() != 0;
             c.table = t->name;
             cols.push_back(c);
@@ -380,9 +409,35 @@ void Catalog::Load() {
             foreign_keys_[name] = std::move(fk);
         }
     }
+    if (r.pos < data.size()) {  // absent in files from before ANALYZE existed
+        uint32_t ns = r.U32();
+        for (uint32_t i = 0; i < ns; ++i) {
+            TableInfo* t = RequireTable(r.Str());
+            const int64_t rows = r.I64();
+            const uint32_t nc = r.U32();
+            if (nc != t->schema.Size() || rows < 0) throw DbError("catalog is corrupt (bad statistics)");
+            std::vector<ColumnStats> stats(nc);
+            for (ColumnStats& s : stats) {
+                s.rows = rows;
+                s.nulls = r.I64();
+                s.distinct = r.I64();
+                uint32_t nm = r.U32();
+                if (nm > ColumnStats::kMaxMcv) throw DbError("catalog is corrupt (bad statistics)");
+                for (uint32_t j = 0; j < nm; ++j) {
+                    s.mcv.push_back(ReadValue(r));
+                    s.mcv_counts.push_back(r.I64());
+                }
+                uint32_t nh = r.U32();
+                if (nh > ColumnStats::kBuckets + 1) throw DbError("catalog is corrupt (bad statistics)");
+                for (uint32_t j = 0; j < nh; ++j) s.histogram.push_back(ReadValue(r));
+            }
+            t->stats = std::move(stats);
+        }
+    }
     for (auto& [name, idx] : indexes_) {
         try {
-            ResolveIndexColumns(idx.get(), RequireTable(idx->table)->schema);
+            ResolveIndexColumns(
+idx.get(), RequireTable(idx->table)->schema);
         } catch (const DbError&) {
             throw DbError("catalog is corrupt (index \"" + name + "\" on unknown or unindexable columns)");
         }
@@ -403,8 +458,8 @@ void Catalog::ResolveIndexColumns(IndexInfo* idx, const Schema& schema) {
         int col = schema.Find("", name);
         if (col < 0) throw DbError("column \"" + name + "\" does not exist in table \"" + idx->table + "\"");
         TypeId type = schema.At(static_cast<size_t>(col)).type;
-        if (type != TypeId::INT && type != TypeId::TEXT)
-            throw DbError("indexes are only supported on INT and TEXT columns (\"" + name + "\" is " + TypeName(type) +
+        if (!IsIndexable(type))
+            throw DbError("indexes are only supported on INT, TEXT, DATE and TIMESTAMP columns (\"" + name + "\" is " + TypeName(type) +
                           ")");
         idx->col_idxs.push_back(col);
     }
@@ -598,6 +653,7 @@ void Catalog::RewriteTable(TableInfo* t, std::vector<Column> cols, const std::fu
     t->first_page = first;
     t->heap = std::move(heap);
     FreePages(old_pages);
+    t->stats.clear();  // the columns changed
     for (const auto& d : keep) CreateIndex(d.name, t->name, d.columns, d.unique);
 }
 
@@ -674,6 +730,8 @@ int64_t IndexKeyPart(const Value& v) {
     switch (v.Type()) {
         case TypeId::INT: return v.AsInt();
         case TypeId::TEXT: return HashTextKey(v.AsText());
+        case TypeId::DATE: return v.AsDays();
+        case TypeId::TIMESTAMP: return v.AsSeconds();
         default: throw DbError(std::string("internal: cannot index a ") + TypeName(v.Type()) + " value");
     }
 }
@@ -871,6 +929,18 @@ std::string Catalog::NewForeignKeyName(const std::string& table, const std::stri
     std::string name = base;
     for (int i = 1; foreign_keys_.count(name); ++i) name = base + std::to_string(i);
     return name;
+}
+
+void Catalog::Analyze(TableInfo* t) {
+    auto it = t->heap->Begin();
+    RID rid;
+    std::string buf;
+    t->stats = ComputeStats(t->schema, [&](Row* row) {
+        if (!it.Next(&rid, &buf)) return false;
+        *row = DeserializeTuple(t->schema, buf.data(), buf.size());
+        return true;
+    });
+    t->row_count = t->stats.empty() ? t->row_count : t->stats[0].rows;  // exact again
 }
 
 }  // namespace minidb

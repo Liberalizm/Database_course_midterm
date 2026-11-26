@@ -148,5 +148,93 @@ TEST(Tuple, RowSizeMismatchThrows) {
     EXPECT_THROW(SerializeTuple(s, {I(1), I(2)}), DbError);
 }
 
+// ---- DATE / TIMESTAMP ----
+
+TEST(Value, CalendarRoundTrip) {
+    EXPECT_EQ(DaysFromCivil(1970, 1, 1), 0);
+    EXPECT_EQ(DaysFromCivil(2000, 3, 1), 11017);
+    EXPECT_EQ(DaysFromCivil(1969, 12, 31), -1);
+    // Every day of four centuries (leap years, century rules) survives the round trip.
+    for (int64_t z = DaysFromCivil(1600, 1, 1); z <= DaysFromCivil(2400, 12, 31); z += 1) {
+        int64_t y;
+        unsigned m, d;
+        CivilFromDays(z, &y, &m, &d);
+        ASSERT_EQ(DaysFromCivil(y, m, d), z);
+    }
+}
+
+TEST(Value, ParseAndFormatDates) {
+    EXPECT_EQ(Value::Date(ParseDate("2024-02-29")).ToString(), "2024-02-29");
+    EXPECT_EQ(Value::Date(ParseDate("0001-01-01")).ToString(), "0001-01-01");
+    EXPECT_EQ(Value::Date(ParseDate("9999-12-31")).ToString(), "9999-12-31");
+    EXPECT_EQ(Value::Date(ParseDate("1900-02-28")).ToSqlLiteral(), "DATE '1900-02-28'");
+    for (const char* bad : {"2023-02-29", "1900-02-29", "2024-13-01", "2024-00-10", "2024-01-32", "0000-01-01",
+                            "24-01-01", "2024-1-1", "2024-01-01 ", "", "2024/01/01", "abcd-ef-gh"})
+        EXPECT_THROW(ParseDate(bad), DbError) << bad;
+}
+
+TEST(Value, ParseAndFormatTimestamps) {
+    EXPECT_EQ(Value::Timestamp(ParseTimestamp("2024-01-31 23:59:59")).ToString(), "2024-01-31 23:59:59");
+    EXPECT_EQ(Value::Timestamp(ParseTimestamp("2024-01-31T08:05")).ToString(), "2024-01-31 08:05:00");
+    EXPECT_EQ(Value::Timestamp(ParseTimestamp("2024-01-31")).ToString(), "2024-01-31 00:00:00");
+    EXPECT_EQ(Value::Timestamp(ParseTimestamp("1969-12-31 23:59:59")).ToString(), "1969-12-31 23:59:59")
+        << "negative seconds round toward the earlier day";
+    EXPECT_EQ(ParseTimestamp("1970-01-01 00:00:01"), 1);
+    for (const char* bad : {"2024-01-31 24:00:00", "2024-01-31 12:60", "2024-01-31 12:00:60", "2024-01-31 12",
+                            "2024-01-31  12:00", "2024-01-31 12:00:00Z"})
+        EXPECT_THROW(ParseTimestamp(bad), DbError) << bad;
+}
+
+TEST(Value, TemporalRangeIsChecked) {
+    EXPECT_THROW(Value::Date(DaysFromCivil(10000, 1, 1)), DbError);
+    EXPECT_THROW(Value::Date(DaysFromCivil(0, 12, 31)), DbError);
+    EXPECT_THROW(Value::Timestamp(DaysFromCivil(10000, 1, 1) * kSecondsPerDay), DbError);
+    EXPECT_NO_THROW(Value::Timestamp(DaysFromCivil(10000, 1, 1) * kSecondsPerDay - 1));
+}
+
+TEST(Value, CompareTemporal) {
+    Value d1 = Value::Date(ParseDate("2024-01-01")), d2 = Value::Date(ParseDate("2024-01-02"));
+    Value ts = Value::Timestamp(ParseTimestamp("2024-01-01 12:00:00"));
+    EXPECT_LT(d1.Compare(d2), 0);
+    EXPECT_LT(d1.Compare(ts), 0) << "a date is its midnight";
+    EXPECT_GT(d2.Compare(ts), 0);
+    EXPECT_EQ(d1.Compare(Value::Timestamp(ParseTimestamp("2024-01-01"))), 0);
+    EXPECT_EQ(d1.Compare(T("2024-01-01")), 0) << "text is read as a date";
+    EXPECT_GT(T("2024-01-01 12:00:01").Compare(ts), 0);
+    EXPECT_THROW(d1.Compare(T("yesterday")), DbError);
+    EXPECT_THROW(d1.Compare(I(19723)), DbError);
+}
+
+TEST(Value, CastToTemporal) {
+    EXPECT_EQ(T("2024-05-06").CastTo(TypeId::DATE).ToString(), "2024-05-06");
+    EXPECT_EQ(T("2024-05-06 07:08:09").CastTo(TypeId::TIMESTAMP).ToString(), "2024-05-06 07:08:09");
+    EXPECT_EQ(Value::Date(0).CastTo(TypeId::TIMESTAMP).ToString(), "1970-01-01 00:00:00");
+    EXPECT_EQ(Value::Timestamp(-1).CastTo(TypeId::DATE).ToString(), "1969-12-31");
+    EXPECT_THROW(T("2024-05-06 07:08:09").CastTo(TypeId::DATE), DbError);
+    EXPECT_THROW(I(5).CastTo(TypeId::DATE), DbError);
+    EXPECT_THROW(Value::Date(0).CastTo(TypeId::INT), DbError);
+}
+
+TEST(Value, TemporalHashKeysMatchComparison) {
+    std::string a, b, c;
+    Value::Date(5).AppendKey(&a);
+    Value::Timestamp(5 * kSecondsPerDay).AppendKey(&b);
+    I(5).AppendKey(&c);
+    EXPECT_EQ(a, b) << "equal values hash alike";
+    EXPECT_NE(a, c);
+}
+
+TEST(Value, TemporalTupleRoundTrip) {
+    Schema s({Col("d", TypeId::DATE), Col("t", TypeId::TIMESTAMP), Col("n", TypeId::DATE)});
+    Row r = {Value::Date(ParseDate("2024-02-29")), Value::Timestamp(ParseTimestamp("1950-06-01 10:20:30")), N()};
+    std::string bytes = SerializeTuple(s, r);
+    Row back = DeserializeTuple(s, bytes.data(), bytes.size());
+    ASSERT_EQ(back.size(), 3u);
+    EXPECT_EQ(back[0].Type(), TypeId::DATE);
+    EXPECT_EQ(back[0].ToString(), "2024-02-29");
+    EXPECT_EQ(back[1].ToString(), "1950-06-01 10:20:30");
+    EXPECT_TRUE(back[2].IsNull());
+}
+
 }  // namespace
 }  // namespace minidb
