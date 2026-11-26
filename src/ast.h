@@ -229,7 +229,18 @@ struct ExplainStmt {
     bool analyze = false;
 };
 
+// ALTER TABLE table ADD [COLUMN] col | DROP [COLUMN] name | RENAME [COLUMN] name TO new_name
+//                  | RENAME TO new_name
+struct AlterTableStmt {
+    enum class Action { ADD_COLUMN, DROP_COLUMN, RENAME_COLUMN, RENAME_TABLE };
+    std::string table;
+    Action action = Action::ADD_COLUMN;
+    ColumnDef column;      // ADD_COLUMN
+    std::string name;      // DROP_COLUMN, RENAME_COLUMN: the existing column
+    std::string new_name;  // RENAME_COLUMN, RENAME_TABLE
+};
+
 using Statement = std::variant<CreateTableStmt, CreateIndexStmt, DropStmt, InsertStmt, SelectStmt, DeleteStmt,
-                               UpdateStmt, ExplainStmt>;
+                               UpdateStmt, ExplainStmt, AlterTableStmt>;
 
 }  // namespace minidb

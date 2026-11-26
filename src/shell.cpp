@@ -17,6 +17,7 @@ const char* kHelp = R"(MiniDB - a relational database written from scratch.
 SQL (end every statement with ';'):
   CREATE TABLE t (id INT PRIMARY KEY, name TEXT, score DOUBLE, ok BOOL);
   CREATE [UNIQUE] INDEX idx ON t (col);        DROP TABLE t;  DROP INDEX idx;
+  ALTER TABLE t ADD [COLUMN] c TYPE [UNIQUE] | DROP [COLUMN] c | RENAME [COLUMN] a TO b | RENAME TO u;
   INSERT INTO t VALUES (1, 'a', 2.5, true), (2, 'b', NULL, false);
   INSERT INTO t (id, name) SELECT ...;
   SELECT [DISTINCT] cols | * FROM a [[LEFT] JOIN b ON ...] [, c] WHERE ...

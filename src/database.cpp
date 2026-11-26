@@ -54,6 +54,8 @@ QueryResult Database::Run(const Statement& stmt) {
             r = RunDelete(*s5);
         else if (auto* s6 = std::get_if<UpdateStmt>(&stmt))
             r = RunUpdate(*s6);
+        else if (auto* s7 = std::get_if<AlterTableStmt>(&stmt))
+            r = RunAlterTable(*s7);
     } catch (...) {
         Checkpoint();  // keep catalog statistics consistent with whatever was written
         throw;
@@ -92,6 +94,61 @@ QueryResult Database::RunCreateTable(const CreateTableStmt& s) {
 QueryResult Database::RunCreateIndex(const CreateIndexStmt& s) {
     catalog_->CreateIndex(s.name, s.table, s.column, s.unique);
     return {{}, {}, "CREATE INDEX"};
+}
+
+QueryResult Database::RunAlterTable(const AlterTableStmt& s) {
+    TableInfo* t = catalog_->RequireTable(s.table);
+    using A = AlterTableStmt::Action;
+    switch (s.action) {
+        case A::RENAME_TABLE: catalog_->RenameTable(s.table, s.new_name); break;
+        case A::RENAME_COLUMN: catalog_->RenameColumn(s.table, s.name, s.new_name); break;
+        case A::ADD_COLUMN: {
+            const ColumnDef& d = s.column;
+            if (t->schema.Find("", d.name) >= 0)
+                throw DbError("column \"" + d.name + "\" of relation \"" + s.table + "\" already exists");
+            if ((d.primary_key || d.unique) && d.type != TypeId::INT && d.type != TypeId::TEXT)
+                throw DbError("PRIMARY KEY / UNIQUE is only supported on INT and TEXT columns");
+            // Existing rows get NULL in the new column (DEFAULT is not supported),
+            // so NOT NULL / PRIMARY KEY are only possible while the table is empty.
+            if (d.not_null && t->row_count > 0)
+                throw DbError("column \"" + d.name + "\" cannot be NOT NULL: \"" + s.table +
+                              "\" already has rows, which would get NULL");
+            std::string pk_index = s.table + "_pkey";
+            if (d.primary_key) {
+                for (IndexInfo* i : catalog_->IndexesOf(s.table))
+                    if (i->name == pk_index)
+                        throw DbError("multiple primary keys for table \"" + s.table + "\" are not allowed");
+            }
+            std::vector<Column> cols = t->schema.Columns();
+            Column c{};
+            c.name = d.name;
+            c.type = d.type;
+            c.not_null = d.not_null;
+            cols.push_back(c);
+            catalog_->RewriteTable(t, cols, [](Row r) {
+                r.push_back(Value::Null());
+                return r;
+            });
+            if (d.primary_key)
+                catalog_->CreateIndex(pk_index, s.table, d.name, true);
+            else if (d.unique)
+                catalog_->CreateIndex(s.table + "_" + d.name + "_key", s.table, d.name, true);
+            break;
+        }
+        case A::DROP_COLUMN: {
+            int col = t->schema.Find("", s.name);
+            if (col < 0) throw DbError("column \"" + s.name + "\" of relation \"" + s.table + "\" does not exist");
+            if (t->schema.Size() == 1) throw DbError("cannot drop the only column of table \"" + s.table + "\"");
+            std::vector<Column> cols = t->schema.Columns();
+            cols.erase(cols.begin() + col);
+            catalog_->RewriteTable(t, cols, [col](Row r) {
+                r.erase(r.begin() + col);
+                return r;
+            });
+            break;
+        }
+    }
+    return {{}, {}, "ALTER TABLE"};
 }
 
 QueryResult Database::RunDrop(const DropStmt& s) {

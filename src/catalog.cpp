@@ -281,6 +281,78 @@ void Catalog::FreePages(const std::vector<page_id_t>& pages) {
     for (page_id_t p : pages) bpm_->DeletePage(p);
 }
 
+void Catalog::RenameTable(const std::string& name, const std::string& new_name) {
+    TableInfo* t = RequireTable(name);
+    if (tables_.count(new_name)) throw DbError("table \"" + new_name + "\" already exists");
+    std::vector<Column> cols = t->schema.Columns();
+    for (auto& c : cols) c.table = new_name;
+    t->schema = Schema(std::move(cols));
+    t->name = new_name;
+    for (auto& [n, idx] : indexes_)
+        if (idx->table == name) idx->table = new_name;
+    auto node = tables_.extract(name);
+    node.key() = new_name;
+    tables_.insert(std::move(node));
+}
+
+void Catalog::RenameColumn(const std::string& table, const std::string& column, const std::string& new_name) {
+    TableInfo* t = RequireTable(table);
+    int col = t->schema.Find("", column);
+    if (col < 0) throw DbError("column \"" + column + "\" does not exist in table \"" + table + "\"");
+    if (t->schema.Find("", new_name) >= 0)
+        throw DbError("column \"" + new_name + "\" of relation \"" + table + "\" already exists");
+    std::vector<Column> cols = t->schema.Columns();
+    cols[static_cast<size_t>(col)].name = new_name;
+    t->schema = Schema(std::move(cols));
+    for (auto& [n, idx] : indexes_)
+        if (idx->table == table && idx->column == column) idx->column = new_name;
+}
+
+void Catalog::RewriteTable(TableInfo* t, std::vector<Column> cols, const std::function<Row(Row)>& convert) {
+    if (cols.empty()) throw DbError("a table must have at least one column");
+    for (auto& c : cols) c.table = t->name;
+    Schema new_schema(std::move(cols));
+
+    // Pass 1: convert and check every row; nothing is modified yet.
+    {
+        auto it = t->heap->Begin();
+        RID rid;
+        std::string buf;
+        while (it.Next(&rid, &buf)) {
+            Row row = convert(DeserializeTuple(t->schema, buf.data(), buf.size()));
+            if (SerializeTuple(new_schema, row).size() > TablePage::MAX_TUPLE)
+                throw DbError("a row would become too large (max " + std::to_string(TablePage::MAX_TUPLE) + " bytes)");
+        }
+    }
+
+    // Pass 2: drop the indexes, copy the rows into a new heap, swap, free the old pages.
+    struct IndexDef {
+        std::string name, column;
+        bool unique;
+    };
+    std::vector<IndexDef> keep;
+    for (IndexInfo* idx : IndexesOf(t->name)) {
+        if (new_schema.Find("", idx->column) >= 0) keep.push_back({idx->name, idx->column, idx->unique});
+        std::string name = idx->name;  // DropIndex destroys *idx
+        DropIndex(name);
+    }
+    page_id_t first = TableHeap::Create(bpm_);
+    auto heap = std::make_unique<TableHeap>(bpm_, first);
+    {
+        auto it = t->heap->Begin();
+        RID rid;
+        std::string buf;
+        while (it.Next(&rid, &buf))
+            heap->Insert(SerializeTuple(new_schema, convert(DeserializeTuple(t->schema, buf.data(), buf.size()))));
+    }
+    std::vector<page_id_t> old_pages = t->heap->Pages();
+    t->schema = std::move(new_schema);
+    t->first_page = first;
+    t->heap = std::move(heap);
+    FreePages(old_pages);
+    for (const auto& d : keep) CreateIndex(d.name, t->name, d.column, d.unique);
+}
+
 IndexInfo* Catalog::CreateIndex(const std::string& name, const std::string& table, const std::string& column,
                                 bool unique) {
     if (indexes_.count(name)) throw DbError("index \"" + name + "\" already exists");

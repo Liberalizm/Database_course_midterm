@@ -27,6 +27,8 @@ public:
 private:
     Statement ParseStatement();
     CreateTableStmt ParseCreateTable();
+    ColumnDef ParseColumnDef();
+    AlterTableStmt ParseAlterTable();
     CreateIndexStmt ParseCreateIndex(bool unique);
     InsertStmt ParseInsert();
     SelectStmt ParseSelect();      // full query: cores + UNION/INTERSECT/EXCEPT + ORDER BY/LIMIT

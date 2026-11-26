@@ -337,5 +337,78 @@ TEST_F(CatalogTest, UniqueTextIndexOnDuplicatesFails) {
     EXPECT_NO_THROW(cat->CreateIndex("u_name", "u", "name", false));
 }
 
+// ---- ALTER TABLE support ----
+
+static size_t ScanCount(TableInfo* t) {
+    size_t n = 0;
+    auto it = t->heap->Begin();
+    RID rid;
+    std::string buf;
+    while (it.Next(&rid, &buf)) ++n;
+    return n;
+}
+
+TEST_F(CatalogTest, RenameTableAndColumnCarryIndexesAlong) {
+    TableInfo* t = cat->CreateTable("t", {Col("id", TypeId::INT), Col("v", TypeId::INT)});
+    AddRow(t, {I(1), I(10)});
+    cat->CreateIndex("t_v", "t", "v", false);
+    cat->RenameColumn("t", "v", "w");
+    EXPECT_EQ(cat->IndexesOf("t")[0]->column, "w");
+    EXPECT_THROW(cat->RenameColumn("t", "w", "id"), DbError) << "name taken";
+    EXPECT_THROW(cat->RenameColumn("t", "nope", "x"), DbError);
+    cat->CreateTable("other", {Col("a", TypeId::INT)});
+    EXPECT_THROW(cat->RenameTable("t", "other"), DbError);
+    cat->RenameTable("t", "u");
+    EXPECT_EQ(cat->GetTable("t"), nullptr);
+    TableInfo* u = cat->RequireTable("u");
+    EXPECT_EQ(u->name, "u");
+    EXPECT_EQ(u->schema.At(1).table, "u");
+    ASSERT_EQ(cat->IndexesOf("u").size(), 1u);
+    Reopen();
+    EXPECT_EQ(cat->RequireTable("u")->schema.At(1).name, "w");
+    ASSERT_EQ(cat->IndexesOf("u").size(), 1u);
+    EXPECT_EQ(cat->IndexesOf("u")[0]->col_idx, 1);
+}
+
+TEST_F(CatalogTest, RewriteTableConvertsRowsRebuildsIndexesAndFreesPages) {
+    TableInfo* t = cat->CreateTable("t", {Col("id", TypeId::INT), Col("drop_me", TypeId::INT), Col("v", TypeId::INT)});
+    for (int i = 0; i < 2000; ++i) AddRow(t, {I(i), I(i % 7), I(i * 2)});
+    cat->CreateIndex("t_drop", "t", "drop_me", false);
+    cat->CreateIndex("t_v", "t", "v", true);
+    page_id_t size = disk->NumPages();
+    // Drop the middle column.
+    cat->RewriteTable(t, {Col("id", TypeId::INT), Col("v", TypeId::INT)}, [](Row r) {
+        r.erase(r.begin() + 1);
+        return r;
+    });
+    EXPECT_EQ(t->schema.Size(), 2u);
+    EXPECT_EQ(ScanCount(t), 2000u);
+    ASSERT_EQ(cat->IndexesOf("t").size(), 1u) << "the index on the dropped column is gone";
+    IndexInfo* v = cat->IndexesOf("t")[0];
+    EXPECT_EQ(v->col_idx, 1) << "rebuilt against the new column positions";
+    EXPECT_EQ(v->tree->CheckAndCount(), 2000u);
+    EXPECT_TRUE(cat->KeyTaken(v, I(3998)));
+    EXPECT_FALSE(bpm->FreePages().empty()) << "old heap pages were freed";
+    EXPECT_LE(disk->NumPages(), size + 2) << "the rewrite reuses the dropped index's pages";
+}
+
+TEST_F(CatalogTest, FailedRewriteLeavesTheTableUntouched) {
+    TableInfo* t = cat->CreateTable("t", {Col("id", TypeId::INT), Col("s", TypeId::TEXT)});
+    AddRow(t, {I(1), T("short")});
+    AddRow(t, {I(2), T(std::string(TablePage::MAX_TUPLE - 40, 'x'))});
+    cat->CreateIndex("t_id", "t", "id", true);
+    page_id_t first = t->first_page;
+    auto grow = [](Row r) {  // makes the second row too large
+        r.push_back(Value::Text(std::string(100, 'y')));
+        return r;
+    };
+    EXPECT_THROW(cat->RewriteTable(t, {Col("id", TypeId::INT), Col("s", TypeId::TEXT), Col("z", TypeId::TEXT)}, grow),
+                 DbError);
+    EXPECT_EQ(t->schema.Size(), 2u);
+    EXPECT_EQ(t->first_page, first);
+    EXPECT_EQ(ScanCount(t), 2u);
+    EXPECT_EQ(cat->IndexesOf("t").size(), 1u) << "indexes are only dropped after all checks passed";
+}
+
 }  // namespace
 }  // namespace minidb

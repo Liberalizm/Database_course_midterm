@@ -211,6 +211,10 @@ Statement Parser::ParseStatement() {
         d.name = ExpectIdent();
         return d;
     }
+    if (AcceptKw("alter")) {
+        ExpectKw("table");
+        return ParseAlterTable();
+    }
     if (AcceptKw("insert")) return ParseInsert();
     if (CheckKw("select")) return ParseSelect();
     if (AcceptKw("delete")) return ParseDelete();
@@ -248,6 +252,60 @@ TypeId Parser::ParseType() {
     return type;
 }
 
+// name type [PRIMARY KEY | NOT NULL | NULL | UNIQUE]...
+ColumnDef Parser::ParseColumnDef() {
+    ColumnDef d;
+    d.name = ExpectIdent();
+    d.type = ParseType();
+    while (true) {
+        if (AcceptKw("primary")) {
+            ExpectKw("key");
+            d.primary_key = true;
+            d.not_null = true;
+        } else if (AcceptKw("not")) {
+            ExpectKw("null");
+            d.not_null = true;
+        } else if (AcceptKw("unique")) {
+            d.unique = true;
+        } else if (AcceptKw("null")) {
+        } else {
+            break;
+        }
+    }
+    return d;
+}
+
+// After ALTER TABLE. ADD / DROP / RENAME / COLUMN / TO are matched in context
+// only (not reserved), so existing columns with those names keep working.
+AlterTableStmt Parser::ParseAlterTable() {
+    AlterTableStmt a;
+    a.table = ExpectIdent();
+    if (AcceptKw("add")) {
+        a.action = AlterTableStmt::Action::ADD_COLUMN;
+        // "ADD COLUMN x INT" vs. a column that is itself named "column": "ADD column INT".
+        if (CheckKw("column") && Peek(1).type == TokenType::IDENT && Peek(2).type == TokenType::IDENT) Advance();
+        a.column = ParseColumnDef();
+    } else if (AcceptKw("drop")) {
+        a.action = AlterTableStmt::Action::DROP_COLUMN;
+        if (CheckKw("column") && Peek(1).type == TokenType::IDENT) Advance();
+        a.name = ExpectIdent();
+    } else if (AcceptKw("rename")) {
+        if (AcceptKw("to")) {
+            a.action = AlterTableStmt::Action::RENAME_TABLE;
+            a.new_name = ExpectIdent();
+        } else {
+            a.action = AlterTableStmt::Action::RENAME_COLUMN;
+            if (CheckKw("column") && !(Peek(1).type == TokenType::IDENT && Peek(1).text == "to")) Advance();
+            a.name = ExpectIdent();
+            ExpectKw("to");
+            a.new_name = ExpectIdent();
+        }
+    } else {
+        Error("expected ADD, DROP or RENAME");
+    }
+    return a;
+}
+
 CreateTableStmt Parser::ParseCreateTable() {
     CreateTableStmt c;
     c.name = ExpectIdent();
@@ -261,25 +319,7 @@ CreateTableStmt Parser::ParseCreateTable() {
             ExpectSym(")");
             continue;
         }
-        ColumnDef d;
-        d.name = ExpectIdent();
-        d.type = ParseType();
-        while (true) {
-            if (AcceptKw("primary")) {
-                ExpectKw("key");
-                d.primary_key = true;
-                d.not_null = true;
-            } else if (AcceptKw("not")) {
-                ExpectKw("null");
-                d.not_null = true;
-            } else if (AcceptKw("unique")) {
-                d.unique = true;
-            } else if (AcceptKw("null")) {
-            } else {
-                break;
-            }
-        }
-        c.cols.push_back(d);
+        c.cols.push_back(ParseColumnDef());
     } while (AcceptSym(","));
     ExpectSym(")");
     if (!table_pk.empty()) {

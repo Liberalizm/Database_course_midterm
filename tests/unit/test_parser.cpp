@@ -170,6 +170,35 @@ TEST(Parser, Subqueries) {
     EXPECT_THROW(ParseExpr("(SELECT 1"), DbError);
 }
 
+TEST(Parser, AlterTable) {
+    using A = AlterTableStmt::Action;
+    auto add = ParseOne<AlterTableStmt>("ALTER TABLE t ADD COLUMN email TEXT UNIQUE");
+    EXPECT_EQ(add.table, "t");
+    EXPECT_EQ(add.action, A::ADD_COLUMN);
+    EXPECT_EQ(add.column.name, "email");
+    EXPECT_EQ(add.column.type, TypeId::TEXT);
+    EXPECT_TRUE(add.column.unique);
+    EXPECT_EQ(ParseOne<AlterTableStmt>("ALTER TABLE t ADD n INT NOT NULL").column.name, "n") << "COLUMN is optional";
+    EXPECT_EQ(ParseOne<AlterTableStmt>("ALTER TABLE t ADD column INT").column.name, "column")
+        << "a column may be called \"column\"";
+    auto drop = ParseOne<AlterTableStmt>("ALTER TABLE t DROP COLUMN x");
+    EXPECT_EQ(drop.action, A::DROP_COLUMN);
+    EXPECT_EQ(drop.name, "x");
+    EXPECT_EQ(ParseOne<AlterTableStmt>("ALTER TABLE t DROP column").name, "column");
+    auto rc = ParseOne<AlterTableStmt>("ALTER TABLE t RENAME COLUMN a TO b");
+    EXPECT_EQ(rc.action, A::RENAME_COLUMN);
+    EXPECT_EQ(rc.name, "a");
+    EXPECT_EQ(rc.new_name, "b");
+    EXPECT_EQ(ParseOne<AlterTableStmt>("ALTER TABLE t RENAME a TO b").new_name, "b");
+    EXPECT_EQ(ParseOne<AlterTableStmt>("ALTER TABLE t RENAME column TO c").name, "column");
+    auto rt = ParseOne<AlterTableStmt>("ALTER TABLE t RENAME TO u");
+    EXPECT_EQ(rt.action, A::RENAME_TABLE);
+    EXPECT_EQ(rt.new_name, "u");
+    EXPECT_THROW(Parser("ALTER TABLE t").ParseAll(), DbError);
+    EXPECT_THROW(Parser("ALTER TABLE t MODIFY x INT").ParseAll(), DbError);
+    EXPECT_THROW(Parser("ALTER TABLE t ADD x BLOB").ParseAll(), DbError);
+}
+
 TEST(Parser, DerivedTablesInFrom) {
     auto s = ParseOne<SelectStmt>("SELECT * FROM (SELECT a FROM t) AS x JOIN (SELECT b FROM u UNION SELECT 1) y ON x.a = y.b");
     ASSERT_EQ(s.from.size(), 2u);

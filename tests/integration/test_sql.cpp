@@ -469,6 +469,49 @@ TEST_F(SqlTest, SubqueriesInFrom) {
     EXPECT_THROW(db->Execute("SELECT nope FROM (SELECT id FROM emp) a"), DbError);
 }
 
+TEST_F(SqlTest, AlterTable) {
+    SeedCompany();
+    db->Execute("CREATE INDEX emp_dept ON emp (dept_id)");
+    // ADD COLUMN: existing rows get NULL; UNIQUE creates an index.
+    EXPECT_EQ(Msg("ALTER TABLE emp ADD COLUMN email TEXT UNIQUE"), "ALTER TABLE");
+    EXPECT_EQ(Scalar("SELECT COUNT(email) FROM emp"), 0);
+    db->Execute("UPDATE emp SET email = name || '@corp' WHERE id <= 2");
+    EXPECT_THROW(db->Execute("UPDATE emp SET email = 'ann@corp' WHERE id = 3"), DbError);
+    EXPECT_THROW(db->Execute("ALTER TABLE emp ADD COLUMN level INT NOT NULL"), DbError) << "table has rows";
+    EXPECT_THROW(db->Execute("ALTER TABLE emp ADD COLUMN name TEXT"), DbError) << "exists already";
+    // DROP COLUMN removes the data and the indexes on it; other indexes keep working.
+    EXPECT_EQ(Msg("ALTER TABLE emp DROP COLUMN dept_id"), "ALTER TABLE");
+    EXPECT_THROW(db->Execute("SELECT dept_id FROM emp"), DbError);
+    for (IndexInfo* idx : db->GetCatalog().IndexesOf("emp")) EXPECT_NE(idx->column, "dept_id");
+    EXPECT_EQ(Q("SELECT name FROM emp WHERE id = 4")[0][0].AsText(), "dan");
+    EXPECT_THROW(db->Execute("INSERT INTO emp (id, name) VALUES (1, 'dup')"), DbError) << "primary key still enforced";
+    // RENAME COLUMN / TABLE.
+    db->Execute("ALTER TABLE emp RENAME COLUMN salary TO pay");
+    EXPECT_DOUBLE_EQ(Q("SELECT pay FROM emp WHERE id = 1")[0][0].AsDouble(), 100.0);
+    db->Execute("ALTER TABLE emp RENAME TO staff");
+    EXPECT_THROW(db->Execute("SELECT * FROM emp"), DbError);
+    EXPECT_EQ(Scalar("SELECT COUNT(*) FROM staff WHERE email IS NOT NULL"), 2);
+    ExpectIndexesConsistent("staff");
+    // Survives a restart.
+    db.reset();
+    db = std::make_unique<Database>(file.path(), 64);
+    EXPECT_EQ(Scalar("SELECT COUNT(*) FROM staff"), 5);
+    EXPECT_THROW(db->Execute("INSERT INTO staff (id, name, email) VALUES (9, 'x', 'ann@corp')"), DbError);
+    ExpectIndexesConsistent("staff");
+}
+
+TEST_F(SqlTest, AlterTableOnEmptyTableAllowsNotNullAndPrimaryKey) {
+    db->Execute("CREATE TABLE t (a INT)");
+    EXPECT_EQ(Msg("ALTER TABLE t ADD id INT PRIMARY KEY"), "ALTER TABLE");
+    EXPECT_THROW(db->Execute("INSERT INTO t (a) VALUES (1)"), DbError) << "id is NOT NULL now";
+    db->Execute("INSERT INTO t VALUES (1, 10)");
+    EXPECT_THROW(db->Execute("INSERT INTO t VALUES (2, 10)"), DbError) << "and the primary key";
+    EXPECT_THROW(db->Execute("ALTER TABLE t ADD other INT PRIMARY KEY"), DbError);
+    EXPECT_EQ(Msg("ALTER TABLE t DROP COLUMN a"), "ALTER TABLE");
+    EXPECT_THROW(db->Execute("ALTER TABLE t DROP COLUMN id"), DbError) << "the only column left";
+    EXPECT_EQ(Scalar("SELECT id FROM t"), 10) << "id was added after a: VALUES (1, 10) set a = 1, id = 10";
+}
+
 TEST_F(SqlTest, QuotedIdentifiersAreNeverKeywords) {
     db->Execute("CREATE TABLE \"select\" (\"left\" INT, \"right\" TEXT, \"null\" INT)");
     db->Execute("INSERT INTO \"select\" (\"left\", \"right\", \"null\") VALUES (1, 'r', 7)");

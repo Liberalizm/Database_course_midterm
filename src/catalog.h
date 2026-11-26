@@ -50,6 +50,15 @@ public:
     TableInfo* RequireTable(const std::string& name);
     void DropTable(const std::string& name);
 
+    // ALTER TABLE support. Renames only change metadata. RewriteTable gives the
+    // table a new column list: every row goes through `convert` into a fresh
+    // heap, the indexes are rebuilt (those on columns that no longer exist are
+    // dropped), and the old pages are freed. All rows are converted and checked
+    // before anything is changed, so a failure leaves the table as it was.
+    void RenameTable(const std::string& name, const std::string& new_name);
+    void RenameColumn(const std::string& table, const std::string& column, const std::string& new_name);
+    void RewriteTable(TableInfo* t, std::vector<Column> cols, const std::function<Row(Row)>& convert);
+
     IndexInfo* CreateIndex(const std::string& name, const std::string& table, const std::string& column, bool unique);
     void DropIndex(const std::string& name);
     std::vector<IndexInfo*> IndexesOf(const std::string& table);
