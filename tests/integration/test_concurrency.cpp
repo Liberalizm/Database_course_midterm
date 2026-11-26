@@ -111,9 +111,11 @@ TEST_F(ConcurrencyTest, ClosingAConnectionRollsBackItsTransaction) {
         Connection a(db.get());
         a.Execute("BEGIN; INSERT INTO t VALUES (1), (2)");
     }
-    Connection b(db.get());
-    EXPECT_EQ(Count(b, "t"), 0) << "rolled back, and the database is free again";
-    b.Execute("INSERT INTO t VALUES (3)");
+    {
+        Connection b(db.get());  // closed before its Database goes away
+        EXPECT_EQ(Count(b, "t"), 0) << "rolled back, and the database is free again";
+        b.Execute("INSERT INTO t VALUES (3)");
+    }
     db.reset();  // committed data survives a reopen
     db = std::make_unique<Database>(file.path(), 64);
     EXPECT_EQ(db->Execute("SELECT COUNT(*) FROM t").back().rows[0][0].AsInt(), 1);
