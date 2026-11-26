@@ -28,10 +28,15 @@ function(minidb_add_test target label)
     target_link_libraries(${target} PRIVATE minidb_core GTest::gtest_main)
     target_include_directories(${target} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
     minidb_set_warnings(${target})
+    # One label per test, e.g. "unit:storage:buffer_pool", never a CMake list:
+    # gtest_discover_tests in CMake 3.x flattens a list in PROPERTIES, which left
+    # every test with just the first label ("unit") in CI. `ctest -L` takes a
+    # regex, so -L storage, -L unit and -L buffer_pool all still match.
+    string(REPLACE ";" ":" label_text "${label}")
     gtest_discover_tests(${target}
-            DISCOVERY_MODE POST_BUILD  # the default; with PRE_TEST the Windows (multi-config) CI job found no tests
+            DISCOVERY_MODE POST_BUILD  # the default, generated at build time for the built configuration
             DISCOVERY_TIMEOUT 60
-            PROPERTIES LABELS "${label}" TIMEOUT 300)
+            PROPERTIES LABELS "${label_text}" TIMEOUT 300)
 endfunction()
 
 # ---- unit tests: one binary per component, grouped into two layers ----
