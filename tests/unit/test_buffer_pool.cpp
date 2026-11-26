@@ -214,5 +214,56 @@ TEST_F(BufferPoolTest, FreedFramesAreReusedWhenThePoolIsFull) {
     EXPECT_EQ(pid, victim);
 }
 
+TEST_F(BufferPoolTest, DiscardAllDropsDirtyPagesWithoutWritingThem) {
+    BufferPoolManager bpm(8, &disk);
+    auto ids = MakePages(bpm, 3);
+    bpm.FlushAll();
+    {
+        PageGuard g = PageGuard::Fetch(&bpm, ids[1]);
+        std::strcpy(g.Data(), "changed");
+        g.MarkDirty();
+    }
+    const uint64_t writes = disk.Writes();
+    bpm.DiscardAll();
+    EXPECT_EQ(disk.Writes(), writes) << "nothing is written back";
+    {
+        PageGuard g = PageGuard::Fetch(&bpm, ids[1]);
+        EXPECT_STREQ(g.Data(), "page-1") << "the cached change is gone; the page comes from disk again";
+    }
+    std::vector<PageGuard> held;  // and all 8 frames are usable again
+    for (int i = 0; i < 8; ++i) {
+        page_id_t pid;
+        held.push_back(PageGuard::New(&bpm, &pid));
+    }
+}
+
+TEST_F(BufferPoolTest, DiscardAllRefusesWhilePagesArePinned) {
+    BufferPoolManager bpm(8, &disk);
+    auto ids = MakePages(bpm, 2);
+    PageGuard g = PageGuard::Fetch(&bpm, ids[0]);
+    EXPECT_THROW(bpm.DiscardAll(), DbError);
+}
+
+// The transaction manager journals the old contents of every page about to be
+// written; FlushAll announces the whole batch first so it can sync once.
+TEST_F(BufferPoolTest, FlushAllAnnouncesTheWholeBatchBeforeWriting) {
+    struct Listener : DiskManager::WriteListener {
+        std::vector<std::string> events;
+        void BeforeWrite(page_id_t pid, bool durable) override {
+            events.push_back(std::string(durable ? "write " : "prepare ") + std::to_string(pid));
+        }
+        void BeforeGrow() override {}
+    } listener;
+    BufferPoolManager bpm(8, &disk);
+    MakePages(bpm, 3);
+    disk.SetListener(&listener);
+    bpm.FlushAll();
+    disk.SetListener(nullptr);
+    const auto& ev = listener.events;
+    ASSERT_EQ(ev.size(), 6u);
+    for (size_t i = 0; i < 3; ++i) EXPECT_EQ(ev[i].rfind("prepare ", 0), 0u) << ev[i];
+    for (size_t i = 3; i < 6; ++i) EXPECT_EQ(ev[i].rfind("write ", 0), 0u) << ev[i];
+}
+
 }  // namespace
 }  // namespace minidb

@@ -48,7 +48,8 @@ set(MINIDB_STORAGE_COMPONENTS
         table_page
         table_heap
         bplus_tree
-        catalog)
+        catalog
+        transaction)
 set(MINIDB_QUERY_COMPONENTS
         lexer
         parser
@@ -73,7 +74,8 @@ foreach (f IN LISTS MINIDB_UNIT_FILES)
 endforeach ()
 
 # ---- integration tests ----
-minidb_add_test(test_integration "integration" integration/test_sql.cpp integration/test_persistence.cpp)
+minidb_add_test(test_integration "integration" integration/test_sql.cpp integration/test_persistence.cpp
+        integration/test_transactions.cpp)
 
 # ---- end-to-end tests of the shell binary ----
 file(GLOB MINIDB_E2E_CASES LIST_DIRECTORIES true ${CMAKE_CURRENT_SOURCE_DIR}/e2e/*)

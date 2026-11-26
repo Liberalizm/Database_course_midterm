@@ -15,6 +15,7 @@ tests/
 │   ├── test_table_heap      storage: heap file of linked pages
 │   ├── test_bplus_tree      storage: B+ tree index (splits, duplicates, ranges)
 │   ├── test_catalog         storage: metadata + persistence in page 0
+│   ├── test_transaction     storage: rollback journal, savepoints, hot-journal recovery, torn records
 │   ├── test_lexer           query:   tokenizer
 │   ├── test_parser          query:   SQL -> AST
 │   ├── test_expression      query:   binding, evaluation, 3-valued logic, LIKE
@@ -23,13 +24,15 @@ tests/
 │   └── test_shell           query:   statement splitting, scripts, meta commands, .read
 ├── integration/             whole engine via the Database API (SQL in, rows out)
 │   ├── test_sql.cpp         DDL/DML, constraints, index consistency, index-vs-scan
-│   └── test_persistence.cpp data survives restarts and simulated crashes
+│   ├── test_persistence.cpp data survives restarts and simulated crashes
+│   └── test_transactions.cpp BEGIN/COMMIT/ROLLBACK, savepoints, crash at every write, model check
 └── e2e/                     the real shell binary, compared to golden output
     ├── run_case.cmake       runner: N.sql -> compare with N.expected
     ├── basic/               queries, joins, aggregates, EXPLAIN
     ├── advanced/            LEFT JOIN, functions, subqueries, set ops, TEXT keys, ALTER TABLE
     ├── errors/              error messages; the shell keeps going after errors
-    └── persistence/         3 separate shell processes on the same file
+    ├── persistence/         3 separate shell processes on the same file
+    └── transactions/        rollback, commit, savepoints; an open transaction is gone after exit
 ```
 
 Isolation techniques:
@@ -43,13 +46,25 @@ Isolation techniques:
   all the time.
 * **Cross-checks**: index scan vs. sequential scan and hash join vs. nested loop
   must return the same results on random data.
+* **Crashes** are simulated without killing anything.
+  `DiskManager::SetBeforeWriteHook` runs right before every page write, and the
+  crash tests copy the database file and its journal from there. That copy is
+  exactly what a crash at that moment would leave on disk (every write goes
+  straight to the OS). Each copy is then opened, and recovery must restore the
+  state from before the transaction. `Crash.*` does this for every single write
+  of a transaction, of an autocommit statement and of a `ROLLBACK`. The same
+  hook can throw to simulate an I/O error halfway through a statement.
+* **Transactions vs. a model**: `Transactions.RandomizedAgainstAModel` runs
+  random statements, failing statements, savepoints, commits, rollbacks and
+  restarts on a 12-frame buffer pool, and compares the table with a `std::map`
+  after every few steps.
 
 ## Running tests locally
 
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build --parallel
-ctest --test-dir build -j 8 --output-on-failure    # everything (335 tests)
+ctest --test-dir build -j 8 --output-on-failure    # everything (389 tests)
 
 ctest --test-dir build -L storage                  # one layer
 ctest --test-dir build -L query

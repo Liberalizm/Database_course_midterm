@@ -72,6 +72,10 @@ public:
     std::vector<IndexInfo*> Indexes();
 
     void Save();
+    // Forgets everything held in memory and loads the catalog again from its
+    // pages (after a rollback restored them). Every TableInfo* / IndexInfo*
+    // handed out before is invalid afterwards.
+    void Reload();
 
 private:
     void Load();

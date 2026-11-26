@@ -61,6 +61,10 @@ public:
         return true;
     }
     size_t Size() const { return lru_.size(); }
+    void Clear() {
+        lru_.clear();
+        pos_.clear();
+    }
 
 private:
     std::list<frame_id_t> lru_;  // front = most recent, back = least recent
@@ -82,6 +86,10 @@ public:
     bool UnpinPage(page_id_t pid, bool is_dirty);
     void FlushPage(page_id_t pid);
     void FlushAll();
+    // Drops every cached page *without* writing anything back (used by rollback:
+    // the file is restored underneath, so whatever is cached is stale). No page
+    // may be pinned. The free-page list is kept; the catalog reloads it.
+    void DiscardAll();
 
     // Gives a page back for reuse (e.g. the pages of a dropped table). The page
     // must not be pinned; its cached contents are discarded without write-back.

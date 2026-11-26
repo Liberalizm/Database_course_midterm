@@ -226,7 +226,53 @@ Statement Parser::ParseStatement() {
         e.select = std::make_shared<SelectStmt>(ParseSelect());
         return e;
     }
+    if (Statement t; ParseTransaction(&t)) return t;
     Error("unknown statement");
+}
+
+// Transaction control, with the common synonyms of PostgreSQL / SQLite / MySQL:
+//   BEGIN [TRANSACTION | WORK]      START TRANSACTION
+//   COMMIT [TRANSACTION | WORK]     END [TRANSACTION | WORK]
+//   ROLLBACK [TRANSACTION | WORK]   ABORT [TRANSACTION | WORK]
+//   SAVEPOINT name   RELEASE [SAVEPOINT] name   ROLLBACK [TRANSACTION | WORK] TO [SAVEPOINT] name
+// None of these words is reserved, so they still work as table or column names.
+bool Parser::ParseTransaction(Statement* out) {
+    using K = TransactionStmt::Kind;
+    auto noise = [this] { return AcceptKw("transaction") || AcceptKw("work"); };
+    TransactionStmt t;
+    if (AcceptKw("begin")) {
+        noise();
+        t.kind = K::BEGIN;
+    } else if (AcceptKw("start")) {
+        ExpectKw("transaction");
+        t.kind = K::BEGIN;
+    } else if (AcceptKw("commit") || AcceptKw("end")) {
+        noise();
+        t.kind = K::COMMIT;
+    } else if (AcceptKw("abort")) {
+        noise();
+        t.kind = K::ROLLBACK;
+    } else if (AcceptKw("rollback")) {
+        noise();
+        t.kind = K::ROLLBACK;
+        if (AcceptKw("to")) {
+            AcceptKw("savepoint");
+            t.kind = K::ROLLBACK_TO;
+            t.savepoint = ExpectIdent();
+        }
+    } else if (AcceptKw("savepoint")) {
+        t.kind = K::SAVEPOINT;
+        t.savepoint = ExpectIdent();
+    } else if (AcceptKw("release")) {
+        // "RELEASE savepoint" alone names a savepoint called "savepoint".
+        if (CheckKw("savepoint") && Peek(1).type == TokenType::IDENT) Advance();
+        t.kind = K::RELEASE;
+        t.savepoint = ExpectIdent();
+    } else {
+        return false;
+    }
+    *out = std::move(t);
+    return true;
 }
 
 TypeId Parser::ParseType() {

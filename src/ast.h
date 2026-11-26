@@ -250,7 +250,15 @@ struct AlterTableStmt {
     std::string new_name;  // RENAME_COLUMN, RENAME_TABLE
 };
 
+// BEGIN | COMMIT | ROLLBACK | SAVEPOINT name | RELEASE [SAVEPOINT] name
+// | ROLLBACK TO [SAVEPOINT] name   (plus the usual synonyms, see the parser)
+struct TransactionStmt {
+    enum class Kind { BEGIN, COMMIT, ROLLBACK, SAVEPOINT, RELEASE, ROLLBACK_TO };
+    Kind kind = Kind::BEGIN;
+    std::string savepoint;  // SAVEPOINT, RELEASE, ROLLBACK_TO
+};
+
 using Statement = std::variant<CreateTableStmt, CreateIndexStmt, DropStmt, InsertStmt, SelectStmt, DeleteStmt,
-                               UpdateStmt, ExplainStmt, AlterTableStmt>;
+                               UpdateStmt, ExplainStmt, AlterTableStmt, TransactionStmt>;
 
 }  // namespace minidb

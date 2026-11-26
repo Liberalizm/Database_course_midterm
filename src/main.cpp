@@ -19,9 +19,12 @@ using namespace minidb;
 int main(int argc, char** argv) {
     std::string path = "minidb.db";
     size_t frames = 256;
+    bool synchronous = true;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
-        if (a == "--pool" && i + 1 < argc) {
+        if (a == "--nosync") {
+            synchronous = false;  // no fsync: faster, but not safe against power loss
+        } else if (a == "--pool" && i + 1 < argc) {
             std::string v = argv[++i];
             try {
                 size_t used = 0;
@@ -37,14 +40,19 @@ int main(int argc, char** argv) {
     }
 
     try {
-        Database db(path, frames);
+        Database db(path, frames, synchronous);
         Shell shell(db, std::cout);
         bool interactive = ISATTY(FILENO(stdin));
         if (interactive) {
             std::cout << "MiniDB 1.0 - database file '" << path << "', buffer pool " << frames
                       << " frames. Type .help for help.\n";
         }
+        if (db.RecoveredOnOpen())
+            std::cout << "NOTICE: rolled back a transaction that was interrupted (found its rollback journal)\n";
         shell.RunScript(std::cin, interactive);
+        // Like psql and sqlite3: what was not committed is not kept.
+        if (db.InTransaction())
+            std::cout << "WARNING: the transaction still open at exit was rolled back\n";
     } catch (const std::exception& e) {
         std::cerr << "fatal: " << e.what() << "\n";
         return 1;

@@ -326,6 +326,48 @@ TEST(Parser, UpdateAndDelete) {
     EXPECT_EQ(d.where, nullptr);
 }
 
+TEST(Parser, TransactionStatements) {
+    using K = TransactionStmt::Kind;
+    struct Case {
+        const char* sql;
+        K kind;
+        const char* savepoint;
+    };
+    const Case cases[] = {{"BEGIN", K::BEGIN, ""},
+                          {"begin transaction", K::BEGIN, ""},
+                          {"BEGIN WORK", K::BEGIN, ""},
+                          {"START TRANSACTION", K::BEGIN, ""},
+                          {"COMMIT", K::COMMIT, ""},
+                          {"COMMIT WORK", K::COMMIT, ""},
+                          {"END", K::COMMIT, ""},
+                          {"END TRANSACTION", K::COMMIT, ""},
+                          {"ROLLBACK", K::ROLLBACK, ""},
+                          {"ROLLBACK TRANSACTION", K::ROLLBACK, ""},
+                          {"ABORT", K::ROLLBACK, ""},
+                          {"SAVEPOINT sp1", K::SAVEPOINT, "sp1"},
+                          {"RELEASE sp1", K::RELEASE, "sp1"},
+                          {"RELEASE SAVEPOINT sp1", K::RELEASE, "sp1"},
+                          {"RELEASE savepoint", K::RELEASE, "savepoint"},  // a savepoint named "savepoint"
+                          {"ROLLBACK TO sp1", K::ROLLBACK_TO, "sp1"},
+                          {"ROLLBACK TO SAVEPOINT sp1", K::ROLLBACK_TO, "sp1"},
+                          {"ROLLBACK WORK TO SAVEPOINT \"Sp\"", K::ROLLBACK_TO, "Sp"}};
+    for (const Case& c : cases) {
+        auto t = ParseOne<TransactionStmt>(c.sql);
+        EXPECT_EQ(t.kind, c.kind) << c.sql;
+        EXPECT_EQ(t.savepoint, c.savepoint) << c.sql;
+    }
+    for (const char* bad : {"START", "SAVEPOINT", "RELEASE", "ROLLBACK TO", "SAVEPOINT select", "COMMIT now"})
+        EXPECT_THROW(Parser(bad).ParseAll(), DbError) << bad;
+}
+
+TEST(Parser, TransactionWordsAreNotReserved) {
+    auto c = ParseOne<CreateTableStmt>("CREATE TABLE work (begin INT, commit TEXT, savepoint INT, start INT)");
+    EXPECT_EQ(c.name, "work");
+    auto s = ParseOne<SelectStmt>("SELECT begin, commit FROM work");
+    EXPECT_EQ(s.items.size(), 2u);
+    EXPECT_EQ(Parser("BEGIN; INSERT INTO work VALUES (1, 'x', 2, 3); COMMIT").ParseAll().size(), 3u);
+}
+
 TEST(Parser, Explain) {
     auto e = ParseOne<ExplainStmt>("EXPLAIN ANALYZE SELECT 1");
     EXPECT_TRUE(e.analyze);

@@ -152,5 +152,29 @@ TEST_F(ShellTest, ReadErrorsAndExit) {
     EXPECT_FALSE(Contains(out.str(), "outer"));
 }
 
+TEST_F(ShellTest, PromptShowsAnOpenTransaction) {
+    out.str("");
+    std::istringstream in("BEGIN;\nSELECT 1;\nCOMMIT;\n");
+    shell.RunScript(in, /*interactive=*/true);
+    EXPECT_TRUE(Contains(out.str(), "minidb> BEGIN\nminidb*> ")) << out.str();
+    EXPECT_TRUE(Contains(out.str(), "minidb*> COMMIT\nminidb> ")) << out.str();
+}
+
+TEST_F(ShellTest, TransactionsAndStats) {
+    std::string o = Run("CREATE TABLE t (a INT);\nBEGIN;\nINSERT INTO t VALUES (1);\nSAVEPOINT s1;\n.stats\nROLLBACK;\n.stats");
+    EXPECT_TRUE(Contains(o, "BEGIN\nINSERT 1\nSAVEPOINT\n")) << o;
+    EXPECT_TRUE(Contains(o, "transaction: open, ")) << o;
+    EXPECT_TRUE(Contains(o, "savepoints: s1")) << o;
+    EXPECT_TRUE(Contains(o, "ROLLBACK\n")) << o;
+    EXPECT_TRUE(Contains(o, "transaction: none (autocommit)")) << o;
+    EXPECT_FALSE(db.InTransaction());
+}
+
+TEST_F(ShellTest, PopulateInsideATransactionIsRolledBack) {
+    std::string o = Run("CREATE TABLE t (id INT PRIMARY KEY, s TEXT);\nBEGIN;\n.populate t 500\nROLLBACK;\nSELECT COUNT(*) FROM t;");
+    EXPECT_TRUE(Contains(o, "INSERT 500\nROLLBACK\n")) << o;
+    EXPECT_TRUE(Contains(o, " 0\n(1 row)")) << o;
+}
+
 }  // namespace
 }  // namespace minidb

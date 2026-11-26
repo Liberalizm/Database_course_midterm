@@ -35,6 +35,7 @@ private:
     SelectStmt ParseSelectCore();  // SELECT ... FROM ... WHERE ... GROUP BY ... HAVING ...
     DeleteStmt ParseDelete();
     UpdateStmt ParseUpdate();
+    bool ParseTransaction(Statement* out);  // BEGIN / COMMIT / ROLLBACK / SAVEPOINT ...
     TypeId ParseType();
 
     ExprPtr ParseExpr();

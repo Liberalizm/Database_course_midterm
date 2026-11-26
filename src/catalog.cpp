@@ -216,6 +216,12 @@ std::string Catalog::Serialize() const {
     return std::move(w.buf);
 }
 
+void Catalog::Reload() {
+    indexes_.clear();
+    tables_.clear();
+    Load();
+}
+
 void Catalog::Load() {
     std::string data;
     size_t total;

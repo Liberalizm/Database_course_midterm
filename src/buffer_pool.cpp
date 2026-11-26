@@ -105,12 +105,27 @@ void BufferPoolManager::FlushPage(page_id_t pid) {
 }
 
 void BufferPoolManager::FlushAll() {
+    // Announce the whole batch first, so that the transaction manager journals
+    // all of these pages and syncs its journal once instead of once per page.
+    for (auto& [pid, f] : page_table_)
+        if (frames_[f].dirty_) disk_->PrepareWrite(pid);
     for (auto& [pid, f] : page_table_) {
         Page& p = frames_[f];
         if (p.dirty_) {
             disk_->WritePage(p.id_, p.data_);
             p.dirty_ = false;
         }
+    }
+}
+
+void BufferPoolManager::DiscardAll() {
+    if (PinnedFrames() > 0) throw DbError("internal: cannot discard the buffer pool while pages are pinned");
+    page_table_.clear();
+    replacer_.Clear();
+    free_list_.clear();
+    for (size_t i = 0; i < frames_.size(); ++i) {
+        frames_[i].Reset();
+        free_list_.push_back(static_cast<frame_id_t>(i));
     }
 }
 

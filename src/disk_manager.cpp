@@ -2,54 +2,48 @@
 
 namespace minidb {
 
-DiskManager::DiskManager(const std::string& path) : path_(path) {
-    file_.open(path, std::ios::in | std::ios::out | std::ios::binary);
-    if (!file_.is_open()) {
-        // File does not exist yet: create it, then reopen in read/write mode.
-        std::ofstream create(path, std::ios::binary);
-        create.close();
-        file_.open(path, std::ios::in | std::ios::out | std::ios::binary);
-        if (!file_.is_open()) throw DbError("cannot open database file: " + path);
-    }
-    file_.seekg(0, std::ios::end);
-    auto size = static_cast<int64_t>(file_.tellg());
-    num_pages_ = static_cast<page_id_t>(size / static_cast<int64_t>(PAGE_SIZE));
-}
-
-DiskManager::~DiskManager() {
-    if (file_.is_open()) {
-        file_.flush();
-        file_.close();
-    }
+DiskManager::DiskManager(const std::string& path) : path_(path), file_(path, /*create=*/true) {
+    num_pages_ = static_cast<page_id_t>(file_.Size() / PAGE_SIZE);
 }
 
 void DiskManager::ReadPage(page_id_t pid, char* out) {
     if (pid < 0 || pid >= num_pages_) throw DbError("read of invalid page " + std::to_string(pid));
-    file_.clear();
-    file_.seekg(static_cast<std::streamoff>(pid) * static_cast<std::streamoff>(PAGE_SIZE));
-    file_.read(out, PAGE_SIZE);
-    auto got = file_.gcount();
-    if (got < static_cast<std::streamsize>(PAGE_SIZE)) {
-        std::memset(out + got, 0, PAGE_SIZE - static_cast<size_t>(got));
-    }
+    size_t got = file_.ReadAt(static_cast<uint64_t>(pid) * PAGE_SIZE, out, PAGE_SIZE);
+    if (got < PAGE_SIZE) std::memset(out + got, 0, PAGE_SIZE - got);
     ++reads_;
 }
 
 void DiskManager::WritePage(page_id_t pid, const char* data) {
     if (pid < 0 || pid >= num_pages_) throw DbError("write of invalid page " + std::to_string(pid));
-    file_.clear();
-    file_.seekp(static_cast<std::streamoff>(pid) * static_cast<std::streamoff>(PAGE_SIZE));
-    file_.write(data, PAGE_SIZE);
-    file_.flush();
-    if (!file_) throw DbError("I/O error while writing page " + std::to_string(pid));
+    if (listener_) listener_->BeforeWrite(pid, /*durable=*/true);
+    RawWrite(pid, data);
+}
+
+void DiskManager::RawWrite(page_id_t pid, const char* data) {
+    if (before_write_hook_) before_write_hook_(pid);
+    file_.WriteAt(static_cast<uint64_t>(pid) * PAGE_SIZE, data, PAGE_SIZE);
     ++writes_;
 }
 
 page_id_t DiskManager::AllocatePage() {
-    page_id_t pid = num_pages_++;
+    if (listener_) listener_->BeforeGrow();
     char zeros[PAGE_SIZE] = {};
-    WritePage(pid, zeros);
-    return pid;
+    RawWrite(num_pages_, zeros);  // a new page has no old contents to save
+    return num_pages_++;
 }
+
+void DiskManager::PrepareWrite(page_id_t pid) {
+    if (listener_ && pid >= 0 && pid < num_pages_) listener_->BeforeWrite(pid, /*durable=*/false);
+}
+
+void DiskManager::Truncate(page_id_t num_pages) {
+    if (num_pages < 0 || num_pages > num_pages_)
+        throw DbError("internal: cannot truncate the file to " + std::to_string(num_pages) + " pages");
+    if (num_pages == num_pages_) return;
+    file_.Truncate(static_cast<uint64_t>(num_pages) * PAGE_SIZE);
+    num_pages_ = num_pages;
+}
+
+void DiskManager::Sync() { file_.Sync(); }
 
 }  // namespace minidb

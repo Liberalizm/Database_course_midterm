@@ -133,8 +133,12 @@ TEST(Persistence, CorruptedFileNeverCrashesOrHangs) {
             std::ofstream out(f.path(), std::ios::binary | std::ios::trunc);
             out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
         }
+        // A journal left by the previous round belongs to the file just replaced.
+        std::remove(TransactionManager::JournalPath(f.path()).c_str());
         try {
-            Database db(f.path(), 16);
+            // No fsync: this test is about damaged pages, not durability (and
+            // opens the database 120 times).
+            Database db(f.path(), 16, /*synchronous=*/false);
             for (const char* q : queries) {
                 try {
                     db.Execute(q);

@@ -17,7 +17,8 @@
 
 namespace minidb::testing {
 
-// A unique database file path that is deleted before and after the test.
+// A unique database file path that is deleted before and after the test, together
+// with its rollback journal ("<path>-journal").
 class TempFile {
 public:
     TempFile() {
@@ -33,9 +34,13 @@ public:
         path_ = (std::filesystem::temp_directory_path() /
                  ("minidb_" + name + "_" + process_tag + "_" + std::to_string(counter++) + ".db"))
                     .string();
-        std::remove(path_.c_str());
+        Clean();
     }
-    ~TempFile() { std::remove(path_.c_str()); }
+    ~TempFile() { Clean(); }
+    void Clean() const {
+        std::remove(path_.c_str());
+        std::remove((path_ + "-journal").c_str());
+    }
     TempFile(const TempFile&) = delete;
     TempFile& operator=(const TempFile&) = delete;
 

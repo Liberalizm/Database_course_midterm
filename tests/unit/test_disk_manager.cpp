@@ -77,5 +77,52 @@ TEST(DiskManager, CountsIo) {
     EXPECT_EQ(disk.Reads(), 2u);
 }
 
+TEST(DiskManager, TruncateDropsTrailingPages) {
+    TempFile f;
+    {
+        DiskManager disk(f.path());
+        for (int i = 0; i < 5; ++i) disk.AllocatePage();
+        disk.Truncate(2);
+        EXPECT_EQ(disk.NumPages(), 2);
+        char buf[PAGE_SIZE] = {};
+        EXPECT_THROW(disk.ReadPage(2, buf), DbError);
+        EXPECT_EQ(disk.AllocatePage(), 2) << "the file grows again from the new end";
+        EXPECT_THROW(disk.Truncate(4), DbError) << "cannot 'truncate' to a larger size";
+        disk.Sync();
+    }
+    EXPECT_EQ(std::filesystem::file_size(f.path()), 3 * PAGE_SIZE);
+    DiskManager disk(f.path());
+    EXPECT_EQ(disk.NumPages(), 3);
+}
+
+// Records what the DiskManager tells its listener, interleaved with the actual
+// writes (seen through the before-write hook).
+struct RecordingListener : DiskManager::WriteListener {
+    std::vector<std::string> events;
+    void BeforeWrite(page_id_t pid, bool durable) override {
+        events.push_back((durable ? "write " : "prepare ") + std::to_string(pid));
+    }
+    void BeforeGrow() override { events.push_back("grow"); }
+};
+
+TEST(DiskManager, ListenerHearsAboutEveryChangeBeforeItHappens) {
+    TempFile f;
+    DiskManager disk(f.path());
+    RecordingListener l;
+    disk.SetListener(&l);
+    disk.SetBeforeWriteHook([&](page_id_t pid) { l.events.push_back("disk " + std::to_string(pid)); });
+    disk.AllocatePage();
+    disk.AllocatePage();
+    char buf[PAGE_SIZE] = {};
+    disk.PrepareWrite(1);
+    disk.WritePage(1, buf);
+    disk.PrepareWrite(9);  // not a page of the file: ignored
+    disk.ReadPage(0, buf);  // reads are not reported
+    EXPECT_EQ(l.events, (std::vector<std::string>{"grow", "disk 0", "grow", "disk 1", "prepare 1", "write 1", "disk 1"}));
+    disk.SetListener(nullptr);
+    disk.WritePage(0, buf);
+    EXPECT_EQ(l.events.back(), "disk 0") << "no listener anymore, only the hook";
+}
+
 }  // namespace
 }  // namespace minidb
