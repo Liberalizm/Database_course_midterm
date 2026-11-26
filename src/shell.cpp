@@ -19,6 +19,9 @@ SQL (end every statement with ';'):
   CREATE TABLE u (a INT, b TEXT, n INT, PRIMARY KEY (a, b), UNIQUE (b, n));
   CREATE [UNIQUE] INDEX idx ON t (col [, col2 ...]);  DROP TABLE t;  DROP INDEX idx;
   ALTER TABLE t ADD [COLUMN] c TYPE [UNIQUE] | DROP [COLUMN] c | RENAME [COLUMN] a TO b | RENAME TO u;
+  Foreign keys: c INT REFERENCES p [(col)]   or   [CONSTRAINT n] FOREIGN KEY (c) REFERENCES p [(col)]
+                [ON DELETE | ON UPDATE  CASCADE | SET NULL | SET DEFAULT | RESTRICT | NO ACTION]
+  ALTER TABLE t ADD [CONSTRAINT n] FOREIGN KEY (c) REFERENCES p [(col)] ... | DROP CONSTRAINT n;
   CREATE [OR REPLACE] VIEW v [(a, b)] AS SELECT ...;   DROP VIEW v;   (views are read-only)
   INSERT INTO t VALUES (1, 'a', 2.5, true), (2, 'b', NULL, false);
   INSERT INTO t (id, name) SELECT ...;
@@ -202,6 +205,10 @@ bool Shell::RunMeta(const std::string& line) {
             for (IndexInfo* i : db_.GetCatalog().IndexesOf(name))
                 out_ << "  index " << i->name << " (" << ColumnList(*i) << ")" << (i->unique ? " UNIQUE" : "")
                      << " btree\n";
+            for (ForeignKey* fk : db_.GetCatalog().ForeignKeysOf(name))
+                out_ << "  constraint " << fk->name << " " << fk->ToString() << "\n";
+            for (ForeignKey* fk : db_.GetCatalog().ForeignKeysTo(name))
+                out_ << "  referenced by " << fk->table << "(" << fk->column << ") via " << fk->name << "\n";
         } else if (cmd == ".stats") {
             auto& b = db_.Bpm();
             auto& d = db_.Disk();

@@ -24,13 +24,15 @@ tests/
 │   └── test_shell           query:   statement splitting, scripts, meta commands, .read
 ├── integration/             whole engine via the Database API (SQL in, rows out)
 │   ├── test_sql.cpp         DDL/DML, constraints, index consistency, index-vs-scan
-│   └── test_persistence.cpp data survives restarts and simulated crashes
+│   ├── test_persistence.cpp data survives restarts and simulated crashes
+│   └── test_foreign_keys.cpp FOREIGN KEY checks, actions, DDL guards, randomized invariants
 └── e2e/                     the real shell binary, compared to golden output
     ├── run_case.cmake       runner: N.sql -> compare with N.expected
     ├── basic/               queries, joins, aggregates, EXPLAIN
     ├── advanced/            LEFT JOIN, functions, subqueries, set ops, TEXT keys, ALTER TABLE
     ├── composite/           composite PRIMARY KEY / UNIQUE, multi-column indexes (2 steps: restart)
     ├── errors/              error messages; the shell keeps going after errors
+    ├── foreign_keys/        referential actions, .schema, constraints after a restart
     ├── persistence/         3 separate shell processes on the same file
     └── views/               CREATE / DROP VIEW, views over views, kept across a restart
 ```

@@ -50,11 +50,12 @@ private:
     QueryResult RunUpdate(const UpdateStmt& s);
     QueryResult RunExplain(const ExplainStmt& s);
 
-    // Write path. Each modifying statement is atomic: all constraints (types,
-    // NOT NULL, row size, uniqueness) are checked for every affected row before
-    // the first change is applied, so a failing statement changes nothing.
-    Row PrepareRow(const TableInfo* t, Row row) const;
+    // Each modifying statement is atomic: its changes are collected in a WriteSet
+    // (write_set.h), which runs the foreign key actions and checks every
+    // constraint before the first change is applied.
     void InsertRows(TableInfo* t, const std::vector<Row>& rows);
+    // Completes a parsed foreign key of `table` (name) and creates it.
+    void AddForeignKey(const std::string& table, ForeignKey fk);
 
     std::unique_ptr<DiskManager> disk_;
     std::unique_ptr<BufferPoolManager> bpm_;
