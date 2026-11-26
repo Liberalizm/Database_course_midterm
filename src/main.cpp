@@ -187,6 +187,18 @@ bool StatementComplete(const std::string& buf) {
     return !in_str && last == ';';
 }
 
+// True if the buffer holds anything besides whitespace and -- comments.
+bool HasSqlContent(const std::string& buf) {
+    for (size_t i = 0; i < buf.size(); ++i) {
+        if (buf[i] == '-' && i + 1 < buf.size() && buf[i + 1] == '-') {
+            while (i < buf.size() && buf[i] != '\n') ++i;
+            continue;
+        }
+        if (!std::isspace(static_cast<unsigned char>(buf[i]))) return true;
+    }
+    return false;
+}
+
 std::string Trim(const std::string& s) {
     size_t a = s.find_first_not_of(" \t\r\n");
     if (a == std::string::npos) return "";
@@ -219,17 +231,23 @@ int main(int argc, char** argv) {
         while (true) {
             if (interactive) std::cout << (buffer.empty() ? "minidb> " : "   ...> ") << std::flush;
             if (!std::getline(std::cin, line)) break;
-            if (buffer.empty() && Trim(line).rfind('.', 0) == 0) {
+            // Meta commands are recognized at the start of a statement, even after comment lines.
+            if (!HasSqlContent(buffer) && Trim(line).rfind('.', 0) == 0) {
+                buffer.clear();
                 if (!shell.RunMeta(Trim(line))) break;
                 continue;
             }
             buffer += line + "\n";
+            if (!HasSqlContent(buffer)) {  // only blank lines / comments so far
+                buffer.clear();
+                continue;
+            }
             if (StatementComplete(buffer)) {
                 shell.RunSql(buffer);
                 buffer.clear();
             }
         }
-        if (!Trim(buffer).empty()) shell.RunSql(buffer);
+        if (HasSqlContent(buffer)) shell.RunSql(buffer);
     } catch (const std::exception& e) {
         std::cerr << "fatal: " << e.what() << "\n";
         return 1;
